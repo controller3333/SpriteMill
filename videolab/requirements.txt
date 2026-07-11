@@ -1,0 +1,12 @@
+# SpriteMill VideoLab — サーバ本体の依存 (mockモード = これだけで動く)
+fastapi
+uvicorn
+pillow
+imageio-ffmpeg
+
+# --- 実モデル(LTX/Wan)を動かす場合はさらに以下 (CUDA GPU 必須) ---
+# 1) torch (CUDA 13.0 版。RTX 5090/Blackwell 含む):
+#      pip install torch --index-url https://download.pytorch.org/whl/cu130
+# 2) 拡散モデル一式:
+#      pip install "diffusers>=0.39.0" transformers accelerate safetensors sentencepiece
+# 注: diffusers は 0.38.0 以降で LTX-2.3 対応、0.39.0 で高速化済み。
