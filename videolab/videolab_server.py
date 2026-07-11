@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.2"   # 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
+__version__ = "0.3.3"   # 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
+# 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
 # 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
 # 0.3.0: AniSora/Wan-A14B+LoRAアダプタ、extra欄、ディスク自動解放
 
@@ -854,7 +855,13 @@ CURRENT_MODEL: str | None = None
 _LOCK = threading.Lock()
 
 
-def submit_job(model: str, req: GenRequest) -> str:
+# 孤児ジョブ検知: cancel_if_unpolled 指定ジョブは、クライアントの
+# /status ポーリングがこの秒数途絶えたら自動中止する (アプリ強制終了・
+# クラッシュでColab GPUが無駄に回り続けるのを防ぐ 2026-07-12要望)
+ORPHAN_SEC = int(os.environ.get("VIDEOLAB_ORPHAN_SEC", "90"))
+
+
+def submit_job(model: str, req: GenRequest, watch_poll: bool = False) -> str:
     jid = uuid.uuid4().hex[:12]
     with _LOCK:
         JOBS[jid] = {
@@ -867,6 +874,7 @@ def submit_job(model: str, req: GenRequest) -> str:
                        "steps": req.steps, "seed": req.seed,
                        "guidance": req.guidance, "images": len(req.images)},
             "_req": req, "_cancel": False,
+            "_watch_poll": watch_poll, "_last_poll": time.time(),
         }
         JOB_ORDER.append(jid)
     WORK_Q.put(jid)
@@ -890,6 +898,13 @@ def worker_loop():
             if j:
                 j["status"] = "cancelled"
             continue
+        # 孤児検知: キュー待ちの間にクライアントが消えたジョブは始めない
+        if (j.get("_watch_poll")
+                and time.time() - j.get("_last_poll", 0) > ORPHAN_SEC):
+            j["status"] = "cancelled"
+            j["detail"] = "クライアント切断により自動中止 (ポーリング途絶)"
+            print(f"[{jid}] 孤児ジョブを自動中止", flush=True)
+            continue
 
         def log(msg, _j=j):
             line = f"[{time.strftime('%H:%M:%S')}] {msg}"
@@ -899,6 +914,10 @@ def worker_loop():
         def progress(p, _j=j):
             _j["progress"] = round(float(p), 4)
             if _j.get("_cancel"):
+                raise JobCancelled()
+            if (_j.get("_watch_poll") and time.time() - _j.get("_last_poll", 0)
+                    > max(120, ORPHAN_SEC)):
+                _j["detail"] = "クライアント切断により自動中止 (ポーリング途絶)"
                 raise JobCancelled()
 
         try:
@@ -1035,7 +1054,8 @@ def build_app(token: str | None):
             seed=int(body.get("seed", 0)) or int(time.time()) % 2**31,
             guidance=float(body.get("guidance", 3.0)),
             extra=body.get("extra", {}) or {})
-        return {"job": submit_job(model, req)}
+        return {"job": submit_job(
+            model, req, watch_poll=bool(body.get("cancel_if_unpolled")))}
 
     # ---- SpriteMill canvas_walk.py 互換契約 (旧FramePackサーバと同一) ----
     @app.post("/generate_multikey")
@@ -1074,6 +1094,7 @@ def build_app(token: str | None):
         j = JOBS.get(jid)
         if not j:
             return {"status": "error", "detail": "unknown job"}
+        j["_last_poll"] = time.time()   # 孤児検知のハートビート
         return _job_public(j)
 
     @app.get("/result/{jid}")
