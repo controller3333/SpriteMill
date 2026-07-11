@@ -664,12 +664,19 @@ class _WanA14BBase(VideoAdapter):
             log(f"scheduler: UniPC flow_shift={self.flow_shift}")
         except Exception as e:
             log(f"flow_shift設定スキップ: {e}")
-        self.pipe.enable_model_cpu_offload()
+        # VIDEOLAB_OFFLOAD=seq: 12GB級GPU向けの逐次オフロード(層単位で
+        # GPUへ載せる。低速だがVRAM最小。システムRAM 32GB推奨 2026-07-12)
+        if os.environ.get("VIDEOLAB_OFFLOAD", "").lower() in ("seq",
+                                                              "sequential"):
+            self.pipe.enable_sequential_cpu_offload()
+            log("enable_sequential_cpu_offload (省メモリ・低速。12GB級GPU向け)")
+        else:
+            self.pipe.enable_model_cpu_offload()
+            log("enable_model_cpu_offload + vae tiling")
         try:
             self.pipe.vae.enable_tiling()
         except Exception:
             pass
-        log("enable_model_cpu_offload + vae tiling")
 
     def _build_prompt(self, req: GenRequest, log) -> str:
         p = req.prompt.strip()
@@ -719,7 +726,8 @@ class AniSoraAdapter(_WanA14BBase):
             "『motion score』で動きの強さを直接指定できる。i2vのみ。"
             "extra例: {\"motion_score\": 3.5}。量子化は環境変数 "
             "VIDEOLAB_ANISORA_QUANT=Q8_0(既定・計32GB)/Q4_0(計18GB・24GB級GPU向け)")
-    requires = "Colab A100 / ローカル24GB+ (Q4_0)・DL 30〜45GB"
+    requires = ("Colab A100 / ローカル24GB+ (Q4_0) / 12GB級はQ4_0+"
+                "VIDEOLAB_OFFLOAD=seq (低速・RAM32GB推奨)・DL 30〜45GB")
     gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
     # High/ には Q4_0 と Q8_0 のみ存在 (2026-07-11確認)。Low側も同じ名前規則。
     quant = os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q8_0")
