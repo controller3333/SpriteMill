@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.1"   # 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
+__version__ = "0.3.2"   # 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
+# 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
 # 0.3.0: AniSora/Wan-A14B+LoRAアダプタ、extra欄、ディスク自動解放
 
 # Colab セットアップセルが入れる依存 (make_notebook.py がここを読む)。
@@ -269,6 +270,24 @@ def _pick_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def _fit_image(img, w: int, h: int):
+    """縦横比を維持して (w,h) に収める。余白は四隅の色でパディング。
+
+    単純な resize((w,h)) は比率が違う入力を引き伸ばす(キャラが縦長になる
+    実障害 2026-07-12)。スプライト用途は背景が単色(マゼンタ等)なので、
+    四隅の色で letterbox するのが安全。"""
+    from PIL import Image
+    iw, ih = img.size
+    if (iw, ih) == (w, h):
+        return img
+    sc = min(w / iw, h / ih)
+    nw, nh = max(1, round(iw * sc)), max(1, round(ih * sc))
+    resized = img.resize((nw, nh), Image.LANCZOS)
+    bg = Image.new("RGB", (w, h), img.convert("RGB").getpixel((0, 0)))
+    bg.paste(resized, ((w - nw) // 2, (h - nh) // 2))
+    return bg
+
+
 def _require_deps(log):
     """実モデルに必要なライブラリのバージョン検査。
 
@@ -424,7 +443,8 @@ class _LTX2Base(VideoAdapter):
             for img, p in zip(req.images, pos):
                 idx = min(max_latent, round(p * max_latent))
                 conds.append(LTX2VideoCondition(
-                    frames=img.resize((w, h)), index=int(idx), strength=strength))
+                    frames=_fit_image(img, w, h), index=int(idx),
+                    strength=strength))
                 log(f"キーフレーム: pos={p:.2f} -> latent index {idx} (frame~{idx * 8})")
 
         steps = int(req.steps)
@@ -535,7 +555,7 @@ class LTX09Adapter(VideoAdapter):
                 if len(req.images) > 1 else [0.0])
             for img, p in zip(req.images, pos):
                 fi = min(n - 1, int(round(p * (n - 1) / 8)) * 8)  # 8の倍数推奨
-                conds.append(LTXVideoCondition(image=img.resize((w, h)),
+                conds.append(LTXVideoCondition(image=_fit_image(img, w, h),
                                                frame_index=fi))
                 log(f"キーフレーム: pos={p:.2f} -> frame_index {fi}")
         steps = int(req.steps)
@@ -596,7 +616,7 @@ class Wan22Adapter(VideoAdapter):
         h = _snap(req.height, 32, 256)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)   # Wan は 4k+1
         steps = int(req.steps)
-        img = req.images[0].resize((w, h))
+        img = _fit_image(req.images[0], w, h)
         kw = dict(image=img, prompt=req.prompt,
                   negative_prompt=req.negative or None,
                   width=w, height=h, num_frames=n,
@@ -665,7 +685,7 @@ class _WanA14BBase(VideoAdapter):
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
-        img = req.images[0].resize((w, h))
+        img = _fit_image(req.images[0], w, h)
         kw = dict(image=img, prompt=self._build_prompt(req, log),
                   negative_prompt=req.negative or None,
                   width=w, height=h, num_frames=n,
