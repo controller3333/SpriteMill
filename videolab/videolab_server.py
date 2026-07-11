@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.4"   # 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
+__version__ = "0.3.5"   # 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
+# 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
 # 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
 # 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
 # 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
@@ -656,7 +657,7 @@ class _WanA14BBase(VideoAdapter):
         self.pipe = None
         self.loaded = False
 
-    def _finalize_pipe(self, log, offload: str = ""):
+    def _finalize_pipe(self, log, offload: str = "", footprint_gb=None):
         import torch
         from diffusers import UniPCMultistepScheduler
         try:
@@ -665,18 +666,58 @@ class _WanA14BBase(VideoAdapter):
             log(f"scheduler: UniPC flow_shift={self.flow_shift}")
         except Exception as e:
             log(f"flow_shift設定スキップ: {e}")
-        # seq = 12GB級GPU向けの逐次オフロード(層単位でGPUへ載せる。低速だが
-        # VRAM最小。システムRAM 32GB推奨 2026-07-12)。指定が無ければ
-        # VIDEOLAB_OFFLOAD 環境変数に従う。
-        off = (offload or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
-        if off in ("seq", "sequential"):
+
+        # ---- オフロード戦略の決定 (速度の要。2026-07-12 A100で3分問題) ----
+        # cuda  = 全モデルをGPU常駐(オフロード無し=最速。A100等でVRAMに
+        #         余裕があるとき)。model_cpu_offloadはCPU<->GPU転送が挟まり
+        #         A100の性能を殺すため、載るなら常駐が正解。
+        # model = 主要モデルを順次GPUへ(中VRAM)。 seq = 逐次(12GB級)。
+        mode = (offload or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
+        mode = {"sequential": "seq", "offload": "model", "full": "cuda",
+                "none": "cuda"}.get(mode, mode)
+        if mode not in ("seq", "model", "cuda"):
+            # auto: VRAM総量とモデル実測サイズから常駐可否を判定
+            mode = "model"
+            try:
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+                if footprint_gb and total_gb >= footprint_gb + 6:
+                    mode = "cuda"
+                elif total_gb < 18:
+                    mode = "seq"
+                log(f"オフロード自動判定: VRAM {total_gb:.0f}GB / 想定"
+                    f"{footprint_gb}GB -> {mode}")
+            except Exception:
+                pass
+
+        if mode == "cuda":
+            try:
+                self.pipe.to("cuda")
+                log("全モデルをGPU常駐 (オフロード無し=最速)")
+                # 常駐時はVAEタイリング不要(タイリングはVAEデコードを遅くする)
+                return self._log_attn_backend(log)
+            except Exception as e:   # OOM等 -> オフロードへ退避
+                log(f"GPU常駐に失敗({str(e)[:120]}) -> model_cpu_offloadへ")
+                mode = "model"
+        if mode == "seq":
             self.pipe.enable_sequential_cpu_offload()
             log("enable_sequential_cpu_offload (省メモリ・低速。12GB級GPU向け)")
         else:
             self.pipe.enable_model_cpu_offload()
-            log("enable_model_cpu_offload + vae tiling")
+            log("enable_model_cpu_offload")
         try:
             self.pipe.vae.enable_tiling()
+        except Exception:
+            pass
+        self._log_attn_backend(log)
+
+    def _log_attn_backend(self, log) -> None:
+        # 透明性: diffusers/torchは既定でSDPA(A100ではFlashAttention/
+        # メモリ効率カーネルを自動選択)。fp32でもxformersでもない。
+        try:
+            import torch
+            has = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            log(f"attention: PyTorch SDPA {'有効' if has else '不明'} "
+                f"(A100ではFlashAttentionカーネルを自動選択)")
         except Exception:
             pass
 
@@ -747,9 +788,11 @@ class AniSoraAdapter(_WanA14BBase):
                 or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q8_0"))
         if q not in ("Q4_0", "Q8_0"):     # High側はQ4_0/Q8_0のみ存在
             q = "Q8_0"
+        # 既定は "" = auto (VRAMを見てGPU常駐 or model_cpu_offloadを選ぶ)。
+        # "seq" のみ明示指定 (12GB級の省メモリモード)。
         off = str((extra or {}).get("offload")
-                  or os.environ.get("VIDEOLAB_OFFLOAD", "model")).lower()
-        off = "seq" if off in ("seq", "sequential") else "model"
+                  or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
+        off = "seq" if off in ("seq", "sequential") else ""
         return q, off
 
     def ensure_loaded(self, log):
@@ -778,7 +821,10 @@ class AniSoraAdapter(_WanA14BBase):
         self.pipe = WanImageToVideoPipeline.from_pretrained(
             self.base_repo, transformer=t_hi, transformer_2=t_lo,
             torch_dtype=torch.bfloat16)
-        self._finalize_pipe(log, offload=offload)
+        # GPU常駐可否の判定用フットプリント(GB): High+Low GGUF常駐 +
+        # bf16テキストエンコーダ(~6) + VAE(~0.5) + 生成アクティベーション(~4)
+        fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
+        self._finalize_pipe(log, offload=offload, footprint_gb=fp)
         self.loaded_quant, self.loaded_offload = quant, offload
         self.loaded = True
 
