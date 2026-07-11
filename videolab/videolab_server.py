@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.0"   # 0.3.0: AniSora/Wan-A14B+LoRAアダプタ、extra欄、ディスク自動解放
+__version__ = "0.3.1"   # 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
+# 0.3.0: AniSora/Wan-A14B+LoRAアダプタ、extra欄、ディスク自動解放
 
 # Colab セットアップセルが入れる依存 (make_notebook.py がここを読む)。
 # torch は Colab に CUDA 版が同梱されているため入れない。
@@ -268,6 +269,40 @@ def _pick_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def _require_deps(log):
+    """実モデルに必要なライブラリのバージョン検査。
+
+    「WanImageToVideoPipeline がない」= 古い diffusers が既に入っている
+    PCで起きた実障害(2026-07-12)への対策。足りない場合は対処コマンド
+    入りの日本語エラーにして webUI のジョブログに出す。"""
+    def _tup(s):
+        out = []
+        for x in str(s).split("+")[0].split(".")[:3]:
+            out.append(int(x) if x.isdigit() else 0)
+        return tuple(out)
+    try:
+        import diffusers
+    except ImportError:
+        raise RuntimeError(
+            'diffusers が入っていません。pip install -U "diffusers>=0.39.0" '
+            "transformers accelerate safetensors sentencepiece ftfy gguf peft "
+            "を実行してからサーバを再起動してください")
+    v = getattr(diffusers, "__version__", "0")
+    if _tup(v) < (0, 39, 0):
+        raise RuntimeError(
+            f"diffusers {v} は古すぎます (0.39.0 以上が必要。WanImageToVideo"
+            f'Pipeline / LTX2系はこの版から)。pip install -U "diffusers>='
+            f'0.39.0" を実行してからサーバを再起動してください')
+    import torch
+    tv = getattr(torch, "__version__", "0")
+    if _tup(tv) < (2, 4, 0):
+        raise RuntimeError(
+            f"torch {tv} は古すぎます (2.4 以上推奨)。pip install -U torch "
+            f"--index-url https://download.pytorch.org/whl/cu130 を実行して"
+            f"からサーバを再起動してください")
+    log(f"deps OK: diffusers {v} / torch {tv}")
+
+
 def _apply_offload(pipe, log):
     """VRAM 量でオフロード戦略を選ぶ。VAE tiling は常時有効(OOM対策の定石)。"""
     import torch
@@ -351,6 +386,7 @@ class _LTX2Base(VideoAdapter):
         self.pipe = None
 
     def ensure_loaded(self, log):
+        _require_deps(log)
         import torch
         from diffusers import LTX2ConditionPipeline
         log(f"読み込み開始: {self.repo} (bf16・初回は数十GBのDL)")
@@ -463,6 +499,7 @@ class LTX09Adapter(VideoAdapter):
         self.pipe = None
 
     def ensure_loaded(self, log):
+        _require_deps(log)
         import torch
         from diffusers import LTXConditionPipeline
         log(f"読み込み開始: {self.repo}")
@@ -541,6 +578,7 @@ class Wan22Adapter(VideoAdapter):
         self.pipe = None
 
     def ensure_loaded(self, log):
+        _require_deps(log)
         from diffusers import WanImageToVideoPipeline
         log(f"読み込み開始: {self.repo}")
         self.pipe = WanImageToVideoPipeline.from_pretrained(
@@ -673,6 +711,7 @@ class AniSoraAdapter(_WanA14BBase):
                 "steps": 8, "guidance": 1.0}
 
     def ensure_loaded(self, log):
+        _require_deps(log)
         import torch
         from diffusers import (GGUFQuantizationConfig, WanImageToVideoPipeline,
                                WanTransformer3DModel)
@@ -729,6 +768,7 @@ class Wan22A14BAdapter(_WanA14BBase):
         self._lora_state = None      # 直近に適用した (lightning, walk, weight)
 
     def ensure_loaded(self, log):
+        _require_deps(log)
         import torch
         from diffusers import WanImageToVideoPipeline
         log(f"読み込み開始: {self.base_repo} (DL約126GB・初回は20分前後)")
@@ -932,9 +972,21 @@ def build_app(token: str | None):
             disk = {"total_gb": round(u.total / 2**30), "free_gb": round(u.free / 2**30)}
         except Exception:
             pass
+        # ライブラリ版数 (遠隔デバッグ用。metadata参照なのでimport不要で軽い)
+        libs = {}
+        try:
+            from importlib.metadata import version as _pkgver
+            for pkg in ("torch", "diffusers", "transformers"):
+                try:
+                    libs[pkg] = _pkgver(pkg)
+                except Exception:
+                    libs[pkg] = None
+        except Exception:
+            pass
         return {"ok": True, "app": "SpriteMill VideoLab", "version": __version__,
                 "auth": bool(token), "queued": WORK_Q.qsize(),
-                "current_model": CURRENT_MODEL, "gpu": gpu, "disk": disk}
+                "current_model": CURRENT_MODEL, "gpu": gpu, "disk": disk,
+                "libs": libs}
 
     @app.get("/api/models")
     def models(request: Request):

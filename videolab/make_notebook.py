@@ -104,6 +104,9 @@ while True:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"wrote {OUT} (server v{version}, {len(code.splitlines())} lines embedded)")
+    print("※ GUIの「Colabでノートブックを開く」はGitHub上のノートを開きます。"
+          "再生成したら github_repo/ へコピーして push するのを忘れずに "
+          "(controller3333/SpriteMill)")
 
 
 if __name__ == "__main__":
