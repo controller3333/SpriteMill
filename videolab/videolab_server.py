@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.5"   # 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
+__version__ = "0.3.6"   # 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
+# 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
 # 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
 # 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
 # 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
@@ -745,9 +746,17 @@ class _WanA14BBase(VideoAdapter):
                   generator=torch.Generator("cpu").manual_seed(req.seed),
                   output_type="np", return_dict=False,
                   callback_on_step_end=_step_callback(progress, steps))
+        # 終端画像アンカー (2026-07-12): 2枚目の画像があれば last_image に。
+        # 「imageとlast_imageの間を補間する」diffusers公式仕様。開始と同じ
+        # 立ち絵を渡すと始点=終点のループ拘束になり、後ろ向きの回転を
+        # 構造的に防ぐ (Veoの loop_anchor と同じ発想)。AniSoraは首尾
+        # フレーム誘導で学習されており相性が良い見込み。
+        if len(req.images) >= 2:
+            kw["last_image"] = _fit_image(req.images[-1], w, h)
+            log("終端画像アンカー: 始点と同じポーズで終わるよう拘束")
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance}")
         out = _call_with_optional_kwargs(
-            self.pipe, kw, ["callback_on_step_end"], log)
+            self.pipe, kw, ["last_image", "callback_on_step_end"], log)
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
