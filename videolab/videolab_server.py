@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.3"   # 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
+__version__ = "0.3.4"   # 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
+# 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
 # 0.3.2: 入力画像の比率維持パディング(縦伸び事故対策)
 # 0.3.1: 依存バージョン検査(古いdiffusers対策)、/healthにlibs
 # 0.3.0: AniSora/Wan-A14B+LoRAアダプタ、extra欄、ディスク自動解放
@@ -655,7 +656,7 @@ class _WanA14BBase(VideoAdapter):
         self.pipe = None
         self.loaded = False
 
-    def _finalize_pipe(self, log):
+    def _finalize_pipe(self, log, offload: str = ""):
         import torch
         from diffusers import UniPCMultistepScheduler
         try:
@@ -664,10 +665,11 @@ class _WanA14BBase(VideoAdapter):
             log(f"scheduler: UniPC flow_shift={self.flow_shift}")
         except Exception as e:
             log(f"flow_shift設定スキップ: {e}")
-        # VIDEOLAB_OFFLOAD=seq: 12GB級GPU向けの逐次オフロード(層単位で
-        # GPUへ載せる。低速だがVRAM最小。システムRAM 32GB推奨 2026-07-12)
-        if os.environ.get("VIDEOLAB_OFFLOAD", "").lower() in ("seq",
-                                                              "sequential"):
+        # seq = 12GB級GPU向けの逐次オフロード(層単位でGPUへ載せる。低速だが
+        # VRAM最小。システムRAM 32GB推奨 2026-07-12)。指定が無ければ
+        # VIDEOLAB_OFFLOAD 環境変数に従う。
+        off = (offload or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
+        if off in ("seq", "sequential"):
             self.pipe.enable_sequential_cpu_offload()
             log("enable_sequential_cpu_offload (省メモリ・低速。12GB級GPU向け)")
         else:
@@ -726,18 +728,29 @@ class AniSoraAdapter(_WanA14BBase):
             "『motion score』で動きの強さを直接指定できる。i2vのみ。"
             "extra例: {\"motion_score\": 3.5}。量子化は環境変数 "
             "VIDEOLAB_ANISORA_QUANT=Q8_0(既定・計32GB)/Q4_0(計18GB・24GB級GPU向け)")
-    requires = ("Colab A100 / ローカル24GB+ (Q4_0) / 12GB級はQ4_0+"
-                "VIDEOLAB_OFFLOAD=seq (低速・RAM32GB推奨)・DL 30〜45GB")
+    requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) / 12GB級はQ4_0+"
+                "逐次オフロード (低速・RAM32GB推奨)・DL 30〜45GB")
     gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
-    # High/ には Q4_0 と Q8_0 のみ存在 (2026-07-11確認)。Low側も同じ名前規則。
-    quant = os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q8_0")
-    gguf_high = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
-    gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
     cache_repos = ("QuantStack/Index-Anisora-V3.2-GGUF",)
     prompt_suffix = ("aesthetic score: 6.0. motion score: {motion:.1f}. "
                      "There is no text in the video.")
     defaults = {"width": 464, "height": 848, "num_frames": 81, "fps": 16,
                 "steps": 8, "guidance": 1.0}
+
+    def _resolve_want(self, extra: dict) -> tuple:
+        """量子化とオフロード方式をリクエスト>環境変数>既定の順で解決。
+
+        Colabサーバは遠隔で環境変数を触れないため、アプリからはジョブの
+        extra {"quant": "Q4_0", "offload": "seq"} で指定できる(共通設定、
+        2026-07-12要望: A100ばかり使えないのでL4はQ4_0で運用したい)。"""
+        q = str((extra or {}).get("quant")
+                or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q8_0"))
+        if q not in ("Q4_0", "Q8_0"):     # High側はQ4_0/Q8_0のみ存在
+            q = "Q8_0"
+        off = str((extra or {}).get("offload")
+                  or os.environ.get("VIDEOLAB_OFFLOAD", "model")).lower()
+        off = "seq" if off in ("seq", "sequential") else "model"
+        return q, off
 
     def ensure_loaded(self, log):
         _require_deps(log)
@@ -745,10 +758,14 @@ class AniSoraAdapter(_WanA14BBase):
         from diffusers import (GGUFQuantizationConfig, WanImageToVideoPipeline,
                                WanTransformer3DModel)
         from huggingface_hub import hf_hub_download
+        quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
+        gguf_high = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
+        gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
-        log(f"GGUF DL: {self.gguf_repo} (High+Low 各15.9GB)")
-        hi = hf_hub_download(self.gguf_repo, self.gguf_high)
-        lo = hf_hub_download(self.gguf_repo, self.gguf_low)
+        log(f"GGUF DL: {self.gguf_repo} {quant} "
+            f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB'})")
+        hi = hf_hub_download(self.gguf_repo, gguf_high)
+        lo = hf_hub_download(self.gguf_repo, gguf_low)
         log("transformer(High) 読み込み — configはWan2.2ベースを明示")
         t_hi = WanTransformer3DModel.from_single_file(
             hi, quantization_config=qc, config=self.base_repo,
@@ -761,8 +778,24 @@ class AniSoraAdapter(_WanA14BBase):
         self.pipe = WanImageToVideoPipeline.from_pretrained(
             self.base_repo, transformer=t_hi, transformer_2=t_lo,
             torch_dtype=torch.bfloat16)
-        self._finalize_pipe(log)
+        self._finalize_pipe(log, offload=offload)
+        self.loaded_quant, self.loaded_offload = quant, offload
         self.loaded = True
+
+    def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
+        # 量子化/オフロード指定がロード時と違う場合は積み替え (共通設定を
+        # ジョブ単位で反映するため。切替は数分かかるので必要時のみ)
+        want = self._resolve_want(req.extra)
+        if self.loaded and want != (getattr(self, "loaded_quant", None),
+                                    getattr(self, "loaded_offload", None)):
+            log(f"設定変更 {self.loaded_quant}/{self.loaded_offload} -> "
+                f"{want[0]}/{want[1]}: モデルを積み替えます")
+            self.unload(log)
+            _free_cuda(log)
+        if not self.loaded:
+            self._next_extra = dict(req.extra or {})
+            self.ensure_loaded(log)
+        return super().generate(req, workdir, log, progress)
 
 
 @register
@@ -930,6 +963,8 @@ def worker_loop():
 
         try:
             adapter = ADAPTERS[j["model"]]
+            # ロード時にジョブのextra(量子化指定など)を参照できるように渡す
+            adapter._next_extra = dict(getattr(j["_req"], "extra", {}) or {})
             # モデル切替: 前のモデルをアンロードしてVRAMを空ける
             if CURRENT_MODEL not in (None, j["model"]):
                 prev = ADAPTERS.get(CURRENT_MODEL)
