@@ -65,8 +65,13 @@ class ColabDriver:
         self._wd = wd
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
-        if not wd.ensure_debug_edge(profile_dir, notebook_url,
-                                    open_url=True):
+        try:
+            ok = wd.ensure_debug_edge(profile_dir, notebook_url,
+                                      open_url=True, app_mode=True)
+        except TypeError:   # 旧web_drive (app_mode未対応) との互換
+            ok = wd.ensure_debug_edge(profile_dir, notebook_url,
+                                      open_url=True)
+        if not ok:
             raise RuntimeError(
                 "運転用Edgeを起動できませんでした(Edge未検出/ポート不通)")
         self.browser = self._pw.chromium.connect_over_cdp(
