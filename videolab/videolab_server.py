@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.4.0"   # 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
+__version__ = "0.4.1"   # 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
+# 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
 # 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
 # 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
 # 0.3.7: 中間キーフレーム注入(往復回転の対策)
@@ -1870,21 +1871,44 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
             ADAPTERS[preload].ensure_loaded(lambda m: print(f"[preload] {m}", flush=True))
             globals()["CURRENT_MODEL"] = preload
         threading.Thread(target=_pre, daemon=True).start()
-    subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
-    time.sleep(1)
-    proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}",
-         "--no-autoupdate"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # トンネルもトークン同様に「生きていれば据え置き」: セルを何回実行しても
+    # webUI行のURLが変わらないようにする。従来は毎回 pkill→新URL だったため、
+    # 貼った直後にRun Allがもう一度走るとURLが差し替わり、貼った側は
+    # getaddrinfo failed(DNS消滅)で必ず失敗した(2026-07-12実障害)。
+    # cloudflaredはカーネルと別プロセスなのでランタイム再起動を生き延びる。
+    url_file = Path(tempfile.gettempdir()) / "videolab_url.txt"
     url = None
-    deadline = time.time() + 60
-    while time.time() < deadline and url is None:
-        line = proc.stdout.readline()
-        m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line or "")
-        if m:
-            url = m.group(0)
-    if not url:
-        raise RuntimeError("cloudflared のトンネルURLが取得できませんでした。セルを再実行してください。")
+    if url_file.is_file():
+        old = url_file.read_text(encoding="utf-8").strip()
+        cf_alive = (subprocess.run(["pgrep", "-f", "cloudflared"],
+                                   capture_output=True).returncode == 0)
+        if old and cf_alive:
+            try:
+                with _rq.urlopen(f"{old}/health", timeout=8) as r:
+                    if r.status == 200:
+                        url = old
+                        print("既存のトンネルを再利用します(URL据え置き)")
+            except Exception:
+                pass
+    if url is None:
+        subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
+        time.sleep(1)
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}",
+             "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline and url is None:
+            line = proc.stdout.readline()
+            m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com",
+                           line or "")
+            if m:
+                url = m.group(0)
+        if not url:
+            raise RuntimeError(
+                "cloudflared のトンネルURLが取得できませんでした。"
+                "セルを再実行してください。")
+        url_file.write_text(url, encoding="utf-8")
     print("=" * 62)
     print("SpriteMill VideoLab 起動完了!")
     print(f"  webUI : {url}/?token={token}")
