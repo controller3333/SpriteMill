@@ -259,14 +259,28 @@ class ColabDriver:
         return _classify_conn(t)
 
     def _dialogs_text(self) -> str:
-        """ダイアログ/トースト内のテキストだけを集める。ノート本文は
-        含まれないので『再起動』等の語を安全に検査できる。"""
+        """ダイアログ/トースト(左下のクラッシュ通知含む)のテキストを集める。
+
+        cell2のos.killはカーネルだけを殺しVM接続は切れないため、右上の
+        接続ボタンは変化せず、左下の「予期せぬクラッシュ」通知が唯一の
+        確実な再起動シグナル(2026-07-12ユーザー観測)。通知系の要素を
+        広めに拾い、ノートのセル本文・出力は除外する(セルのソースにも
+        『クラッシュ』の語が書かれているため)。"""
         return self._js(
-            "Array.from(document.querySelectorAll("
-            "  \"mwc-dialog,md-dialog,paper-dialog,[role='dialog'],"
-            "[role='alertdialog'],colab-toast\"))"
-            ".map(e => e.innerText || e.textContent || '').join('\\n')",
-            default="") or ""
+            "(() => {"
+            "  const sels = \"paper-toast, mwc-snackbar, md-snackbar,"
+            " colab-toast, [role='alert'], [role='status'],"
+            " [role='alertdialog'], [role='dialog'], mwc-dialog, md-dialog,"
+            " paper-dialog\";"
+            "  const out = [];"
+            "  for (const el of document.querySelectorAll(sels)) {"
+            "    if (el.closest('.cell, .notebook-content, .monaco-editor,"
+            " colab-static-output-renderer')) continue;"
+            "    const t = (el.innerText || el.textContent || '').trim();"
+            "    if (t) out.push(t);"
+            "  }"
+            "  return out.join('\\n');"
+            "})()", default="") or ""
 
     def _cells_running(self) -> bool:
         """セルが実行中/実行待ちかを複数のシグナルで推定する。"""
@@ -466,9 +480,12 @@ class ColabDriver:
             dtxt = self._dialogs_text()
             crashed = bool(re.search(r"クラッシュ|crash|再起動|restart",
                                      dtxt, re.I))
-            if crashed and not seen_connected:
-                # 接続前に見えるクラッシュ通知は前セッションの残骸。
-                # 本物のcell2クラッシュは接続後にしか起きない
+            # 開始直後(接続前かつ60秒以内)のクラッシュ通知は前セッションの
+            # 残骸なので掃除して無視。それ以外のクラッシュ通知は、接続
+            # ボタンが変化しなくても再起動の確定シグナルとして扱う
+            # (os.killはカーネルのみ殺しVM接続は切れない=右上は変化しない。
+            #  2026-07-12ユーザー観測: 左下の「予期せぬクラッシュ」通知のみ)
+            if crashed and not seen_connected and time.time() - start < 60:
                 self._dismiss_info_dialogs()
                 crashed = False
             if (not seen_connected
@@ -487,7 +504,8 @@ class ColabDriver:
                     went_down = True
                     crash_seen = crashed
                     down_since = time.time()
-                    log("  ランタイムの再起動を検知 -- 再接続を待ちます…")
+                    log("  ランタイムの再起動を検知 -- カーネルの復帰を"
+                        "待ちます…")
             else:
                 crash_seen = crash_seen or crashed
                 if crashed or st == "disconnected":
@@ -506,6 +524,12 @@ class ColabDriver:
                             end = max(end, time.time() + 300)
                             continue
                         return "restarted"
+                elif (st == "unknown" and not crashed
+                        and time.time() - down_since >= 9):
+                    # 接続ボタンが読めない環境でも、クラッシュ通知が消えて
+                    # 少し経てばカーネル復帰とみなす(2回目のRun All側にも
+                    # 実行開始の確認+3回の押し直しがあるので安全)
+                    return "restarted"
                 elif (st == "disconnected"
                       and time.time() - down_since > 25):
                     # 自動再接続が始まらない -- 接続ボタンを押してみる
