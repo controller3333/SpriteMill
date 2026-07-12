@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.6"   # 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
+__version__ = "0.3.7"   # 0.3.7: 中間キーフレーム注入(往復回転の対策)
+# 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
 # 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
 # 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
 # 0.3.3: 孤児ジョブ自動中止(cancel_if_unpolled)
@@ -731,6 +732,42 @@ class _WanA14BBase(VideoAdapter):
             log(f"プロンプト接尾辞を自動付与: {suffix}")
         return p
 
+    def _inject_mid_keyframes(self, condition, mids, positions, num_frames,
+                              w, h, log):
+        """条件テンソルの中間latentフレームにキーフレームを注入する。
+
+        diffusersのWan i2v条件付けは [マスク4ch + 条件latent 16ch] の
+        チャネル連結 (先頭=1、中間=0、終端=1)。AniSora V3.2は任意時間位置の
+        画像ガイド(時空間マスク)で学習されているため、中間位置のマスクを
+        立てて同じ立ち絵のlatentを書き込めば「真ん中も固定」できる
+        (2026-07-12 お兄さま発案: 終端だけでは中盤で一回転して戻る
+        「往復回転」が起きた=ロップで実証)。"""
+        import torch
+        pipe = self.pipe
+        tvs = int(getattr(pipe, "vae_scale_factor_temporal", 4))
+        mask_ch = condition.shape[1] - int(pipe.vae.config.z_dim)
+        t_lat = condition.shape[2]
+        lm_mean = torch.tensor(pipe.vae.config.latents_mean).view(
+            1, -1, 1, 1, 1).to(condition.device, condition.dtype)
+        lm_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+            1, -1, 1, 1, 1).to(condition.device, condition.dtype)
+        for img, pos in zip(mids, positions):
+            m = int(round(float(pos) * (num_frames - 1)))
+            lm = 0 if m <= 0 else (m - 1) // tvs + 1
+            lm = min(max(lm, 0), t_lat - 1)
+            t = pipe.video_processor.preprocess(
+                img, height=h, width=w).unsqueeze(2)
+            t = t.to(device=condition.device, dtype=pipe.vae.dtype)
+            enc = pipe.vae.encode(t)
+            lat = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
+                   else enc.latents)
+            lat = lat.to(condition.dtype)
+            lat = (lat - lm_mean) * lm_std
+            condition[:, mask_ch:, lm] = lat[:, :, 0]
+            condition[:, :mask_ch, lm] = 1.0
+            log(f"中間キーフレーム注入: pos={float(pos):.2f} -> "
+                f"画素フレーム{m} (latent {lm}/{t_lat})")
+
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
         w = _snap(req.width, 16, 240)
@@ -754,9 +791,34 @@ class _WanA14BBase(VideoAdapter):
         if len(req.images) >= 2:
             kw["last_image"] = _fit_image(req.images[-1], w, h)
             log("終端画像アンカー: 始点と同じポーズで終わるよう拘束")
+        # 中間キーフレーム (images[1:-1]): prepare_latents をフックして
+        # 条件テンソルに直接注入する。失敗しても先頭/終端拘束で続行。
+        mids = [_fit_image(im, w, h) for im in req.images[1:-1]]
+        mid_pos = (list(req.key_positions[1:-1])
+                   if len(req.key_positions) == len(req.images)
+                   else [(i + 1) / (len(mids) + 1)
+                         for i in range(len(mids))])
+        orig_prep = None
+        if mids:
+            orig_prep = self.pipe.prepare_latents
+
+            def _patched(*a, **k):
+                latents, condition = orig_prep(*a, **k)
+                try:
+                    self._inject_mid_keyframes(condition, mids, mid_pos,
+                                               n, w, h, log)
+                except Exception as e:   # noqa: BLE001
+                    log(f"中間キーフレーム注入に失敗 (先頭/終端のみで"
+                        f"続行): {str(e)[:200]}")
+                return latents, condition
+            self.pipe.prepare_latents = _patched
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance}")
-        out = _call_with_optional_kwargs(
-            self.pipe, kw, ["last_image", "callback_on_step_end"], log)
+        try:
+            out = _call_with_optional_kwargs(
+                self.pipe, kw, ["last_image", "callback_on_step_end"], log)
+        finally:
+            if orig_prep is not None:
+                self.pipe.prepare_latents = orig_prep
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
