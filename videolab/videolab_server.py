@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.3.9"   # 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
+__version__ = "0.4.0"   # 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
+# 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
 # 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
 # 0.3.7: 中間キーフレーム注入(往復回転の対策)
 # 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
@@ -699,12 +700,17 @@ class _WanA14BBase(VideoAdapter):
         self.loaded = False
 
     def _finalize_pipe(self, log, offload: str = "", footprint_gb=None,
-                       vae_tiling: bool = False):
+                       vae_tiling: bool = False,
+                       resident_margin_gb: float = 6):
         """vae_tiling=True: GPU常駐でもVAEタイリングを有効にする。
         動画を丸ごとVAEでencodeするアダプタ(VACEの81f条件動画など)は、
         タイリング無しだと中間テンソルが数十GBになりA100-80でもOOMする
         (2026-07-12実障害: 常駐70GB+encodeでVRAM 79GB超過)。
-        静止画しかencodeしないアダプタは False のまま(デコードが速い)。"""
+        静止画しかencodeしないアダプタは False のまま(デコードが速い)。
+
+        resident_margin_gb: 常駐判定の余白。既定6GB。アクティベーションが
+        大きいモデル(VACE bf16は81f attentionで~9GB)は大きめを渡すこと
+        (bf16 70GB+6の判定でA100-80常駐→残り324MiBでOOMした実績あり)。"""
         import torch
         from diffusers import UniPCMultistepScheduler
         try:
@@ -727,7 +733,7 @@ class _WanA14BBase(VideoAdapter):
             mode = "model"
             try:
                 total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-                if footprint_gb and total_gb >= footprint_gb + 6:
+                if footprint_gb and total_gb >= footprint_gb + resident_margin_gb:
                     mode = "cuda"
                 elif total_gb < 18:
                     mode = "seq"
@@ -986,17 +992,22 @@ class VACEAdapter(_WanA14BBase):
       extra["conditioning_scale"]= 制御強度 (既定1.0)
     """
     id = "vace"
-    label = "Wan2.2 VACE-Fun 14B (骨格制御・ポーズ駆動)"
+    label = "Wan2.2 VACE-Fun 14B (骨格制御・GGUF)"
     desc = ("Alibaba PAI の Wan2.2 VACE-Fun。OpenPose骨格動画で全フレームの"
             "ポーズ・向きを直接指定する(向き回転の根絶用)。images[0]=参照"
             "立ち絵、骨格は extra pose_frames_b64 か images 2枚目以降で渡す。"
-            "extra例: {\"conditioning_scale\": 1.0}。Wan2.1版に切り替えるには "
-            "環境変数 VIDEOLAB_VACE_REPO=Wan-AI/Wan2.1-VACE-14B-diffusers")
-    requires = "Colab A100推奨 (bf16 DL約70GB・80GB VRAMで常駐)"
+            "extra例: {\"conditioning_scale\": 1.0}。量子化は共通設定の "
+            "quant (Q8_0既定/Q4_0)。bf16フル精度は VIDEOLAB_VACE_QUANT=bf16 "
+            "(A100-80でも常駐不可->自動オフロードで低速)")
+    requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) — DL 40GB前後 "
+                "(bf16指定時のみ70GB)")
     modes = ("i2v",)
     repo = os.environ.get("VIDEOLAB_VACE_REPO",
                           "linoyts/Wan2.2-VACE-Fun-14B-diffusers")
-    disk_gb = 70         # transformer x2 (各~28GB) + UMT5 11.4GB + VAE
+    gguf_repo = "QuantStack/Wan2.2-VACE-Fun-A14B-GGUF"
+    cache_repos = ("QuantStack/Wan2.2-VACE-Fun-A14B-GGUF",
+                   "linoyts/Wan2.2-VACE-Fun-14B-diffusers")
+    disk_gb = 45         # GGUF Q8 ~31GB + ベース部品(UMT5+VAE) ~12GB
     flow_shift = float(os.environ.get("VIDEOLAB_VACE_SHIFT", "5.0"))
     defaults = {"width": 464, "height": 848, "num_frames": 81, "fps": 16,
                 "steps": 30, "guidance": 5.0}
@@ -1006,6 +1017,19 @@ class VACEAdapter(_WanA14BBase):
                     "多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,"
                     "形态畸形的肢体,手指融合,静止不动的画面,杂乱的背景,三条腿,"
                     "背景人很多,倒着走")
+
+    def _resolve_want(self, extra: dict) -> tuple:
+        """量子化とオフロードをリクエスト>環境変数>既定(Q8_0)で解決。
+        アプリの共通quant設定がそのまま効く(2026-07-12「Q4選んでいても
+        おっきいほうが使われます」対応 — 従来vaceはbf16固定だった)。"""
+        q = str((extra or {}).get("quant")
+                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q8_0"))
+        if q not in ("Q4_0", "Q8_0", "bf16"):
+            q = "Q8_0"
+        off = str((extra or {}).get("offload")
+                  or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
+        off = "seq" if off in ("seq", "sequential") else ""
+        return q, off
 
     def ensure_loaded(self, log):
         _require_deps(log)
@@ -1017,18 +1041,70 @@ class VACEAdapter(_WanA14BBase):
                 "この diffusers には WanVACEPipeline がありません。"
                 'pip install -U "diffusers>=0.39.0" を実行してから'
                 "サーバを再起動してください")
-        log(f"読み込み開始: {self.repo} (bf16・初回はDL約{self.disk_gb}GB)")
-        self.pipe = WanVACEPipeline.from_pretrained(
-            self.repo, torch_dtype=torch.bfloat16)
-        # 14B transformer x2 の bf16 常駐は~70GB: A100-80のみGPU常駐、
-        # それ以外は自動でオフロードへ (判定は _finalize_pipe)。
+        quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
+        if quant == "bf16":
+            # フル精度: 常駐70GB+81f attentionの活性化~9GBはA100-80にも
+            # 入らない(2026-07-12実測: 残り324MiBでOOM)ため余白12GBで判定
+            # -> 実質オフロード運用。品質検証用の逃げ道として残す
+            log(f"読み込み開始: {self.repo} (bf16・初回はDL約70GB)")
+            self.pipe = WanVACEPipeline.from_pretrained(
+                self.repo, torch_dtype=torch.bfloat16)
+            fp, margin = 79, 12
+        else:
+            from diffusers import GGUFQuantizationConfig
+            from huggingface_hub import hf_hub_download
+            try:
+                from diffusers import WanVACETransformer3DModel
+            except ImportError:
+                raise RuntimeError(
+                    "この diffusers には WanVACETransformer3DModel が"
+                    'ありません。pip install -U "diffusers>=0.39.0" を'
+                    "実行してからサーバを再起動してください")
+            gguf_high = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
+                         f"{quant}.gguf")
+            gguf_low = (f"LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-"
+                        f"{quant}.gguf")
+            qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+            log(f"GGUF DL: {self.gguf_repo} {quant} "
+                f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB'})")
+            hi = hf_hub_download(self.gguf_repo, gguf_high)
+            lo = hf_hub_download(self.gguf_repo, gguf_low)
+            log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
+            t_hi = WanVACETransformer3DModel.from_single_file(
+                hi, quantization_config=qc, config=self.repo,
+                subfolder="transformer", torch_dtype=torch.bfloat16)
+            log("transformer_2(LowNoise) 読み込み")
+            t_lo = WanVACETransformer3DModel.from_single_file(
+                lo, quantization_config=qc, config=self.repo,
+                subfolder="transformer_2", torch_dtype=torch.bfloat16)
+            log(f"ベース部品 DL/読み込み: {self.repo} (VAE+UMT5 約12GB)")
+            self.pipe = WanVACEPipeline.from_pretrained(
+                self.repo, transformer=t_hi, transformer_2=t_lo,
+                torch_dtype=torch.bfloat16)
+            # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
+            fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
+            margin = 10
         # VACEは81fの骨格条件動画を丸ごとVAE encodeするため、常駐でも
         # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
-        self._finalize_pipe(log, footprint_gb=self.disk_gb, vae_tiling=True)
+        self._finalize_pipe(log, offload=offload, footprint_gb=fp,
+                            vae_tiling=True, resident_margin_gb=margin)
+        self.loaded_quant, self.loaded_offload = quant, offload
         self.loaded = True
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
+        # 量子化/オフロード指定がロード時と違えば積み替え (anisoraと同じ)
+        want = self._resolve_want(req.extra)
+        if self.loaded and want != (getattr(self, "loaded_quant", None),
+                                    getattr(self, "loaded_offload", None)):
+            log(f"設定変更 {getattr(self, 'loaded_quant', '?')}/"
+                f"{getattr(self, 'loaded_offload', '?')} -> "
+                f"{want[0]}/{want[1]}: モデルを積み替えます")
+            self.unload(log)
+            _free_cuda(log)
+        if not self.loaded:
+            self._next_extra = dict(req.extra or {})
+            self.ensure_loaded(log)
         w = _snap(req.width, 16, 240)
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
