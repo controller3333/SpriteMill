@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.0"   # 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
+__version__ = "0.6.1"   # 0.6.1: vace用Lightning 4step LoRA + High段間引き
+# 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
 # 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
 # 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
 # 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
@@ -1342,11 +1343,18 @@ class VACEAdapter(_WanA14BBase):
                     or os.environ.get("VIDEOLAB_VACE_PATCH", "fun")).lower()
         if patch not in ("fun", "slice"):
             patch = "fun"
+        lora = str(e.get("vace_lora")
+                   or os.environ.get("VIDEOLAB_VACE_LORA", "")).lower()
+        if lora not in ("lightning",):
+            lora = ""
         if base != "anisora":
             # 移植なしでは experts/patch は不活性 — 正規化してノブ操作
             # だけの無駄な積み替え(数分)を防ぐ
             experts, patch = "both", "fun"
-        return q, off, base, experts, patch
+        else:
+            # LightningはT2V(=fun)向け蒸留。移植ベースでは意味が無い
+            lora = ""
+        return q, off, base, experts, patch, lora
 
     def ensure_loaded(self, log):
         _require_deps(log)
@@ -1360,7 +1368,7 @@ class VACEAdapter(_WanA14BBase):
                 'pip install -U "diffusers>=0.39.0" を実行してから'
                 "サーバを再起動してください")
         want = self._resolve_want(getattr(self, "_next_extra", {}))
-        quant, offload, base, experts, patch = want
+        quant, offload, base, experts, patch, lora = want
         if quant == "bf16":
             # フル精度: 常駐70GB+81f attentionの活性化~9GBはA100-80にも
             # 入らない(2026-07-12実測: 残り324MiBでOOM)ため余白12GBで判定
@@ -1430,6 +1438,33 @@ class VACEAdapter(_WanA14BBase):
             # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
             fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
             margin = 10
+        if lora == "lightning":
+            # Lightning 4step蒸留LoRA (T2V-A14B用がVACE-Funに適合。
+            # cfg=1で回すためCFGパスも消え、14step/cfg5比で約7倍速)。
+            # High/Lowの2エキスパートへそれぞれのLoRAを装着する
+            rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
+                                 "lightx2v/Wan2.2-Lightning")
+            fold = os.environ.get(
+                "VIDEOLAB_VACE_LORA_DIR",
+                "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
+            log(f"Lightning 4step LoRA 読み込み: {rep}/{fold} "
+                "(High/Low 各1.2GB)")
+            try:
+                self.pipe.load_lora_weights(
+                    rep, adapter_name="lightning",
+                    weight_name=f"{fold}/high_noise_model.safetensors")
+                self.pipe.load_lora_weights(
+                    rep, adapter_name="lightning_2",
+                    weight_name=f"{fold}/low_noise_model.safetensors",
+                    load_into_transformer_2=True)
+                self.pipe.set_adapters(["lightning", "lightning_2"],
+                                       [1.0, 1.0])
+                log("Lightning適用完了: steps=6/cfg=1.0 で運用すること")
+            except Exception as e:
+                raise RuntimeError(
+                    "Lightning LoRAの適用に失敗しました (GGUF量子化との"
+                    "組み合わせが原因の可能性)。videolab_pose_lora を外すか "
+                    f"quant=bf16 で再試行してください: {str(e)[:300]}")
         # VACEは81fの骨格条件動画を丸ごとVAE encodeするため、常駐でも
         # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
         self._finalize_pipe(log, offload=offload, footprint_gb=fp,
@@ -1459,11 +1494,12 @@ class VACEAdapter(_WanA14BBase):
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
-        if want[2] == "fun" and steps <= 12:
+        if want[2] == "fun" and steps <= 12 and want[5] != "lightning":
             # 非蒸留の素のVACE-Funに蒸留レシピは「保証つきの泥」
+            # (Lightning LoRA装着時は蒸留済みなので低stepが正解)
             log(f"⚠ vace_base=fun は非蒸留です: steps={steps}/"
                 f"cfg={req.guidance} では崩れます。steps=30 cfg=5.0 を"
-                "指定してください")
+                "指定してください (高速化は vace_lora=lightning を推奨)")
         # vace_end: 骨格制御を序盤ステップに限定し終盤は解放する
         # (kijaiワークフローの end_percent 相当の定石)。ポーズは序盤の
         # 高ノイズ段で確定するため、終盤解放で「骨格がそのまま画面に
@@ -1495,6 +1531,40 @@ class VACEAdapter(_WanA14BBase):
             control = [control[i] for i in idx]
             log(f"制御フレーム数を調整: {got} -> {n}")
         ref = _fit_image(req.images[0], w, h)
+        # High段間引き (vace_high_steps): 構図が決まるHigh段は数stepで
+        # 足りるという運用向けに、σ>=boundaryのステップを等間隔でN本へ
+        # 間引く。UniPCはσ/tを位置参照するため両配列を同じ添字で
+        # 組み替えれば任意の単調減少ラダーで動く (2026-07-13、
+        # 「Highのステップ数を低くしたい」要望)
+        try:
+            hs = int(req.extra.get("vace_high_steps")
+                     or os.environ.get("VIDEOLAB_VACE_HIGH_STEPS", "0") or 0)
+        except (TypeError, ValueError):
+            hs = 0
+        sched = getattr(self.pipe, "scheduler", None)
+        orig_set_ts = getattr(sched, "set_timesteps", None)
+        if hs > 0 and sched is not None:
+            bnd = float(getattr(getattr(self.pipe, "config", None),
+                                "boundary_ratio", None) or 0.9)
+
+            def _set_thin(nsteps, device=None, **kw3):
+                orig_set_ts(nsteps, device=device, **kw3)
+                sig, ts = sched.sigmas, sched.timesteps
+                hi = [i for i in range(len(ts)) if float(sig[i]) >= bnd]
+                lo_i = [i for i in range(len(ts)) if float(sig[i]) < bnd]
+                if len(hi) <= hs:
+                    return
+                keep = sorted({int(round(x)) for x in
+                               [k * (len(hi) - 1) / max(1, hs - 1)
+                                for k in range(hs)]})
+                idx = [hi[k] for k in keep] + lo_i
+                sched.timesteps = ts[idx]
+                sched.sigmas = torch.cat([sig[idx], sig[-1:]])
+                sched.num_inference_steps = len(idx)
+                log(f"High段間引き: {len(hi)}→{len(keep)}本 "
+                    f"(計{len(idx)}step)")
+
+            sched.set_timesteps = _set_thin
         # 序盤限定適用の実装: 完了ステップ数をコールバックで数え、閾値を
         # 越えたら transformer への control_hidden_states_scale をゼロに
         # 差し替える (diffusers 0.39 WanVACEPipeline はループ内で
@@ -1546,6 +1616,8 @@ class VACEAdapter(_WanA14BBase):
         finally:
             for m, orig in unwraps:
                 m.forward = orig
+            if orig_set_ts is not None:
+                sched.set_timesteps = orig_set_ts
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
