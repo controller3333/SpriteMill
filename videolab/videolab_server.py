@@ -41,7 +41,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.7"   # 0.3.7: 中間キーフレーム注入(往復回転の対策)
+__version__ = "0.3.8"   # 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
+# 0.3.7: 中間キーフレーム注入(往復回転の対策)
 # 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
 # 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
 # 0.3.4: ジョブextraで量子化/オフロード指定(共通設定対応)
@@ -179,6 +180,25 @@ def _free_cuda(log):
         pass
 
 
+def _repo_cache_dir(repo: str) -> Path:
+    hub = Path(os.environ.get("HF_HOME",
+                              str(Path.home() / ".cache" / "huggingface"))) / "hub"
+    return hub / ("models--" + repo.replace("/", "--"))
+
+
+def _repo_cache_gb(repo: str) -> float:
+    """リポのHFキャッシュ実サイズ(GB)。snapshots/ はblobsへのsymlinkなので
+    実体のみ数える(二重カウント防止)。"""
+    d = _repo_cache_dir(repo)
+    if not repo or not d.is_dir():
+        return 0.0
+    try:
+        return sum(f.lstat().st_size for f in d.rglob("*")
+                   if f.is_file() and not f.is_symlink()) / 2**30
+    except Exception:
+        return 0.0
+
+
 def _purge_model_cache(repo: str, log):
     """指定リポのHFキャッシュを削除してディスクを空ける(Colabの容量対策)。
 
@@ -188,18 +208,30 @@ def _purge_model_cache(repo: str, log):
     """
     if not repo:
         return
-    hub = Path(os.environ.get("HF_HOME",
-                              str(Path.home() / ".cache" / "huggingface"))) / "hub"
-    d = hub / ("models--" + repo.replace("/", "--"))
+    d = _repo_cache_dir(repo)
     if d.is_dir():
-        try:
-            # snapshots/ はblobsへのsymlinkなので実体のみ数える(二重カウント防止)
-            sz = sum(f.lstat().st_size for f in d.rglob("*")
-                     if f.is_file() and not f.is_symlink()) / 2**30
-        except Exception:
-            sz = 0
+        sz = _repo_cache_gb(repo)
         shutil.rmtree(d, ignore_errors=True)
         log(f"ディスク解放: {repo} のキャッシュ削除 ({sz:.0f}GB)")
+
+
+def _can_keep_cache(next_adapter, log) -> bool:
+    """モデル切替時、前モデルのHFキャッシュを温存できるか判定する。
+
+    従来は無条件削除だったが、anisora(45GB)⇔vace(70GB)を方向別に交互運用
+    すると切替のたびに数十GBを再DLしてしまう。次モデルの未DL分を差し引いて
+    も空きが残る(既定25GB、VIDEOLAB_PURGE_KEEP_FREE_GB)なら温存する。"""
+    try:
+        repos = (getattr(next_adapter, "cache_repos", None)
+                 or [getattr(next_adapter, "repo", "")])
+        cached = sum(_repo_cache_gb(r) for r in repos if r)
+        need = max(0.0, float(getattr(next_adapter, "disk_gb", 60)) - cached)
+        free = shutil.disk_usage(Path.home()).free / 2**30
+        margin = float(os.environ.get("VIDEOLAB_PURGE_KEEP_FREE_GB", "25"))
+        log(f"ディスク判定: 空き{free:.0f}GB / 次モデルの未DL分 約{need:.0f}GB")
+        return free - need >= margin
+    except Exception:
+        return False
 
 
 # ------------------------------------------------ mock: GPU不要の疎通確認用
@@ -404,6 +436,7 @@ class _LTX2Base(VideoAdapter):
     """
     repo = ""            # サブクラスで指定
     distilled = True
+    disk_gb = 46         # bf16重みの目安 (キャッシュ温存判定用)
 
     def __init__(self):
         super().__init__()
@@ -516,6 +549,7 @@ class LTX09Adapter(VideoAdapter):
             "キーフレーム条件付け対応。")
     requires = "VRAM 10〜16GB (T4/L4/ローカル12GB+)"
     repo = os.environ.get("VIDEOLAB_LTX098_REPO", "Lightricks/LTX-Video-0.9.7-distilled")
+    disk_gb = 30
     defaults = {"width": 704, "height": 480, "num_frames": 97, "fps": 24,
                 "steps": 8, "guidance": 1.0}
 
@@ -595,6 +629,7 @@ class Wan22Adapter(VideoAdapter):
     requires = "VRAM 24GB (RTX4090/L4/A100)・オフロードで低VRAM可"
     modes = ("i2v",)
     repo = os.environ.get("VIDEOLAB_WAN22_REPO", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+    disk_gb = 30
     defaults = {"width": 704, "height": 704, "num_frames": 81, "fps": 24,
                 "steps": 40, "guidance": 5.0}
 
@@ -844,6 +879,7 @@ class AniSoraAdapter(_WanA14BBase):
                 "逐次オフロード (低速・RAM32GB推奨)・DL 30〜45GB")
     gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
     cache_repos = ("QuantStack/Index-Anisora-V3.2-GGUF",)
+    disk_gb = 45         # GGUF Q8 32GB + ベース部品12GB
     prompt_suffix = ("aesthetic score: 6.0. motion score: {motion:.1f}. "
                      "There is no text in the video.")
     defaults = {"width": 464, "height": 848, "num_frames": 81, "fps": 16,
@@ -916,6 +952,108 @@ class AniSoraAdapter(_WanA14BBase):
 
 
 @register
+class VACEAdapter(_WanA14BBase):
+    """Wan2.2 VACE-Fun 14B — OpenPose骨格制御動画によるポーズ駆動 i2v。
+
+    AniSora i2vの斜め後ろ(back_left/back_right)は、プロンプトロック・
+    motion減速・終端アンカー・中間キーフレーム5点拘束の全てを貫通して
+    「拘束点の合間で一回転する」抜け道が塞げなかった(2026-07-12 ロップで
+    実証)。VACEは全フレームのポーズを骨格で指定するため回転は定義上
+    起こり得ない。VACEはスタイル非依存で参照画像の画風を保持し、
+    アニメ絵にも強い(コミュニティ報告)。
+
+    リクエスト契約:
+      images[0]                  = 参照キャラ立ち絵 (reference_images)
+      extra["pose_frames_b64"]   = OpenPose骨格フレーム列 (base64 PNGリスト、
+                                   engine/pose_video.py が生成)
+      images[1:]                 = 上記の代替 (webUI手動テスト用)
+      extra["conditioning_scale"]= 制御強度 (既定1.0)
+    """
+    id = "vace"
+    label = "Wan2.2 VACE-Fun 14B (骨格制御・ポーズ駆動)"
+    desc = ("Alibaba PAI の Wan2.2 VACE-Fun。OpenPose骨格動画で全フレームの"
+            "ポーズ・向きを直接指定する(向き回転の根絶用)。images[0]=参照"
+            "立ち絵、骨格は extra pose_frames_b64 か images 2枚目以降で渡す。"
+            "extra例: {\"conditioning_scale\": 1.0}。Wan2.1版に切り替えるには "
+            "環境変数 VIDEOLAB_VACE_REPO=Wan-AI/Wan2.1-VACE-14B-diffusers")
+    requires = "Colab A100推奨 (bf16 DL約70GB・80GB VRAMで常駐)"
+    modes = ("i2v",)
+    repo = os.environ.get("VIDEOLAB_VACE_REPO",
+                          "linoyts/Wan2.2-VACE-Fun-14B-diffusers")
+    disk_gb = 70         # transformer x2 (各~28GB) + UMT5 11.4GB + VAE
+    flow_shift = float(os.environ.get("VIDEOLAB_VACE_SHIFT", "5.0"))
+    defaults = {"width": 464, "height": 848, "num_frames": 81, "fps": 16,
+                "steps": 30, "guidance": 5.0}
+    # Wan公式の標準ネガティブ (蒸留版と違い cfg>1 なので効く)
+    WAN_NEGATIVE = ("色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,"
+                    "静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,"
+                    "多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,"
+                    "形态畸形的肢体,手指融合,静止不动的画面,杂乱的背景,三条腿,"
+                    "背景人很多,倒着走")
+
+    def ensure_loaded(self, log):
+        _require_deps(log)
+        import torch
+        try:
+            from diffusers import WanVACEPipeline
+        except ImportError:
+            raise RuntimeError(
+                "この diffusers には WanVACEPipeline がありません。"
+                'pip install -U "diffusers>=0.39.0" を実行してから'
+                "サーバを再起動してください")
+        log(f"読み込み開始: {self.repo} (bf16・初回はDL約{self.disk_gb}GB)")
+        self.pipe = WanVACEPipeline.from_pretrained(
+            self.repo, torch_dtype=torch.bfloat16)
+        # 14B transformer x2 の bf16 常駐は~70GB: A100-80のみGPU常駐、
+        # それ以外は自動でオフロードへ (判定は _finalize_pipe)
+        self._finalize_pipe(log, footprint_gb=self.disk_gb)
+        self.loaded = True
+
+    def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
+        import torch
+        w = _snap(req.width, 16, 240)
+        h = _snap(req.height, 16, 240)
+        n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
+        steps = int(req.steps)
+        pf = list(req.extra.get("pose_frames_b64") or [])
+        if pf:
+            control = load_images_b64(pf)
+        elif len(req.images) > 1:
+            control = list(req.images[1:])   # webUI手動テスト用の代替経路
+        else:
+            raise RuntimeError(
+                "vace には骨格制御フレームが必要です: extra.pose_frames_b64 "
+                "(base64 PNGのリスト) か images の2枚目以降で渡してください。"
+                "SpriteMill本体からは --videolab-pose-dirs back で自動生成")
+        got = len(control)
+        control = [im if im.size == (w, h) else _fit_image(im, w, h)
+                   for im in control]
+        if got != n:
+            # フレーム数が合わないときは線形リサンプルで合わせる
+            idx = [round(i * (got - 1) / max(1, n - 1)) for i in range(n)]
+            control = [control[i] for i in idx]
+            log(f"制御フレーム数を調整: {got} -> {n}")
+        ref = _fit_image(req.images[0], w, h)
+        kw = dict(video=control, reference_images=[ref],
+                  prompt=self._build_prompt(req, log),
+                  negative_prompt=req.negative or self.WAN_NEGATIVE,
+                  width=w, height=h, num_frames=n,
+                  num_inference_steps=steps,
+                  guidance_scale=float(req.guidance),
+                  conditioning_scale=float(
+                      req.extra.get("conditioning_scale", 1.0)),
+                  generator=torch.Generator("cpu").manual_seed(req.seed),
+                  output_type="np", return_dict=False,
+                  callback_on_step_end=_step_callback(progress, steps))
+        log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance} "
+            f"骨格制御{len(control)}f cond={kw['conditioning_scale']}")
+        out = _call_with_optional_kwargs(
+            self.pipe, kw, ["callback_on_step_end", "conditioning_scale"], log)
+        progress(0.92)
+        return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
+
+
+@register
 class Wan22A14BAdapter(_WanA14BBase):
     """Wan2.2 I2V-A14B フル + Lightning 4step LoRA + スプライト歩行LoRA。
 
@@ -931,6 +1069,7 @@ class Wan22A14BAdapter(_WanA14BBase):
             "専用LoRA(pix3lwalk)を併用可能。i2vのみ。"
             "extra例: {\"walk_lora\": \"pixel_walk\", \"walk_weight\": 0.8}")
     requires = "Colab A100 (DL約126GB — ディスク要注意)"
+    disk_gb = 126
     cache_repos = ("Wan-AI/Wan2.2-I2V-A14B-Diffusers", "lightx2v/Wan2.2-Lightning",
                    "theamusing/wan2.2_pixel_walk_lora", "styly-agents/Wan2-2-pixel-animate")
     WALK_LORAS = {
@@ -1092,10 +1231,14 @@ def worker_loop():
                     prev.unload(log)
                     _free_cuda(log)
                     if os.environ.get("VIDEOLAB_PURGE_ON_SWITCH") == "1":
-                        repos = (getattr(prev, "cache_repos", None)
-                                 or [getattr(prev, "repo", "")])
-                        for r in repos:
-                            _purge_model_cache(r, log)
+                        if _can_keep_cache(adapter, log):
+                            log("空きが十分なため前モデルのキャッシュを温存 "
+                                "(戻したときの再DLを回避)")
+                        else:
+                            repos = (getattr(prev, "cache_repos", None)
+                                     or [getattr(prev, "repo", "")])
+                            for r in repos:
+                                _purge_model_cache(r, log)
             if not adapter.loaded:
                 j["status"] = "loading"
                 j["detail"] = f"{adapter.label} を読み込み中(初回はDLに数分〜数十分)"
