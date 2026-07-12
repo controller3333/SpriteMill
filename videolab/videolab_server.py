@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.1"   # 0.6.1: vace用Lightning 4step LoRA + High段間引き
+__version__ = "0.6.2"   # 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
+# 0.6.1: vace用Lightning 4step LoRA + High段間引き
 # 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
 # 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
 # 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
@@ -1449,6 +1450,21 @@ class VACEAdapter(_WanA14BBase):
                 "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
             log(f"Lightning 4step LoRA 読み込み: {rep}/{fold} "
                 "(High/Low 各1.2GB)")
+            # Colab同梱の古いtorchao(0.10)対策: peftのLoRA適用は全レイヤー
+            # にtorchao用dispatcherを試し、is_torchao_available()が
+            # 「古い版が入っている」ときFalseでなくImportErrorをraiseする
+            # (2026-07-13実障害: torchao 0.10 vs 要求>=0.16)。torchaoは
+            # 未使用なのでdispatcherを無効化して回避する
+            try:
+                from peft.tuners.lora import torchao as _plt
+                try:
+                    _plt.is_torchao_available()
+                except ImportError:
+                    _plt.is_torchao_available = lambda: False
+                    log("非互換torchaoを検出 -> peftのtorchao dispatcher"
+                        "を無効化 (LoRA適用には影響なし)")
+            except Exception:
+                pass
             try:
                 self.pipe.load_lora_weights(
                     rep, adapter_name="lightning",
