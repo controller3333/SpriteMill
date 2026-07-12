@@ -41,7 +41,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.3.8"   # 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
+# CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+__version__ = "0.3.9"   # 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
+# 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
 # 0.3.7: 中間キーフレーム注入(往復回転の対策)
 # 0.3.6: 終端画像アンカー(last_image、後ろ向き回転対策)
 # 0.3.5: VRAM余裕時はGPU常駐(オフロード無し)=A100高速化
@@ -694,7 +698,13 @@ class _WanA14BBase(VideoAdapter):
         self.pipe = None
         self.loaded = False
 
-    def _finalize_pipe(self, log, offload: str = "", footprint_gb=None):
+    def _finalize_pipe(self, log, offload: str = "", footprint_gb=None,
+                       vae_tiling: bool = False):
+        """vae_tiling=True: GPU常駐でもVAEタイリングを有効にする。
+        動画を丸ごとVAEでencodeするアダプタ(VACEの81f条件動画など)は、
+        タイリング無しだと中間テンソルが数十GBになりA100-80でもOOMする
+        (2026-07-12実障害: 常駐70GB+encodeでVRAM 79GB超過)。
+        静止画しかencodeしないアダプタは False のまま(デコードが速い)。"""
         import torch
         from diffusers import UniPCMultistepScheduler
         try:
@@ -730,7 +740,13 @@ class _WanA14BBase(VideoAdapter):
             try:
                 self.pipe.to("cuda")
                 log("全モデルをGPU常駐 (オフロード無し=最速)")
-                # 常駐時はVAEタイリング不要(タイリングはVAEデコードを遅くする)
+                if vae_tiling:
+                    try:
+                        self.pipe.vae.enable_tiling()
+                        log("VAEタイリング有効 (動画encodeのVRAM削減)")
+                    except Exception as e:
+                        log(f"VAEタイリング設定スキップ: {e}")
+                # (静止画encodeのみのモデルは常駐時タイリング不要=デコード最速)
                 return self._log_attn_backend(log)
             except Exception as e:   # OOM等 -> オフロードへ退避
                 log(f"GPU常駐に失敗({str(e)[:120]}) -> model_cpu_offloadへ")
@@ -1005,8 +1021,10 @@ class VACEAdapter(_WanA14BBase):
         self.pipe = WanVACEPipeline.from_pretrained(
             self.repo, torch_dtype=torch.bfloat16)
         # 14B transformer x2 の bf16 常駐は~70GB: A100-80のみGPU常駐、
-        # それ以外は自動でオフロードへ (判定は _finalize_pipe)
-        self._finalize_pipe(log, footprint_gb=self.disk_gb)
+        # それ以外は自動でオフロードへ (判定は _finalize_pipe)。
+        # VACEは81fの骨格条件動画を丸ごとVAE encodeするため、常駐でも
+        # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
+        self._finalize_pipe(log, footprint_gb=self.disk_gb, vae_tiling=True)
         self.loaded = True
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
@@ -1265,11 +1283,15 @@ def worker_loop():
         except JobCancelled:
             j["status"] = "cancelled"
             j["detail"] = "ユーザーによりキャンセル"
+            # 中断で放置された中間テンソルが次のジョブをOOMさせないように
+            _free_cuda(log)
         except Exception as e:
             j["status"] = "error"
             j["detail"] = str(e)[:600]
             j["log"].append(traceback.format_exc()[-1500:])
             print(f"[{jid}] ERROR: {e}", flush=True)
+            # OOM等の失敗断片を回収してから次のジョブへ
+            _free_cuda(log)
         finally:
             j["finished"] = time.time()
             j.pop("_req", None)
