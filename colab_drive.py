@@ -76,18 +76,23 @@ def extract_url_token(text: str) -> tuple[str, str] | None:
 def _classify_conn(t: str) -> str:
     """colab-connect-button の表示テキストから接続状態を分類する。
 
-    connected    : RAM/ディスク ゲージ表示 = ランタイム接続済み
-    connecting   : 接続中/割り当て中/初期化中/再接続中
-    disconnected : 「接続」「再接続」ボタン表示 = 未接続
-    unknown      : ボタンが見つからない・判別不能(判定には使わない)
+    実DOM採取(2026-07-12、WebView2+CDPでColab実機を観測)による実測値:
+      未接続       : 「接続 A100 arrow_drop_down」「再接続 A100 …」
+                     「新しいランタイムに接続する」
+      割り当て中   : 「more_horiz 接続中 arrow_drop_down」
+      接続済み(暇) : 「done arrow_drop_down」 (doneはチェックアイコンの
+                     リガチャ文字。RAM/ディスクゲージは別要素だった)
+      実行中       : 「more_horiz arrow_drop_down」 (接続中の文字なし)
     """
     if not t:
         return "unknown"
-    if re.search(r"RAM|ディスク|disk", t, re.I):
-        return "connected"
     if re.search(r"接続中|しています|connecting|割り当て|allocat|初期化"
                  r"|initializ", t, re.I):
         return "connecting"   # 「再接続しています」等の進行形もここ
+    if re.search(r"\bdone\b|RAM|ディスク|disk", t, re.I):
+        return "connected"
+    if re.search(r"more_horiz", t, re.I):
+        return "connected"    # セル実行中のビジー表示(接続はしている)
     if re.search(r"再接続|reconnect|接続|connect", t, re.I):
         return "disconnected"
     return "unknown"
@@ -217,9 +222,16 @@ class ColabDriver:
                 or "ServiceLogin" in u)
 
     def _click_any(self, patterns: list[str], selectors=None) -> bool:
-        """テキストが patterns のどれかに一致するボタンをクリック。"""
+        """テキストが patterns のどれかに一致するボタンをクリック。
+
+        ColabはMaterial 3へ移行済みで、GitHubノートの実行警告
+        「このまま実行」等は md-text-button (2026-07-12 実DOMで確認。
+        旧セレクタでは一度も押せていなかった=自動運転不発の主因)。"""
         rx = re.compile("|".join(patterns), re.I)
-        for sel in (selectors or ("paper-button", "mwc-button", "button",
+        for sel in (selectors or ("md-text-button", "md-filled-button",
+                                  "md-outlined-button",
+                                  "md-filled-tonal-button",
+                                  "paper-button", "mwc-button", "button",
                                   ".goog-buttonset-default",
                                   "[role='button']")):
             try:
@@ -283,26 +295,68 @@ class ColabDriver:
             "})()", default="") or ""
 
     def _cells_running(self) -> bool:
-        """セルが実行中/実行待ちかを複数のシグナルで推定する。"""
+        """セルが実行中/実行待ちかを判定する。
+
+        実測(2026-07-12): colab-run-button の shadowRoot 直下の className が
+        実行待ち=「cell-execution … pending」、実行中=「… animating running」
+        になる(アイドルは stale / stale error 等)。"""
         return bool(self._js(
             "(() => {"
+            "  for (const b of document.querySelectorAll("
+            "       'colab-run-button')) {"
+            "    const c = b.shadowRoot && b.shadowRoot.firstElementChild"
+            "      ? b.shadowRoot.firstElementChild.className : '';"
+            "    if (/running|pending|animating|queued/i.test(c))"
+            "      return true;"
+            "  }"
             "  if (document.querySelector("
             "      '.cell.running, .cell.pending, .cell.executing'))"
             "    return true;"
-            "  if (document.querySelector("
-            "      \"[aria-label*='中断'], [aria-label*='interrupt' i]\"))"
-            "    return true;"
-            "  for (const b of document.querySelectorAll("
-            "       'colab-run-button')) {"
-            "    const sr = b.shadowRoot;"
-            "    const t = ((sr && sr.textContent) || '') + ' '"
-            "              + (b.getAttribute('aria-label') || '');"
-            "    if (/中断|interrupt|stop/i.test(t)) return true;"
-            "    if (sr && sr.querySelector('.spinner, paper-spinner,"
-            " md-circular-progress, mwc-circular-progress')) return true;"
-            "  }"
             "  return false;"
             "})()", default=False))
+
+    def _crash_snackbar_open(self) -> bool:
+        """左下のクラッシュ通知(スナックバー)が開いているか。
+
+        実測(2026-07-12): colab-snackbar#message-area 内の
+        div.mdc-snackbar が表示中は mdc-snackbar--open クラスを持ち、
+        文言は「不明な理由により、セッションがクラッシュしました。」。
+        通知は自動では消えず、閉じるまでDOMに残り続けるため、
+        検知側は開始時に一度掃除してから監視する。"""
+        return bool(self._js(
+            "(() => {"
+            "  const walk = (root) => {"
+            "    for (const el of root.querySelectorAll("
+            "         '.mdc-snackbar--open')) {"
+            "      if (/クラッシュ|crash/i.test(el.textContent || ''))"
+            "        return true;"
+            "    }"
+            "    for (const el of root.querySelectorAll('*'))"
+            "      if (el.shadowRoot && walk(el.shadowRoot)) return true;"
+            "    return false;"
+            "  };"
+            "  return walk(document);"
+            "})()", default=False))
+
+    def _close_crash_snackbar(self) -> None:
+        """開きっぱなしのクラッシュ通知を閉じる(残骸の掃除用)。"""
+        self._js(
+            "(() => {"
+            "  const walk = (root) => {"
+            "    for (const el of root.querySelectorAll("
+            "         '.mdc-snackbar--open')) {"
+            "      if (!/クラッシュ|crash/i.test(el.textContent || ''))"
+            "        continue;"
+            "      const b = el.querySelector("
+            "        '.mdc-snackbar__dismiss, [class*=\"dismiss\"],"
+            " md-icon-button, button');"
+            "      if (b) b.click();"
+            "    }"
+            "    for (const el of root.querySelectorAll('*'))"
+            "      if (el.shadowRoot) walk(el.shadowRoot);"
+            "  };"
+            "  walk(document);"
+            "})()", default=None)
 
     _DIALOG_BTNS = ("mwc-dialog button", "mwc-dialog mwc-button",
                     "md-dialog button", "paper-dialog paper-button",
@@ -320,11 +374,12 @@ class ColabDriver:
     RUN_WARN = ["run anyway", "そのまま実行", "このまま実行", "実行する"]
 
     def _run_all(self, log, tries: int = 3) -> bool:
-        """すべてのセルを実行(Ctrl+F9)し、実行が本当に始まったかを確認。
+        """すべてのセルを実行し、実行が本当に始まったかを確認。
 
-        始まっていなければダイアログを潰し直して再試行する。「押した
-        つもりが走っていない→結局手でクリック」の自動リカバリ
-        (2026-07-12 ユーザー報告対応)。"""
+        起動はツールバーの実行ボタン(「ノートブック内のすべてのセルを
+        実行」md-text-button、2026-07-12 実DOMで確認)のクリックを優先し、
+        見つからなければ Ctrl+F9 にフォールバック。始まっていなければ
+        ダイアログを潰し直して再試行する。"""
         for attempt in range(1, tries + 1):
             self._dismiss_info_dialogs()
             self._click_any(self.RUN_WARN)   # 先に出ている実行警告
@@ -332,13 +387,27 @@ class ColabDriver:
                 self.page.bring_to_front()
             except Exception:
                 pass
-            try:
-                # ダイアログ残骸でキーが届かないのを防いでから送る
-                self.page.keyboard.press("Escape")
-                self.page.keyboard.press("Control+F9")
-            except Exception:
+            if self._cells_running():
+                # keep-aliveセル等が回っているとRun Allのキューがその後ろに
+                # 詰まって永遠に進まない -- 先に実行を中断してから流す
+                log("  実行中のセルを中断してからRun Allします")
+                try:
+                    self.page.keyboard.press("Escape")
+                    self.page.keyboard.press("Control+m")
+                    self.page.keyboard.press("i")
+                except Exception:
+                    pass
                 time.sleep(2)
-                continue
+            clicked = self._click_any(
+                [r"すべてのセルを実行", r"run\s*all"])
+            if not clicked:
+                try:
+                    # ダイアログ残骸でキーが届かないのを防いでから送る
+                    self.page.keyboard.press("Escape")
+                    self.page.keyboard.press("Control+F9")
+                except Exception:
+                    time.sleep(2)
+                    continue
             end = time.time() + 15
             while time.time() < end:
                 if self._click_any(self.RUN_WARN):
@@ -364,13 +433,14 @@ class ColabDriver:
                     "されてからもう一度お試しください(ログインは保存され、"
                     "次回からは自動になります)")
             time.sleep(1)
-        # 画面に前セッションのURL出力が残っていても問題ない:
-        # 回収は _fresh_url_token が /health 応答を確認したURLしか
-        # 採用しない(残骸・死んだトンネル・DNS未浸透はすべて弾かれる)
-        _old = extract_url_token(self._text())
-        if _old and _old[0]:
-            log(f"  画面に既存のURL出力あり({_old[0]}) -- "
-                "応答が確認できた場合のみ採用します")
+        # 1.5) サーバが既に生きているなら何も実行せずそのまま採用する。
+        # Run Allを押すと (a)キューが無限ループのkeep-aliveセルの後ろに
+        # 詰まり (b)キュー投入時にセル出力=URL行が消去される
+        # (2026-07-12ユーザー観測「5が回ってるせいで4が実行できてない」)
+        got = self._fresh_url_token()
+        if got:
+            log(f"サーバは既に稼働中です -- そのまま採用: {got[0]}")
+            return {"url": got[0], "token": got[1]}
         # 2) 1回目のRun all
         log("すべてのセルを実行します(1回目)…")
         if not self._run_all(log):
@@ -414,6 +484,22 @@ class ColabDriver:
             "URLが出ているか確認し、出ていれば手でアプリの欄に貼って"
             "ください")
 
+    def _scroll_to_server_output(self) -> bool:
+        """トンネルURLを印字するセル(サーバ起動セル)を画面内に出す。
+
+        Colabは画面外のセル出力を仮想化してDOMから外すため
+        (lazy-virtualized、2026-07-12実測: bodyテキストにwebUI行が
+        存在しなかった)、スクロールして表示させないと inner_text に
+        URL行が現れない。手動コピーが動いていたのは人間が見るために
+        スクロールしていたからだった。"""
+        try:
+            c = self.page.locator(".cell", has_text="run_in_colab(").last
+            c.scroll_into_view_if_needed(timeout=3000)
+            time.sleep(0.6)   # 仮想化解除の描画待ち
+            return True
+        except Exception:
+            return False
+
     def _fresh_url_token(self):
         """画面のURL/TOKENを、/health への到達を確認してから返す。
 
@@ -423,6 +509,7 @@ class ColabDriver:
         採用する(2026-07-12: 収集したURLがgetaddrinfo failedで全滅する
         事故が続いたため、検証をURLの新旧判定から到達性そのものに変更)。
         失敗したURLは30秒間probeを抑制して回線を無駄にしない。"""
+        self._scroll_to_server_output()   # 仮想化された出力を呼び戻す
         got = extract_url_token(self._text())
         if not got or not got[0]:
             return None
@@ -472,6 +559,13 @@ class ColabDriver:
         down_since = 0.0
         down_polls = 0
         last = ""
+        # クラッシュ通知は閉じるまでDOMに残るため、開始時に残骸を掃除して
+        # から監視する(以後に開いた通知=本物。2026-07-12実DOM調査)
+        if self._crash_snackbar_open():
+            log("  前回のクラッシュ通知の残骸を閉じます")
+            self._close_crash_snackbar()
+            time.sleep(1)
+        sticky = self._crash_snackbar_open()   # 閉じられなかった場合の保険
         while time.time() < min(end, hard_end):
             # 再開ランタイム等で再起動が不要なら(新しい)URLが先に出る
             if self._fresh_url_token():
@@ -481,15 +575,21 @@ class ColabDriver:
                 log(f"  ランタイム状態: {st}")
                 last = st
             dtxt = self._dialogs_text()
-            crashed = bool(re.search(r"クラッシュ|crash|再起動|restart",
-                                     dtxt, re.I))
-            # 開始直後(接続前かつ60秒以内)のクラッシュ通知は前セッションの
+            snack = self._crash_snackbar_open()
+            if sticky:
+                if not snack:
+                    sticky = False   # 一度閉じた -> 以後に開けば本物
+                snack = False
+            crashed = snack or bool(
+                re.search(r"クラッシュ|crash|再起動|restart", dtxt, re.I))
+            # 開始直後(接続前かつ60秒以内)のクラッシュ表示は前セッションの
             # 残骸なので掃除して無視。それ以外のクラッシュ通知は、接続
             # ボタンが変化しなくても再起動の確定シグナルとして扱う
             # (os.killはカーネルのみ殺しVM接続は切れない=右上は変化しない。
             #  2026-07-12ユーザー観測: 左下の「予期せぬクラッシュ」通知のみ)
             if crashed and not seen_connected and time.time() - start < 60:
                 self._dismiss_info_dialogs()
+                self._close_crash_snackbar()
                 crashed = False
             if (not seen_connected
                     and re.search(self.NO_GPU_RX, dtxt, re.I)):
@@ -513,6 +613,7 @@ class ColabDriver:
                 crash_seen = crash_seen or crashed
                 if crashed or st == "disconnected":
                     self._dismiss_info_dialogs()   # クラッシュ通知を閉じる
+                    self._close_crash_snackbar()   # (通知は自動では消えない)
                 if st == "connected":
                     time.sleep(2)                  # 状態の安定を確認
                     if self._conn_state() == "connected":

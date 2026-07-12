@@ -73,7 +73,10 @@ else:
     c3 = "%%writefile videolab_server.py\n" + code
 
     c4 = """# ---- 4) サーバ起動 + トンネル公開 (URL/TOKEN が表示される) ----
+import sys, importlib
 import videolab_server
+if "videolab_server" in sys.modules:      # 再実行時に最新コードを反映
+    videolab_server = importlib.reload(videolab_server)
 url, token = videolab_server.run_in_colab(preload=None)"""
 
     c5 = """# ---- 5) keep-alive: アイドル切断防止 (回しっぱなしでOK) ----

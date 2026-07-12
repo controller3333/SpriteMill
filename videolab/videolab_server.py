@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.4.2"   # 0.4.2: トンネル据え置き判定をプロセス生存ベースに
+__version__ = "0.4.3"   # 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
+# 0.4.2: トンネル据え置き判定をプロセス生存ベースに
 # 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
 # 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
 # 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
@@ -1877,6 +1878,23 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
     # 貼った直後にRun Allがもう一度走るとURLが差し替わり、貼った側は
     # getaddrinfo failed(DNS消滅)で必ず失敗した(2026-07-12実障害)。
     # cloudflaredはカーネルと別プロセスなのでランタイム再起動を生き延びる。
+    #
+    # 生存判定はDNS登録(DoH)で行う。v0.4.1のトンネル越しHTTPは「VMから
+    # 自分のトンネルに届かない」偽陰性で毎回作り直しに、v0.4.2のプロセス
+    # 生存のみは「プロセスは生きているがトンネルは死んでいる」ゾンビを
+    # 延々と再利用する偽陽性になった(いずれも2026-07-12実障害)。
+    # クライアントが必要とするのは公開DNSにホストが存在することなので、
+    # dns.google (DoH) での解決可否がちょうど正しい判定になる。
+    def _dns_ok(u, timeout=8):
+        """DoHでトンネルのホスト名が引けるか。判定不能時は None。"""
+        try:
+            host = u.split("//", 1)[-1].split("/", 1)[0]
+            with _rq.urlopen("https://dns.google/resolve?name="
+                             f"{host}&type=A", timeout=timeout) as r:
+                return json.load(r).get("Status") == 0
+        except Exception:
+            return None
+
     url_file = Path(tempfile.gettempdir()) / "videolab_url.txt"
     url = None
     if url_file.is_file():
@@ -1884,32 +1902,49 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
         cf_alive = (subprocess.run(["pgrep", "-f", "cloudflared"],
                                    capture_output=True).returncode == 0)
         if old and cf_alive:
-            # cloudflaredはプロセスが生きている限り同じURLを保つ(切断時も
-            # 同名で再接続する)ため、プロセス生存だけで据え置きにする。
-            # トンネル越しの /health 往復を判定に使うと、VMから自分の
-            # トンネルへ届かない環境で毎回作り直しになり、URLが回転して
-            # 貼った側が getaddrinfo failed で全滅する (2026-07-12実障害)
-            url = old
-            print("既存のトンネルを再利用します(URL据え置き)")
-    if url is None:
+            dns = _dns_ok(old)
+            if dns is not False:   # DoH不通(None)なら従来どおり据え置き
+                url = old
+                print("既存のトンネルを再利用します(URL据え置き)")
+            else:
+                print("既存トンネルのDNSが消えています(ゾンビ) -- 作り直します")
+    for attempt in range(1, 4):
+        if url is not None:
+            break
         subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
         time.sleep(1)
         proc = subprocess.Popen(
             ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}",
              "--no-autoupdate"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        got = None
         deadline = time.time() + 60
-        while time.time() < deadline and url is None:
+        while time.time() < deadline and got is None:
             line = proc.stdout.readline()
             m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com",
                            line or "")
             if m:
-                url = m.group(0)
-        if not url:
-            raise RuntimeError(
-                "cloudflared のトンネルURLが取得できませんでした。"
-                "セルを再実行してください。")
-        url_file.write_text(url, encoding="utf-8")
+                got = m.group(0)
+        if not got:
+            print(f"トンネルURLを取得できませんでした (試行{attempt}/3)")
+            continue
+        # 死産検知: URLが印字されてもDNSに載らないトンネルがある
+        # (quick tunnelのレート制限/エッジ障害)。載るまで待ち、
+        # 駄目なら作り直す
+        for _ in range(12):
+            dns = _dns_ok(got)
+            if dns:
+                url = got
+                break
+            time.sleep(5)
+        if url is None:
+            print(f"トンネルがDNSに載りません -- 作り直します "
+                  f"(試行{attempt}/3: {got})")
+    if not url:
+        raise RuntimeError(
+            "cloudflared のトンネルを作成できませんでした(3回失敗)。"
+            "時間を置いてこのセルを再実行してください。")
+    url_file.write_text(url, encoding="utf-8")
     print("=" * 62)
     print("SpriteMill VideoLab 起動完了!")
     print(f"  webUI : {url}/?token={token}")
