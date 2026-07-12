@@ -526,11 +526,17 @@ class ColabDriver:
                             down_polls = 0
                             end = max(end, time.time() + 300)
                             continue
+                        # クラッシュ通知の直後はカーネルがまだ復帰中で
+                        # Run Allが空振りしやすい(2026-07-12ユーザー指摘:
+                        # 「出た直後だと反応しないかも。5〜10秒待機を」)
+                        # -- 検知から最低10秒は寝かせてから返す
+                        if time.time() - down_since < 10:
+                            continue
                         return "restarted"
                 elif (st == "unknown" and not crashed
-                        and time.time() - down_since >= 9):
+                        and time.time() - down_since >= 10):
                     # 接続ボタンが読めない環境でも、クラッシュ通知が消えて
-                    # 少し経てばカーネル復帰とみなす(2回目のRun All側にも
+                    # 10秒経てばカーネル復帰とみなす(2回目のRun All側にも
                     # 実行開始の確認+3回の押し直しがあるので安全)
                     return "restarted"
                 elif (st == "disconnected"
