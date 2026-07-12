@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.4.3"   # 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
+__version__ = "0.5.0"   # 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
+# 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
 # 0.4.2: トンネル据え置き判定をプロセス生存ベースに
 # 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
 # 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
@@ -976,16 +977,172 @@ class AniSoraAdapter(_WanA14BBase):
         return super().generate(req, workdir, log, progress)
 
 
+_GGML_BF16 = 30      # gguf.GGMLQuantizationType.BF16 (ggml固定値)
+
+
+def _gguf_storage_only(x) -> bool:
+    """ブロック量子化でない(=素の数値保存)テンソルか。
+
+    diffusers 0.39のGGUFロードは F32/F16 を素のテンソル(quant_type無し)、
+    BF16 を生バイトのGGUFParameter(quant_type=30) で保持する。"""
+    q = getattr(x, "quant_type", None)
+    if q is None:
+        return True
+    try:
+        return int(q) == _GGML_BF16
+    except Exception:
+        return False
+
+
+def _gguf_as_plain(v):
+    """非ブロック量子化テンソルを素のtorchテンソルに変換 (不可ならNone)。"""
+    import torch
+    q = getattr(v, "quant_type", None)
+    if q is None:
+        return v
+    try:
+        if int(q) == _GGML_BF16:
+            # BF16は生バイト(uint8)格納 -> 論理形状のbf16テンソルへ
+            return v.data.view(torch.bfloat16)
+    except Exception:
+        return None
+    return None
+
+
+def _transplant_base_weights(target, donor, log, tag: str = "",
+                             patch_mode: str = "fun",
+                             min_keys: int = 800) -> tuple:
+    """AniSora(Wan2.2-I2V系finetune)のbase重みをVACE transformerへ移植する。
+
+    コミュニティ定石「AniSoraベース+VACEモジュール」のdiffusers版
+    (2026-07-12設計)。diffusers変換後のパラメタ名は WanTransformer3DModel
+    と WanVACETransformer3DModel の共有部分(blocks.* / condition_embedder.*
+    / proj_out / scale_shift_table)で完全一致し(diffusers 0.39.0ソース+
+    GGUFヘッダ実測で確認)、vace_* はドナーに存在しないため自動的に
+    VACE-Fun側が温存される。
+
+    - patch_embedding: I2V=36ch / VACE=16ch で形状が違うため既定では移植
+      せず VACE-Fun側を維持。patch_mode="slice" はドナー重みの先頭16ch
+      (=ノイズlatent側。I2Vの条件mask4+latent16chは後方連結)を切り出して
+      移植する実験モード。
+    - GGUF量子化テンソル(GGUFParameter)は named_parameters のオブジェクトを
+      そのまま _parameters へ差し替えて quant_type ごと引き継ぐ
+      (load_state_dict(assign=True) は Parameter を再構築するため
+      quant_type 属性が失われる恐れがある)。
+    - 形状/quant_type の不一致はスキップ(破損防止)。移植キー数が min_keys
+      未満なら「命名不一致で空振り=素のVACE-Funが静かに動く」偽PASSを
+      防ぐため例外で停止する。
+
+    戻り値 = (移植キー数, スキップキー数)。
+    """
+    import torch
+    tgt = dict(target.named_parameters())
+    dn = dict(donor.named_parameters())
+    take, skipped, coerced = {}, [], []
+    for k, v in dn.items():
+        if k.startswith("patch_embedding."):
+            skipped.append(k)              # slice指定時は後段で個別処理
+            continue
+        t = tgt.get(k)
+        if t is None:
+            skipped.append(k)
+            continue
+        if (tuple(t.shape) == tuple(v.shape)
+                and getattr(t, "quant_type", None)
+                == getattr(v, "quant_type", None)):
+            take[k] = v
+            continue
+        # 保存形式だけの差は素のParameterに揃えて移植する。実測:
+        # AniSora=F32(素のテンソル) / VACE-Fun=BF16(GGUF格納) が
+        # proj_out・text_embedder・time_proj 等6テンソルで食い違う
+        # (2026-07-12 両GGUFヘッダ実測。time_embedder系はfp32昇格で両側
+        # 素のまま一致)。素通しでスキップすると出力ヘッドだけVACE-Funの
+        # キメラになる。GGUFLinearは素のParameterも扱える (AniSora
+        # アダプタのF32 headで実績)。
+        pv = _gguf_as_plain(v)
+        if (pv is not None and _gguf_storage_only(t)
+                and tuple(pv.shape)
+                == tuple(getattr(t, "quant_shape", t.shape))):
+            take[k] = torch.nn.Parameter(pv.clone(), requires_grad=False)
+            coerced.append(k)
+            continue
+        skipped.append(k)
+    if len(take) < min_keys:   # 実物の期待値: 40層×約27 + 埋め込み ≈ 1100
+        raise RuntimeError(
+            f"AniSora移植[{tag}]が空振りです (一致{len(take)}キー / "
+            f"スキップ{len(skipped)})。キー命名の不一致の疑い。素のVACE-Fun"
+            "のまま静かに生成されてしまうため停止します")
+    # patch_embedding以外のスキップは想定外 (=キメラ化)。少数なら警告、
+    # 多数なら停止 (「静かに混ざったモデル」で品質FAILの原因調査を
+    # 迷宮入りさせないため。2026-07-12レビュー指摘)
+    unexpected = [k for k in skipped if not k.startswith("patch_embedding.")]
+    if unexpected:
+        det = ", ".join(
+            f"{k}(t={getattr(tgt.get(k), 'quant_type', None)}/"
+            f"d={getattr(dn.get(k), 'quant_type', None)})"
+            for k in unexpected[:8])
+        if len(unexpected) > max(4, int(0.02 * len(dn))):
+            raise RuntimeError(
+                f"AniSora移植[{tag}]: 想定外スキップが{len(unexpected)}キー "
+                f"({det} ...)。量子化レイアウトの相違でキメラ化するため"
+                "停止します")
+        log(f"⚠ AniSora移植[{tag}]: 想定外スキップ{len(unexpected)}キー "
+            f"({det}) — このテンソルはVACE-Fun側のまま残ります")
+    if patch_mode == "slice":
+        w, tw = dn.get("patch_embedding.weight"), tgt.get("patch_embedding.weight")
+        b, tb = dn.get("patch_embedding.bias"), tgt.get("patch_embedding.bias")
+        sliceable = (w is not None and tw is not None
+                     and getattr(w, "quant_type", None) is None
+                     and getattr(tw, "quant_type", None) is None
+                     and w.dim() == 5 and tw.dim() == 5
+                     and w.shape[0] == tw.shape[0]
+                     and w.shape[1] >= tw.shape[1]
+                     and w.shape[2:] == tw.shape[2:])
+        if sliceable:
+            sw = w[:, : tw.shape[1]].clone().to(dtype=tw.dtype)
+            take["patch_embedding.weight"] = torch.nn.Parameter(
+                sw, requires_grad=False)
+            if b is not None and tb is not None and b.shape == tb.shape:
+                take["patch_embedding.bias"] = torch.nn.Parameter(
+                    b.clone().to(dtype=tb.dtype), requires_grad=False)
+            log(f"AniSora移植[{tag}]: patch_embedding 先頭{tw.shape[1]}ch"
+                "スライスを移植 (実験モード)")
+        else:
+            log(f"AniSora移植[{tag}]: patch_embeddingはスライス不可 "
+                "(量子化/形状) -> VACE-Fun側を維持")
+    skipped = [k for k in skipped if k not in take]   # slice成功分を除外
+    with torch.no_grad():
+        for k, v in take.items():
+            mod_path, _, leaf = k.rpartition(".")
+            mod = target.get_submodule(mod_path) if mod_path else target
+            mod._parameters[leaf] = v
+    kept_vace = sum(1 for k in tgt if k.startswith("vace_"))
+    log(f"AniSora移植[{tag}]: {len(take)}キー移植"
+        f"{f' (うち保存形式変換{len(coerced)})' if coerced else ''} / "
+        f"スキップ{len(skipped)} "
+        f"({', '.join(skipped[:3])}{' ...' if len(skipped) > 3 else ''}) / "
+        f"vace_*温存 {kept_vace}キー")
+    return len(take), len(skipped)
+
+
 @register
 class VACEAdapter(_WanA14BBase):
-    """Wan2.2 VACE-Fun 14B — OpenPose骨格制御動画によるポーズ駆動 i2v。
+    """VACE骨格制御 × AniSora V3.2ベース — OpenPose骨格によるポーズ駆動 i2v。
 
     AniSora i2vの斜め後ろ(back_left/back_right)は、プロンプトロック・
     motion減速・終端アンカー・中間キーフレーム5点拘束の全てを貫通して
     「拘束点の合間で一回転する」抜け道が塞げなかった(2026-07-12 ロップで
     実証)。VACEは全フレームのポーズを骨格で指定するため回転は定義上
-    起こり得ない。VACEはスタイル非依存で参照画像の画風を保持し、
-    アニメ絵にも強い(コミュニティ報告)。
+    起こり得ない。
+
+    v0.4.xの素のWan2.2 VACE-Fun(汎用ベース・非蒸留30step/cfg5)は
+    「粘土のような崩れ+激遅」でAniSoraに遠く及ばず不採用(2026-07-12
+    お兄さま裁定)。v0.5.0からはコミュニティ定石「AniSoraベース+VACE
+    モジュール」をdiffusersで再現する: VACE-Fun GGUFのtransformerに
+    AniSora V3.2 GGUFのbase重み(blocks/condition_embedder/proj_out、
+    40層で命名・形状が完全一致)を移植し、vace_*ブロックと16ch
+    patch_embeddingだけVACE-Fun由来を残す。アニメprior+8step蒸留のまま
+    骨格制御が効く構成(kijaiのVACEモジュール抽出と同じ発想の逆向き)。
 
     リクエスト契約:
       images[0]                  = 参照キャラ立ち絵 (reference_images)
@@ -993,28 +1150,43 @@ class VACEAdapter(_WanA14BBase):
                                    engine/pose_video.py が生成)
       images[1:]                 = 上記の代替 (webUI手動テスト用)
       extra["conditioning_scale"]= 制御強度 (既定1.0)
+    実験ノブ (extra > 環境変数 > 既定):
+      vace_base    = anisora(既定)|fun    VIDEOLAB_VACE_BASE  移植の有無
+      vace_experts = both(既定)|high|low  VIDEOLAB_VACE_EXPERTS  半移植
+      vace_patch   = fun(既定)|slice      VIDEOLAB_VACE_PATCH
+    品質FAILの後退ラダー: cond 1.1-1.2 → steps 12 → steps16/cfg2-3 →
+    vace_patch=slice → vace_experts=low → vace_base=fun(steps30/cfg5)。
     """
     id = "vace"
-    label = "Wan2.2 VACE-Fun 14B (骨格制御・GGUF)"
-    desc = ("Alibaba PAI の Wan2.2 VACE-Fun。OpenPose骨格動画で全フレームの"
-            "ポーズ・向きを直接指定する(向き回転の根絶用)。images[0]=参照"
-            "立ち絵、骨格は extra pose_frames_b64 か images 2枚目以降で渡す。"
-            "extra例: {\"conditioning_scale\": 1.0}。量子化は共通設定の "
-            "quant (Q8_0既定/Q4_0)。bf16フル精度は VIDEOLAB_VACE_QUANT=bf16 "
-            "(A100-80でも常駐不可->自動オフロードで低速)")
-    requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) — DL 40GB前後 "
-                "(bf16指定時のみ70GB)")
+    label = "VACE骨格制御 (AniSoraベース移植・GGUF)"
+    desc = ("AniSora V3.2のbase重みをWan2.2 VACE-Funのtransformerへ移植した"
+            "骨格制御i2v — アニメprior+8step蒸留のままOpenPose骨格動画で全"
+            "フレームのポーズ・向きを直接指定する(向き回転の根絶用)。"
+            "images[0]=参照立ち絵、骨格は extra pose_frames_b64 か images "
+            "2枚目以降で渡す。extra例: {\"conditioning_scale\": 1.0, "
+            "\"vace_base\": \"fun\"(移植なしの素のVACE-Fun・steps30/cfg5"
+            "推奨)}。量子化は共通quant (Q8_0既定/Q4_0。AniSora GGUFはこの"
+            "2種のみ)。bf16は移植なし=素のVACE-Fun")
+    requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) — DL 75GB前後 "
+                "(VACE-Fun 31GB + AniSora 32GB + ベース12GB)。"
+                "移植中はRAMを一時+16GB(Q8)使用")
     modes = ("i2v",)
     repo = os.environ.get("VIDEOLAB_VACE_REPO",
                           "linoyts/Wan2.2-VACE-Fun-14B-diffusers")
     gguf_repo = "QuantStack/Wan2.2-VACE-Fun-A14B-GGUF"
+    anisora_gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
     cache_repos = ("QuantStack/Wan2.2-VACE-Fun-A14B-GGUF",
+                   "QuantStack/Index-Anisora-V3.2-GGUF",
                    "linoyts/Wan2.2-VACE-Fun-14B-diffusers")
-    disk_gb = 45         # GGUF Q8 ~31GB + ベース部品(UMT5+VAE) ~12GB
+    disk_gb = 75         # VACE GGUF ~31 + AniSora GGUF ~32 + ベース部品 ~12
     flow_shift = float(os.environ.get("VIDEOLAB_VACE_SHIFT", "5.0"))
+    # 既定はAniSoraベース移植版の蒸留レシピ (8step/cfg1.0)。
+    # vace_base=fun(素のVACE-Fun)で使うときは 30/5.0 を明示すること。
     defaults = {"width": 464, "height": 848, "num_frames": 81, "fps": 16,
-                "steps": 30, "guidance": 5.0}
-    # Wan公式の標準ネガティブ (蒸留版と違い cfg>1 なので効く)
+                "steps": 8, "guidance": 1.0}
+    # Wan公式の標準ネガティブ。既定のAniSoraベース(cfg=1.0)では計算に
+    # 乗らず無害。guidance>1 で使うとき(vace_base=fun の30step/cfg5や
+    # 後退ラダーの steps16/cfg2-3)にだけ効く
     WAN_NEGATIVE = ("色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,"
                     "静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,"
                     "多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,"
@@ -1022,20 +1194,44 @@ class VACEAdapter(_WanA14BBase):
                     "背景人很多,倒着走")
 
     def _resolve_want(self, extra: dict) -> tuple:
-        """量子化とオフロードをリクエスト>環境変数>既定(Q8_0)で解決。
+        """量子化・オフロード・移植構成をリクエスト>環境変数>既定で解決。
         アプリの共通quant設定がそのまま効く(2026-07-12「Q4選んでいても
-        おっきいほうが使われます」対応 — 従来vaceはbf16固定だった)。"""
-        q = str((extra or {}).get("quant")
+        おっきいほうが使われます」対応 — 従来vaceはbf16固定だった)。
+        戻り値 = (quant, offload, base, experts, patch)。"""
+        e = extra or {}
+        q = str(e.get("quant")
                 or os.environ.get("VIDEOLAB_VACE_QUANT", "Q8_0"))
         if q not in ("Q4_0", "Q8_0", "bf16"):
             q = "Q8_0"
-        off = str((extra or {}).get("offload")
+        off = str(e.get("offload")
                   or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
         off = "seq" if off in ("seq", "sequential") else ""
-        return q, off
+        base = str(e.get("vace_base")
+                   or os.environ.get("VIDEOLAB_VACE_BASE", "anisora")).lower()
+        if base not in ("anisora", "fun"):
+            base = "anisora"
+        if q == "bf16":
+            # bf16はGGUFLinearを持たないため量子化ドナーを差し込めない
+            # → 移植なし(素のVACE-Fun)に固定。品質A/B比較の逃げ道。
+            base = "fun"
+        experts = str(e.get("vace_experts")
+                      or os.environ.get("VIDEOLAB_VACE_EXPERTS",
+                                        "both")).lower()
+        if experts not in ("both", "high", "low"):
+            experts = "both"
+        patch = str(e.get("vace_patch")
+                    or os.environ.get("VIDEOLAB_VACE_PATCH", "fun")).lower()
+        if patch not in ("fun", "slice"):
+            patch = "fun"
+        if base != "anisora":
+            # 移植なしでは experts/patch は不活性 — 正規化してノブ操作
+            # だけの無駄な積み替え(数分)を防ぐ
+            experts, patch = "both", "fun"
+        return q, off, base, experts, patch
 
     def ensure_loaded(self, log):
         _require_deps(log)
+        import gc
         import torch
         try:
             from diffusers import WanVACEPipeline
@@ -1044,12 +1240,14 @@ class VACEAdapter(_WanA14BBase):
                 "この diffusers には WanVACEPipeline がありません。"
                 'pip install -U "diffusers>=0.39.0" を実行してから'
                 "サーバを再起動してください")
-        quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
+        want = self._resolve_want(getattr(self, "_next_extra", {}))
+        quant, offload, base, experts, patch = want
         if quant == "bf16":
             # フル精度: 常駐70GB+81f attentionの活性化~9GBはA100-80にも
             # 入らない(2026-07-12実測: 残り324MiBでOOM)ため余白12GBで判定
-            # -> 実質オフロード運用。品質検証用の逃げ道として残す
-            log(f"読み込み開始: {self.repo} (bf16・初回はDL約70GB)")
+            # -> 実質オフロード運用。素のVACE-Fun品質のA/B比較用の逃げ道
+            # (AniSora移植はGGUF経路のみ。_resolve_wantがbase=funに固定)
+            log(f"読み込み開始: {self.repo} (bf16・素のVACE-Fun・DL約70GB)")
             self.pipe = WanVACEPipeline.from_pretrained(
                 self.repo, torch_dtype=torch.bfloat16)
             fp, margin = 79, 12
@@ -1080,6 +1278,32 @@ class VACEAdapter(_WanA14BBase):
             t_lo = WanVACETransformer3DModel.from_single_file(
                 lo, quantization_config=qc, config=self.repo,
                 subfolder="transformer_2", torch_dtype=torch.bfloat16)
+            if base == "anisora":
+                # AniSora V3.2のbase重みを移植 (High->HighNoise、
+                # Low->LowNoise のエキスパート対応)。ドナーはCPU上で
+                # 読み込み→移植→即解放 (Q8で一時+16GB)
+                from diffusers import WanTransformer3DModel
+                for tgt, tag, sub in ((t_hi, "High", "transformer"),
+                                      (t_lo, "Low", "transformer_2")):
+                    if experts != "both" and experts != tag.lower():
+                        log(f"AniSora移植[{tag}]: スキップ "
+                            f"(vace_experts={experts})")
+                        continue
+                    fname = f"{tag}/Index-Anisora-V3.2-{tag}-{quant}.gguf"
+                    log(f"AniSora GGUF DL: {self.anisora_gguf_repo} {fname}")
+                    dp = hf_hub_download(self.anisora_gguf_repo, fname)
+                    log(f"AniSora {tag} 読み込み (移植ドナー・config="
+                        "Wan2.2-I2Vベースを明示)")
+                    donor = WanTransformer3DModel.from_single_file(
+                        dp, quantization_config=qc, config=self.base_repo,
+                        subfolder=sub, torch_dtype=torch.bfloat16)
+                    _transplant_base_weights(tgt, donor, log, tag=tag,
+                                             patch_mode=patch)
+                    del donor
+                    gc.collect()
+            else:
+                log("vace_base=fun: AniSora移植なし (素のVACE-Fun。"
+                    "steps30/cfg5.0を明示推奨)")
             log(f"ベース部品 DL/読み込み: {self.repo} (VAE+UMT5 約12GB)")
             self.pipe = WanVACEPipeline.from_pretrained(
                 self.repo, transformer=t_hi, transformer_2=t_lo,
@@ -1091,18 +1315,22 @@ class VACEAdapter(_WanA14BBase):
         # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
         self._finalize_pipe(log, offload=offload, footprint_gb=fp,
                             vae_tiling=True, resident_margin_gb=margin)
+        # AniSoraベース時はmotion scoreプロンプト接尾辞も効く(蒸留ベースの
+        # 学習時プロンプト形式。_build_prompt が extra.motion_score を反映)
+        self.prompt_suffix = (AniSoraAdapter.prompt_suffix
+                              if base == "anisora" else "")
         self.loaded_quant, self.loaded_offload = quant, offload
+        self._loaded_want = want
         self.loaded = True
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
-        # 量子化/オフロード指定がロード時と違えば積み替え (anisoraと同じ)
+        # 量子化/オフロード/移植構成がロード時と違えば積み替え (anisoraと
+        # 同様。_loaded_want未設定=外部からpipe注入されたテスト等は温存)
         want = self._resolve_want(req.extra)
-        if self.loaded and want != (getattr(self, "loaded_quant", None),
-                                    getattr(self, "loaded_offload", None)):
-            log(f"設定変更 {getattr(self, 'loaded_quant', '?')}/"
-                f"{getattr(self, 'loaded_offload', '?')} -> "
-                f"{want[0]}/{want[1]}: モデルを積み替えます")
+        if self.loaded and want != getattr(self, "_loaded_want", want):
+            log(f"設定変更 {getattr(self, '_loaded_want', '?')} -> "
+                f"{want}: モデルを積み替えます")
             self.unload(log)
             _free_cuda(log)
         if not self.loaded:
@@ -1112,6 +1340,11 @@ class VACEAdapter(_WanA14BBase):
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
+        if want[2] == "fun" and steps <= 12:
+            # 非蒸留の素のVACE-Funに蒸留レシピは「保証つきの泥」
+            log(f"⚠ vace_base=fun は非蒸留です: steps={steps}/"
+                f"cfg={req.guidance} では崩れます。steps=30 cfg=5.0 を"
+                "指定してください")
         pf = list(req.extra.get("pose_frames_b64") or [])
         if pf:
             control = load_images_b64(pf)
@@ -1334,8 +1567,15 @@ def worker_loop():
                         else:
                             repos = (getattr(prev, "cache_repos", None)
                                      or [getattr(prev, "repo", "")])
+                            # 次モデルも使うリポは消さない (anisora⇔vaceは
+                            # AniSora GGUFを共有: 消すと即再DLで純損)
+                            keep = set(getattr(adapter, "cache_repos", None)
+                                       or [getattr(adapter, "repo", "")])
                             for r in repos:
-                                _purge_model_cache(r, log)
+                                if r in keep:
+                                    log(f"共有キャッシュを温存: {r}")
+                                else:
+                                    _purge_model_cache(r, log)
             if not adapter.loaded:
                 j["status"] = "loading"
                 j["detail"] = f"{adapter.label} を読み込み中(初回はDLに数分〜数十分)"
