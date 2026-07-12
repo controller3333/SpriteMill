@@ -1724,8 +1724,13 @@ def start_server(host: str, port: int, token: str | None):
 def run_in_colab(port: int = 8000, preload: str | None = None):
     """Colabノートブックから呼ぶ: サーバ+cloudflaredトンネルを起動しURL/TOKENを表示。
 
-    セルの再実行に強い設計: 既にサーバが動いていればトークンを再利用し
-    (新規発行すると旧サーバとトークン不一致で全APIが401になる)、
+    セルの再実行に強い設計: トークンは「ファイルが無い時だけ」生成し、
+    以後はランタイムが変わるまで常に同じ値を使い回す。こうしないと、
+    サーバ起動中(healthがまだ立たない数秒)にセルがもう一度実行された
+    とき alive=False 判定で新トークンが発行され、2つ目のサーバは
+    ポート占有でスレッド内に静かに死に、トンネルは旧トークンのサーバに
+    つながったまま画面には新トークンが印字される(=貼っても必ず401。
+    2026-07-12 実障害。Run All連打/自動運転リトライで再現)。
     古い cloudflared だけ張り替える。
     """
     import re as _re
@@ -1733,21 +1738,35 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
     # Colabのディスクは60GB級モデル2つで枯渇するため、切替時の自動削除を既定ON
     os.environ.setdefault("VIDEOLAB_PURGE_ON_SWITCH", "1")
     tok_file = Path(tempfile.gettempdir()) / "videolab_token.txt"
-    alive = False
-    try:
-        with _rq.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as r:
-            alive = (r.status == 200)
-    except Exception:
-        pass
-    if alive and tok_file.is_file():
+
+    def _health_up(timeout=3):
+        try:
+            with _rq.urlopen(f"http://127.0.0.1:{port}/health",
+                             timeout=timeout) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    # トークンの決定はサーバ生存判定と独立(何回実行しても同じ値になる)
+    token = ""
+    if tok_file.is_file():
         token = tok_file.read_text(encoding="utf-8").strip()
-        print("既存のサーバを再利用します(トークン据え置き・トンネルのみ再作成)")
-    else:
+    if not token:
         token = secrets.token_urlsafe(16)
         tok_file.write_text(token, encoding="utf-8")
+    if _health_up():
+        print("既存のサーバを再利用します(トークン据え置き・トンネルのみ再作成)")
+    else:
         server = start_server("127.0.0.1", port, token)
         threading.Thread(target=server.run, daemon=True).start()
-        time.sleep(3)
+        # 固定sleepではなく health が立つまで待つ(二重起動の誤判定防止)
+        for _ in range(60):
+            if _health_up(timeout=2):
+                break
+            time.sleep(1)
+        else:
+            print("警告: サーバのhealthが確認できませんでした。"
+                  "下のURLで接続できない場合はランタイムを再起動してください")
     if preload and preload in ADAPTERS:
         def _pre():
             ADAPTERS[preload].ensure_loaded(lambda m: print(f"[preload] {m}", flush=True))

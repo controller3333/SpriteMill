@@ -43,20 +43,54 @@ def _web_drive():
 
 
 def extract_url_token(text: str) -> tuple[str, str] | None:
-    """Colab最終セルの出力から trycloudflare URL と TOKEN を拾う。"""
-    m = TRYCF.search(text or "")
-    if not m:
+    """Colab最終セルの出力から trycloudflare URL と TOKEN を拾う。
+
+    URLとTOKENは必ず【同じ行】から対で取る(文書全体から別々に拾うと、
+    古い出力のURLと新しいTOKENのような偽ペアを作ってしまう)。複数の
+    webUI行が見えている場合は最後(=最下部・最新の出力)を優先する。
+    """
+    text = text or ""
+    best = None
+    for line in text.splitlines():
+        m = TRYCF.search(line)
+        if not m:
+            continue
+        tok = ""
+        mt = TOKEN_Q.search(line)
+        if mt:
+            tok = mt.group(1)
+        # token付きの行を最優先、無ければURLだけの行も候補として保持
+        if tok or best is None or not best[1]:
+            best = (m.group(0), tok)
+    if best is None:
         return None
-    url = m.group(0)
-    tok = ""
-    mt = TOKEN_Q.search(text)
-    if mt:
-        tok = mt.group(1)
-    else:
-        ml = TOKEN_LINE.search(text)
-        if ml:
-            tok = ml.group(1)
-    return url, tok
+    if not best[1]:
+        # 同一行にtokenが無い形式(URL行とTOKEN行が分かれている)への保険。
+        # 最後の TOKEN : 行を対にする(出力は上から古い順なので最後=最新)
+        toks = TOKEN_LINE.findall(text)
+        if toks:
+            best = (best[0], toks[-1])
+    return best
+
+
+def _classify_conn(t: str) -> str:
+    """colab-connect-button の表示テキストから接続状態を分類する。
+
+    connected    : RAM/ディスク ゲージ表示 = ランタイム接続済み
+    connecting   : 接続中/割り当て中/初期化中/再接続中
+    disconnected : 「接続」「再接続」ボタン表示 = 未接続
+    unknown      : ボタンが見つからない・判別不能(判定には使わない)
+    """
+    if not t:
+        return "unknown"
+    if re.search(r"RAM|ディスク|disk", t, re.I):
+        return "connected"
+    if re.search(r"接続中|しています|connecting|割り当て|allocat|初期化"
+                 r"|initializ", t, re.I):
+        return "connecting"   # 「再接続しています」等の進行形もここ
+    if re.search(r"再接続|reconnect|接続|connect", t, re.I):
+        return "disconnected"
+    return "unknown"
 
 
 WEBVIEW_CDP_PORT = 9456   # sprite_mill._webview_main と一致させること
@@ -69,6 +103,30 @@ def _port_up(port: int) -> bool:
             return True
     except Exception:
         return False
+
+
+def _probe_health(url: str, timeout: float = 4.0) -> bool:
+    """トンネルURLの /health に届くか(認証不要エンドポイント)。"""
+    import urllib.request as _rq
+    try:
+        with _rq.urlopen(f"{url}/health", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+_PW = None
+
+
+def _playwright():
+    """Playwrightドライバは使い回す(web_drive._PW と同じ方針)。
+    呼び出しごとに start() すると、close() で stop() されない node
+    ドライバが⚡を押すたびに1個ずつ孤児化して蓄積するため。"""
+    global _PW
+    if _PW is None:
+        from playwright.sync_api import sync_playwright
+        _PW = sync_playwright().start()
+    return _PW
 
 
 def _launch_webview_host(notebook_url: str, log=print) -> bool:
@@ -103,8 +161,7 @@ class ColabDriver:
                  browser: str = "webview2", log=print):
         wd = _web_drive()
         self._wd = wd
-        from playwright.sync_api import sync_playwright
-        self._pw = sync_playwright().start()
+        self._pw = _playwright()
         cdp_port = None
         if browser == "webview2":
             if _launch_webview_host(notebook_url, log):
@@ -159,11 +216,12 @@ class ColabDriver:
         return ("accounts.google.com" in u
                 or "ServiceLogin" in u)
 
-    def _click_any(self, patterns: list[str]) -> bool:
+    def _click_any(self, patterns: list[str], selectors=None) -> bool:
         """テキストが patterns のどれかに一致するボタンをクリック。"""
         rx = re.compile("|".join(patterns), re.I)
-        for sel in ("paper-button", "mwc-button", "button",
-                    ".goog-buttonset-default", "[role='button']"):
+        for sel in (selectors or ("paper-button", "mwc-button", "button",
+                                  ".goog-buttonset-default",
+                                  "[role='button']")):
             try:
                 loc = self.page.locator(sel)
                 n = min(loc.count(), 40)
@@ -180,23 +238,104 @@ class ColabDriver:
                 continue
         return False
 
-    def _run_all(self, log) -> None:
-        """すべてのセルを実行(Ctrl+F9)。GitHubノート警告が出たら承認。"""
-        # GitHub由来ノートの「このまま実行」警告を先に潰す
-        self._click_any(["run anyway", "そのまま実行", "このまま実行",
-                         "実行する", "run all"])
+    # ---- ランタイム状態の観測 (2026-07-12: 2回目Run All空振り対策) ----
+
+    def _js(self, expr: str, default=None):
         try:
-            self.page.bring_to_front()
+            return self.page.evaluate(expr)
         except Exception:
-            pass
-        self.page.keyboard.press("Control+F9")
-        time.sleep(2)
-        # キー直後にも警告/接続ダイアログが出ることがある
-        if self._click_any(["run anyway", "そのまま実行", "このまま実行",
-                            "実行する"]):
-            log("  GitHubノートの実行警告を承認しました")
-            time.sleep(1)
-            self.page.keyboard.press("Control+F9")
+            return default
+
+    def _conn_state(self) -> str:
+        """接続ボタン(colab-connect-button)の状態。shadow DOM 込み。"""
+        t = self._js(
+            "(() => {"
+            "  const b = document.querySelector('colab-connect-button');"
+            "  if (!b) return '';"
+            "  const s = b.shadowRoot ? (b.shadowRoot.textContent || '') : '';"
+            "  return (s + ' ' + (b.textContent || '') + ' '"
+            "          + (b.getAttribute('aria-label') || '')).trim();"
+            "})()", default="") or ""
+        return _classify_conn(t)
+
+    def _dialogs_text(self) -> str:
+        """ダイアログ/トースト内のテキストだけを集める。ノート本文は
+        含まれないので『再起動』等の語を安全に検査できる。"""
+        return self._js(
+            "Array.from(document.querySelectorAll("
+            "  \"mwc-dialog,md-dialog,paper-dialog,[role='dialog'],"
+            "[role='alertdialog'],colab-toast\"))"
+            ".map(e => e.innerText || e.textContent || '').join('\\n')",
+            default="") or ""
+
+    def _cells_running(self) -> bool:
+        """セルが実行中/実行待ちかを複数のシグナルで推定する。"""
+        return bool(self._js(
+            "(() => {"
+            "  if (document.querySelector("
+            "      '.cell.running, .cell.pending, .cell.executing'))"
+            "    return true;"
+            "  if (document.querySelector("
+            "      \"[aria-label*='中断'], [aria-label*='interrupt' i]\"))"
+            "    return true;"
+            "  for (const b of document.querySelectorAll("
+            "       'colab-run-button')) {"
+            "    const sr = b.shadowRoot;"
+            "    const t = ((sr && sr.textContent) || '') + ' '"
+            "              + (b.getAttribute('aria-label') || '');"
+            "    if (/中断|interrupt|stop/i.test(t)) return true;"
+            "    if (sr && sr.querySelector('.spinner, paper-spinner,"
+            " md-circular-progress, mwc-circular-progress')) return true;"
+            "  }"
+            "  return false;"
+            "})()", default=False))
+
+    _DIALOG_BTNS = ("mwc-dialog button", "mwc-dialog mwc-button",
+                    "md-dialog button", "paper-dialog paper-button",
+                    "[role='dialog'] button",
+                    "[role='dialog'] [role='button']",
+                    "[role='alertdialog'] button")
+
+    def _dismiss_info_dialogs(self) -> bool:
+        """クラッシュ通知などの情報ダイアログを OK/閉じる で潰す。"""
+        return self._click_any(
+            [r"^\s*OK\s*$", r"^\s*閉じる\s*$", r"^\s*了解\s*$",
+             r"^\s*Close\s*$", r"^\s*Dismiss\s*$"],
+            selectors=self._DIALOG_BTNS)
+
+    RUN_WARN = ["run anyway", "そのまま実行", "このまま実行", "実行する"]
+
+    def _run_all(self, log, tries: int = 3) -> bool:
+        """すべてのセルを実行(Ctrl+F9)し、実行が本当に始まったかを確認。
+
+        始まっていなければダイアログを潰し直して再試行する。「押した
+        つもりが走っていない→結局手でクリック」の自動リカバリ
+        (2026-07-12 ユーザー報告対応)。"""
+        for attempt in range(1, tries + 1):
+            self._dismiss_info_dialogs()
+            self._click_any(self.RUN_WARN)   # 先に出ている実行警告
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
+            try:
+                # ダイアログ残骸でキーが届かないのを防いでから送る
+                self.page.keyboard.press("Escape")
+                self.page.keyboard.press("Control+F9")
+            except Exception:
+                time.sleep(2)
+                continue
+            end = time.time() + 15
+            while time.time() < end:
+                if self._click_any(self.RUN_WARN):
+                    log("  GitHubノートの実行警告を承認しました")
+                if self._cells_running() or self._conn_state() == "connecting":
+                    return True
+                time.sleep(1)
+            if attempt < tries:
+                log(f"  実行開始を確認できません -- 再試行します"
+                    f"({attempt}/{tries})")
+        return False
 
     def run(self, log, poll_timeout: int = 2400) -> dict:
         # 1) ロード待ち + ログイン確認
@@ -211,27 +350,49 @@ class ColabDriver:
                     "されてからもう一度お試しください(ログインは保存され、"
                     "次回からは自動になります)")
             time.sleep(1)
+        # タブ再利用時に前セッションのURL出力が残っていることがある。
+        # それを「新しいURL」と誤認して死んだURLを回収しないよう記録
+        # (同じURLは /health への到達確認が取れたときだけ有効とみなす)
+        _stale = extract_url_token(self._text())
+        self._stale_url = _stale[0] if _stale else None
+        if self._stale_url:
+            log(f"  前回のURL出力を検出({self._stale_url})。"
+                "生存確認できない限り無視します")
         # 2) 1回目のRun all
         log("すべてのセルを実行します(1回目)…")
-        self._run_all(log)
-        # 3) セル2の自動再起動を待つ → 2回目のRun all
+        if not self._run_all(log):
+            log("  実行開始を確認できませんでした。始まっていないようなら"
+                "Colab画面で「すべてのセルを実行」を押してください"
+                "(自動処理は続行)")
+        # 3) セル2の自動再起動を待つ → 再接続の完了を確認して2回目
         log("依存確定のためのランタイム再起動を待っています"
             "(数分かかることがあります)…")
-        restarted = self._wait_restart(log, timeout=600)
-        if restarted:
-            log("再起動を検知。すべてのセルを実行します(2回目)…")
+        res = self._wait_restart(log, timeout=600)
+        if res == "server-up":
+            log("再起動済みのランタイムでした -- そのままサーバ起動を"
+                "待ちます")
+        elif res == "restarted":
+            log("再接続の完了を確認。すべてのセルを実行します(2回目)…")
             time.sleep(3)
-            self._run_all(log)
+            if not self._run_all(log):
+                log("  2回目の実行開始を確認できませんでした。Colab画面で"
+                    "「すべてのセルを実行」を押してください(自動回収は続行)")
+        elif res == "no-gpu":
+            raise RuntimeError(
+                "GPUランタイムに接続できませんでした(割り当て不可または"
+                "使用量上限)。Colab画面でランタイム種別(GPU)を確認するか、"
+                "時間を置いてもう一度お試しください")
         else:
-            log("  再起動を検知できませんでした。Colab画面で"
-                "「すべてのセルを実行」を一度押してください(自動回収は続行)")
+            log("  再起動を検知できませんでした。1回目の実行がまだ進行中"
+                "ならそのまま待ち、止まっているようならColab画面で"
+                "「すべてのセルを実行」を押してください(自動回収は続行)")
         # 4) URL/TOKEN をポーリング回収
         log("サーバ起動待ち: URL と TOKEN を探しています"
             "(初回はモデルDLで時間がかかります)…")
         deadline = time.time() + poll_timeout
         while time.time() < deadline:
-            got = extract_url_token(self._text())
-            if got and got[0]:
+            got = self._fresh_url_token()
+            if got:
                 log(f"URL/TOKEN を取得しました: {got[0]}")
                 return {"url": got[0], "token": got[1]}
             time.sleep(5)
@@ -240,31 +401,128 @@ class ColabDriver:
             "URLが出ているか確認し、出ていれば手でアプリの欄に貼って"
             "ください")
 
+    def _fresh_url_token(self):
+        """画面のURL/TOKENを、前セッションの残骸を除外して返す。
+
+        開始時に見えていたURLと同じ場合は、/health への到達確認が
+        取れたときだけ有効(=本当にまだ生きている再開ケース)。
+        trycloudflareのURLはトンネルごとにランダムなので、開始時と
+        異なるURLはそれだけで新鮮とみなせる。"""
+        got = extract_url_token(self._text())
+        if not got or not got[0]:
+            return None
+        if got[0] == getattr(self, "_stale_url", None):
+            now = time.time()
+            if now < getattr(self, "_stale_next_probe", 0.0):
+                return None
+            if _probe_health(got[0]):
+                return got
+            self._stale_next_probe = now + 30   # 死んだURLの連続probe抑制
+            return None
+        return got
+
     def _text_html_probe(self) -> str:
         try:
             return self.page.content()[:200000]
         except Exception:
             return ""
 
-    def _wait_restart(self, log, timeout: int) -> bool:
-        """cell2の os.kill による再起動を検知する。実行が一旦止まり、
-        ランタイムが再接続されるのを、状態バー文言と接続ボタンで判定。"""
-        end = time.time() + timeout
-        saw_running = False
-        while time.time() < end:
-            t = self._text()
-            # 「再起動」「クラッシュ」「再接続」等の痕跡
-            if re.search(r"再起動|restart|crashed|クラッシュ|reconnect|再接続",
-                         t, re.I):
-                return True
-            if re.search(r"実行中|running|busy", t, re.I):
-                saw_running = True
-            # 実行が始まってから一旦止まったら再起動とみなす
-            if saw_running and not re.search(r"実行中|running|busy", t, re.I):
-                time.sleep(3)
-                return True
+    # GPU割り当て失敗ダイアログの文言(接続前にしか検査しない)
+    NO_GPU_RX = (r"GPU\s*(に|への)?接続できません|Cannot connect to a GPU"
+                 r"|割り当てられません|使用量上限|usage limits?"
+                 r"|バックエンドに接続できません")
+
+    def _wait_restart(self, log, timeout: int) -> str:
+        """cell2 の自動再起動を「ランタイム接続状態」の遷移で検知する。
+
+        以前は画面テキスト中の『再起動/再接続』等を探していたが、ノート
+        自身の説明文・セルのソースに同じ語が最初から表示されており、
+        開始直後に誤検知 → 2回目のRun Allが早すぎて空振りしていた
+        (2026-07-12 ユーザー報告)。ここでは接続ボタンの
+        connected → 切断 → connected(再接続完了) を待ってから返す。
+        接続が確認できている間(=cell1実行中)は期限を延長するので、
+        依存インストールが長引いても timeout で誤誘導しない。
+
+        返り値: "restarted"=再接続完了 / "server-up"=再起動不要で
+        サーバURLが既に出ている / "no-gpu"=GPU割り当て失敗 /
+        "timeout"=検知できず。"""
+        start = time.time()
+        end = start + timeout
+        hard_end = start + max(timeout * 3, 1800)   # 延長の上限
+        seen_connected = False
+        went_down = False
+        crash_seen = False
+        down_since = 0.0
+        down_polls = 0
+        last = ""
+        while time.time() < min(end, hard_end):
+            # 再開ランタイム等で再起動が不要なら(新しい)URLが先に出る
+            if self._fresh_url_token():
+                return "server-up"
+            st = self._conn_state()
+            if st != last and st != "unknown":
+                log(f"  ランタイム状態: {st}")
+                last = st
+            dtxt = self._dialogs_text()
+            crashed = bool(re.search(r"クラッシュ|crash|再起動|restart",
+                                     dtxt, re.I))
+            if crashed and not seen_connected:
+                # 接続前に見えるクラッシュ通知は前セッションの残骸。
+                # 本物のcell2クラッシュは接続後にしか起きない
+                self._dismiss_info_dialogs()
+                crashed = False
+            if (not seen_connected
+                    and re.search(self.NO_GPU_RX, dtxt, re.I)):
+                return "no-gpu"
+            if not went_down:
+                if st == "connected":
+                    seen_connected = True
+                    down_polls = 0
+                    # cell1(依存インストール)が長引いても待てるように、
+                    # 接続を確認できている間は期限を延長する
+                    end = max(end, time.time() + 300)
+                elif seen_connected and st in ("disconnected", "connecting"):
+                    down_polls += 1   # 一瞬の揺らぎは無視(2回で確定)
+                if crashed or down_polls >= 2:
+                    went_down = True
+                    crash_seen = crashed
+                    down_since = time.time()
+                    log("  ランタイムの再起動を検知 -- 再接続を待ちます…")
+            else:
+                crash_seen = crash_seen or crashed
+                if crashed or st == "disconnected":
+                    self._dismiss_info_dialogs()   # クラッシュ通知を閉じる
+                if st == "connected":
+                    time.sleep(2)                  # 状態の安定を確認
+                    if self._conn_state() == "connected":
+                        # 回線の揺らぎとの区別: 本物の再起動なら実行キューは
+                        # 全部消えている。まだセルが動いていれば cell1 継続
+                        # 中の一時断なので、再起動待ちに戻る
+                        if not crash_seen and self._cells_running():
+                            log("  一時的な接続の揺らぎでした -- "
+                                "再起動待ちを続けます")
+                            went_down = False
+                            down_polls = 0
+                            end = max(end, time.time() + 300)
+                            continue
+                        return "restarted"
+                elif (st == "disconnected"
+                      and time.time() - down_since > 25):
+                    # 自動再接続が始まらない -- 接続ボタンを押してみる
+                    self._js(
+                        "(() => {"
+                        "  const b = document.querySelector("
+                        "      'colab-connect-button');"
+                        "  if (!b) return false;"
+                        "  const t = b.shadowRoot && b.shadowRoot"
+                        ".querySelector('#connect,button,mwc-button,"
+                        "md-text-button');"
+                        "  (t || b).click(); return true;"
+                        "})()")
+                    log("  再接続ボタンを押しました")
+                    down_since = time.time()
             time.sleep(3)
-        return False
+        return "timeout"
 
     def close(self) -> None:
         try:
