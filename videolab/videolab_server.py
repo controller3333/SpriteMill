@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.5.0"   # 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
+__version__ = "0.5.1"   # 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
+# 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
 # 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
 # 0.4.2: トンネル据え置き判定をプロセス生存ベースに
 # 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
@@ -1149,13 +1150,17 @@ class VACEAdapter(_WanA14BBase):
       extra["pose_frames_b64"]   = OpenPose骨格フレーム列 (base64 PNGリスト、
                                    engine/pose_video.py が生成)
       images[1:]                 = 上記の代替 (webUI手動テスト用)
-      extra["conditioning_scale"]= 制御強度 (既定1.0)
+      extra["conditioning_scale"]= 制御強度 (既定1.0。<1.0は骨が浮くので
+                                   下げないこと — 2026-07-12実証)
+      extra["vace_end"]          = 骨格制御を適用するステップ割合 (既定1.0。
+                                   0.6=序盤60%のみ適用・終盤解放。骨転写の
+                                   第一対策。VIDEOLAB_VACE_END)
     実験ノブ (extra > 環境変数 > 既定):
       vace_base    = anisora(既定)|fun    VIDEOLAB_VACE_BASE  移植の有無
       vace_experts = both(既定)|high|low  VIDEOLAB_VACE_EXPERTS  半移植
       vace_patch   = fun(既定)|slice      VIDEOLAB_VACE_PATCH
-    品質FAILの後退ラダー: cond 1.1-1.2 → steps 12 → steps16/cfg2-3 →
-    vace_patch=slice → vace_experts=low → vace_base=fun(steps30/cfg5)。
+    骨転写/濁りの後退ラダー: vace_end 0.6→0.4 → vace_experts=low →
+    vace_patch=slice → vace_base=fun(steps30/cfg5)。
     """
     id = "vace"
     label = "VACE骨格制御 (AniSoraベース移植・GGUF)"
@@ -1345,6 +1350,18 @@ class VACEAdapter(_WanA14BBase):
             log(f"⚠ vace_base=fun は非蒸留です: steps={steps}/"
                 f"cfg={req.guidance} では崩れます。steps=30 cfg=5.0 を"
                 "指定してください")
+        # vace_end: 骨格制御を序盤ステップに限定し終盤は解放する
+        # (kijaiワークフローの end_percent 相当の定石)。ポーズは序盤の
+        # 高ノイズ段で確定するため、終盤解放で「骨格がそのまま画面に
+        # 転写される」問題を消しにいく (2026-07-12 移植ハイブリッドで
+        # 骨転写が発生 — vace残差はVACE-Funベース向け較正のため
+        # AniSoraブロック上では骨格消去が効き切らない)
+        try:
+            end_frac = float(req.extra.get("vace_end")
+                             or os.environ.get("VIDEOLAB_VACE_END", "1.0"))
+        except (TypeError, ValueError):
+            end_frac = 1.0
+        end_frac = max(0.05, min(1.0, end_frac))
         pf = list(req.extra.get("pose_frames_b64") or [])
         if pf:
             control = load_images_b64(pf)
@@ -1364,6 +1381,37 @@ class VACEAdapter(_WanA14BBase):
             control = [control[i] for i in idx]
             log(f"制御フレーム数を調整: {got} -> {n}")
         ref = _fit_image(req.images[0], w, h)
+        # 序盤限定適用の実装: 完了ステップ数をコールバックで数え、閾値を
+        # 越えたら transformer への control_hidden_states_scale をゼロに
+        # 差し替える (diffusers 0.39 WanVACEPipeline はループ内で
+        # current_model(..., control_hidden_states_scale=テンソル) を呼ぶ)
+        step_box = {"i": 0}
+        cut = max(1, int(round(steps * end_frac)))
+        unwraps = []
+        if end_frac < 1.0:
+            log(f"骨格制御は序盤 {cut}/{steps} ステップのみ適用 "
+                f"(vace_end={end_frac} — 終盤解放で骨転写を抑制)")
+
+            def _wrap(model):
+                orig = model.forward
+
+                def fwd(*a, **kw2):
+                    s = kw2.get("control_hidden_states_scale")
+                    if step_box["i"] >= cut and s is not None:
+                        kw2["control_hidden_states_scale"] = s * 0.0
+                    return orig(*a, **kw2)
+                model.forward = fwd
+                unwraps.append((model, orig))
+            for m in (getattr(self.pipe, "transformer", None),
+                      getattr(self.pipe, "transformer_2", None)):
+                if m is not None:
+                    _wrap(m)
+        base_cb = _step_callback(progress, steps)
+
+        def cb(pipe, step_index, timestep, callback_kwargs):
+            step_box["i"] = step_index + 1
+            return base_cb(pipe, step_index, timestep, callback_kwargs)
+
         kw = dict(video=control, reference_images=[ref],
                   prompt=self._build_prompt(req, log),
                   negative_prompt=req.negative or self.WAN_NEGATIVE,
@@ -1374,11 +1422,16 @@ class VACEAdapter(_WanA14BBase):
                       req.extra.get("conditioning_scale", 1.0)),
                   generator=torch.Generator("cpu").manual_seed(req.seed),
                   output_type="np", return_dict=False,
-                  callback_on_step_end=_step_callback(progress, steps))
+                  callback_on_step_end=cb)
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance} "
             f"骨格制御{len(control)}f cond={kw['conditioning_scale']}")
-        out = _call_with_optional_kwargs(
-            self.pipe, kw, ["callback_on_step_end", "conditioning_scale"], log)
+        try:
+            out = _call_with_optional_kwargs(
+                self.pipe, kw, ["callback_on_step_end", "conditioning_scale"],
+                log)
+        finally:
+            for m, orig in unwraps:
+                m.forward = orig
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
