@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.4.1"   # 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
+__version__ = "0.4.2"   # 0.4.2: トンネル据え置き判定をプロセス生存ベースに
+# 0.4.1: トンネルURL据え置き(再実行でURLが変わらない)
 # 0.4.0: VACEをGGUF化(共通quant設定が効く・OOM根治)
 # 0.3.9: VACEのVAEタイリング(A100-80のencode OOM対策)
 # 0.3.8: VACE骨格制御アダプタ(ポーズ駆動・回転根絶)
@@ -1883,13 +1884,13 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
         cf_alive = (subprocess.run(["pgrep", "-f", "cloudflared"],
                                    capture_output=True).returncode == 0)
         if old and cf_alive:
-            try:
-                with _rq.urlopen(f"{old}/health", timeout=8) as r:
-                    if r.status == 200:
-                        url = old
-                        print("既存のトンネルを再利用します(URL据え置き)")
-            except Exception:
-                pass
+            # cloudflaredはプロセスが生きている限り同じURLを保つ(切断時も
+            # 同名で再接続する)ため、プロセス生存だけで据え置きにする。
+            # トンネル越しの /health 往復を判定に使うと、VMから自分の
+            # トンネルへ届かない環境で毎回作り直しになり、URLが回転して
+            # 貼った側が getaddrinfo failed で全滅する (2026-07-12実障害)
+            url = old
+            print("既存のトンネルを再利用します(URL据え置き)")
     if url is None:
         subprocess.run(["pkill", "-f", "cloudflared"], capture_output=True)
         time.sleep(1)

@@ -364,14 +364,13 @@ class ColabDriver:
                     "されてからもう一度お試しください(ログインは保存され、"
                     "次回からは自動になります)")
             time.sleep(1)
-        # タブ再利用時に前セッションのURL出力が残っていることがある。
-        # それを「新しいURL」と誤認して死んだURLを回収しないよう記録
-        # (同じURLは /health への到達確認が取れたときだけ有効とみなす)
-        _stale = extract_url_token(self._text())
-        self._stale_url = _stale[0] if _stale else None
-        if self._stale_url:
-            log(f"  前回のURL出力を検出({self._stale_url})。"
-                "生存確認できない限り無視します")
+        # 画面に前セッションのURL出力が残っていても問題ない:
+        # 回収は _fresh_url_token が /health 応答を確認したURLしか
+        # 採用しない(残骸・死んだトンネル・DNS未浸透はすべて弾かれる)
+        _old = extract_url_token(self._text())
+        if _old and _old[0]:
+            log(f"  画面に既存のURL出力あり({_old[0]}) -- "
+                "応答が確認できた場合のみ採用します")
         # 2) 1回目のRun all
         log("すべてのセルを実行します(1回目)…")
         if not self._run_all(log):
@@ -416,24 +415,28 @@ class ColabDriver:
             "ください")
 
     def _fresh_url_token(self):
-        """画面のURL/TOKENを、前セッションの残骸を除外して返す。
+        """画面のURL/TOKENを、/health への到達を確認してから返す。
 
-        開始時に見えていたURLと同じ場合は、/health への到達確認が
-        取れたときだけ有効(=本当にまだ生きている再開ケース)。
-        trycloudflareのURLはトンネルごとにランダムなので、開始時と
-        異なるURLはそれだけで新鮮とみなせる。"""
+        画面に見えているURLでも信用しない: 前セッションの残骸・
+        作り直しで死んだトンネル・DNS未浸透の新トンネルはすべて
+        「この端末から応答が取れない」ので、probeが通ったものだけを
+        採用する(2026-07-12: 収集したURLがgetaddrinfo failedで全滅する
+        事故が続いたため、検証をURLの新旧判定から到達性そのものに変更)。
+        失敗したURLは30秒間probeを抑制して回線を無駄にしない。"""
         got = extract_url_token(self._text())
         if not got or not got[0]:
             return None
-        if got[0] == getattr(self, "_stale_url", None):
-            now = time.time()
-            if now < getattr(self, "_stale_next_probe", 0.0):
-                return None
-            if _probe_health(got[0]):
-                return got
-            self._stale_next_probe = now + 30   # 死んだURLの連続probe抑制
+        u = got[0]
+        now = time.time()
+        neg = getattr(self, "_url_probe_neg", None)
+        if neg is None:
+            neg = self._url_probe_neg = {}
+        if now < neg.get(u, 0.0):
             return None
-        return got
+        if _probe_health(u):
+            return got
+        neg[u] = now + 30
+        return None
 
     def _text_html_probe(self) -> str:
         try:
