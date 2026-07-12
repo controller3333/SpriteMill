@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.2"   # 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
+__version__ = "0.6.3"   # 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
+# 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
 # 0.6.1: vace用Lightning 4step LoRA + High段間引き
 # 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
 # 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
@@ -1020,6 +1021,30 @@ class AniSoraAdapter(_WanA14BBase):
         strength = max(0.10, min(0.90, strength))
         steps = max(8, int(req.steps))          # スケジュール解像度(既定24)
         dev = pipe._execution_device
+
+        def _dev_of(m):
+            try:
+                return next(m.parameters()).device.type
+            except (StopIteration, AttributeError, TypeError):
+                return None
+
+        # ---- VRAM退避 (2026-07-13 A100-40実OOM対策): リファインの尻尾は
+        # 全ステップが boundary(0.9) 未満 = Low側(transformer_2)しか
+        # 走らないため、High側は丸ごとCPUへ (約9GB解放)。さらに81f一括
+        # encode中はUMT5も不要なのでCPUへ (約11GB解放。常駐29.5GB +
+        # encodeスパイク9-12GBで39.5GBの天井に激突した) ----
+        moved_back = []
+        hi_t = getattr(pipe, "transformer", None)
+        if hi_t is not None and _dev_of(hi_t) == "cuda":
+            log("リファイン: High側transformerをCPUへ退避 (尻尾では不使用)")
+            hi_t.to("cpu")
+            moved_back.append(hi_t)
+        te = getattr(pipe, "text_encoder", None)
+        te_offloaded = False
+        if te is not None and _dev_of(te) == "cuda":
+            te.to("cpu")
+            te_offloaded = True
+        _free_cuda(log)
         # ---- 1段目動画をlatentへ (81f encodeはタイリング必須) ----
         had_tiling = getattr(pipe.vae, "use_tiling", False)
         try:
@@ -1039,6 +1064,13 @@ class AniSoraAdapter(_WanA14BBase):
             1, -1, 1, 1, 1).to(x0.device, x0.dtype)
         x0 = ((x0 - lm) * ls).to(torch.float32)
         del vid, enc
+        try:
+            import torch as _t
+            _t.cuda.empty_cache()      # encodeの中間バッファを即返却
+        except Exception:
+            pass
+        if te_offloaded:
+            te.to(dev)                 # プロンプトembedで必要になる
         # ---- スケジュール切詰めラッパ ----
         sched = pipe.scheduler
         orig_set = sched.set_timesteps
@@ -1090,6 +1122,12 @@ class AniSoraAdapter(_WanA14BBase):
                     pipe.vae.disable_tiling()
                 except Exception:
                     pass
+            for m in moved_back:      # High側を戻す (通常のanisoraジョブ用)
+                try:
+                    m.to(dev)
+                except Exception as e:
+                    log(f"High側の復帰に失敗 (次ジョブで再ロード): {e}")
+                    self.unload(log)
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
