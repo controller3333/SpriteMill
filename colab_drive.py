@@ -59,23 +59,74 @@ def extract_url_token(text: str) -> tuple[str, str] | None:
     return url, tok
 
 
+WEBVIEW_CDP_PORT = 9456   # sprite_mill._webview_main と一致させること
+
+
+def _port_up(port: int) -> bool:
+    import urllib.request as _rq
+    try:
+        with _rq.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+def _launch_webview_host(notebook_url: str, log=print) -> bool:
+    """完全内蔵のWebView2窓 (SpriteMill --webview) を起動してCDPを待つ。
+
+    Edge運転で「普段使い側の拡張機能が全部無効化される」事故が起きたため
+    (2026-07-12 配布テスト)、既定はこちら。WebView2はブラウザのEdgeとは
+    別ランタイム・別プロファイルで、普段の環境に一切干渉しない。"""
+    import subprocess
+    if _port_up(WEBVIEW_CDP_PORT):
+        return True
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--webview", notebook_url]
+    else:
+        host = Path(__file__).resolve().parent / "sprite_mill.py"
+        cmd = [sys.executable, str(host), "--webview", notebook_url]
+    try:
+        subprocess.Popen(cmd)
+    except OSError as e:
+        log(f"内蔵ブラウザを起動できません: {e}")
+        return False
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        if _port_up(WEBVIEW_CDP_PORT):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 class ColabDriver:
-    def __init__(self, profile_dir: Path, notebook_url: str):
+    def __init__(self, profile_dir: Path, notebook_url: str,
+                 browser: str = "webview2", log=print):
         wd = _web_drive()
         self._wd = wd
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
-        try:
-            ok = wd.ensure_debug_edge(profile_dir, notebook_url,
-                                      open_url=True, app_mode=True)
-        except TypeError:   # 旧web_drive (app_mode未対応) との互換
-            ok = wd.ensure_debug_edge(profile_dir, notebook_url,
-                                      open_url=True)
-        if not ok:
-            raise RuntimeError(
-                "運転用Edgeを起動できませんでした(Edge未検出/ポート不通)")
+        cdp_port = None
+        if browser == "webview2":
+            if _launch_webview_host(notebook_url, log):
+                cdp_port = WEBVIEW_CDP_PORT
+                log("内蔵ブラウザ(WebView2)で開きました")
+            else:
+                log("内蔵ブラウザの起動に失敗 -- Edge運転にフォールバック"
+                    "します (config videolab_browser で切替可)")
+        if cdp_port is None:
+            try:
+                ok = wd.ensure_debug_edge(profile_dir, notebook_url,
+                                          open_url=True, app_mode=True)
+            except TypeError:   # 旧web_drive (app_mode未対応) との互換
+                ok = wd.ensure_debug_edge(profile_dir, notebook_url,
+                                          open_url=True)
+            if not ok:
+                raise RuntimeError(
+                    "運転用ブラウザを起動できませんでした"
+                    "(WebView2/Edgeともに不通)")
+            cdp_port = wd.DEBUG_PORT
         self.browser = self._pw.chromium.connect_over_cdp(
-            f"http://127.0.0.1:{wd.DEBUG_PORT}")
+            f"http://127.0.0.1:{cdp_port}")
         ctx = (self.browser.contexts[0] if self.browser.contexts
                else self.browser.new_context())
         # Colabタブを探す(無ければ既存タブで開く)
@@ -223,11 +274,15 @@ class ColabDriver:
 
 
 def drive_colab(profile_dir: Path, notebook_url: str, log=print,
-                poll_timeout: int = 2400) -> dict:
-    """公開エントリ: ノートを開いて起動し {'url','token'} を返す。"""
+                poll_timeout: int = 2400, browser: str = "webview2") -> dict:
+    """公開エントリ: ノートを開いて起動し {'url','token'} を返す。
+
+    browser: "webview2"=完全内蔵ブラウザ(既定・普段の環境に不干渉) /
+             "edge"=従来のCDPアタッチEdge (config videolab_browser)。"""
     drv = None
     try:
-        drv = ColabDriver(Path(profile_dir), notebook_url)
+        drv = ColabDriver(Path(profile_dir), notebook_url,
+                          browser=browser, log=log)
         return drv.run(log, poll_timeout=poll_timeout)
     finally:
         if drv is not None:
