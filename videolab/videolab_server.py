@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.3"   # 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
+__version__ = "0.6.4"   # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
+# 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
 # 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
 # 0.6.1: vace用Lightning 4step LoRA + High段間引き
 # 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
@@ -1912,6 +1913,24 @@ def worker_loop():
             j.pop("_req", None)
 
 
+def _shutdown_runtime(delay: float = 2.0) -> None:
+    """ランタイムを解放して自沈する (アプリ終了時の自動片付け 2026-07-13要望
+    「ランタイム削除が毎回地味に手間」)。
+
+    Colab上なら google.colab.runtime.unassign() でVMごと解放 (課金停止・
+    「ランタイムを接続解除して削除」と同じ)。非Colab (ローカルサーバ) は
+    プロセス終了のみ。HTTP応答を返してから実行するため遅延スレッドで
+    呼ぶこと。"""
+    time.sleep(delay)
+    try:
+        from google.colab import runtime      # type: ignore
+        print("[videolab] runtime.unassign() でColabランタイムを解放します",
+              flush=True)
+        runtime.unassign()
+    except Exception:
+        os._exit(0)
+
+
 # ---------------------------------------------------------------- FastAPI
 def build_app(token: str | None):
     from fastapi import FastAPI, HTTPException, Request
@@ -1972,6 +1991,16 @@ def build_app(token: str | None):
         _auth(request)
         return {"models": [a.info() for a in ADAPTERS.values()],
                 "current": CURRENT_MODEL}
+
+    @app.post("/api/shutdown")
+    def api_shutdown(request: Request):
+        """ランタイム解放 (Colab=unassignでVM削除 / ローカル=プロセス終了)。
+
+        SpriteMill本体がアプリ終了時・内蔵ブラウザが閉じられたときに叩く
+        (2026-07-13要望)。認証必須。応答を返してから2秒後に実行。"""
+        _auth(request)
+        threading.Thread(target=_shutdown_runtime, daemon=True).start()
+        return {"ok": True, "detail": "runtime shutdown scheduled"}
 
     @app.post("/api/generate")
     async def api_generate(request: Request):
