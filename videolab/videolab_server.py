@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.5"   # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
+__version__ = "0.6.6"   # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
+# 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
 # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
 # 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
 # 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
@@ -74,8 +75,18 @@ COLAB_PIP = [
     "fastapi uvicorn pillow imageio-ffmpeg",
     "-U \"diffusers>=0.39.0\" transformers accelerate safetensors sentencepiece",
     # ftfy=Wan系プロンプト前処理 / gguf=GGUF量子化ロード / peft=LoRA
-    "ftfy gguf peft",
+    # hf_transfer=HF並列DL(Colab⇔HFで500MB/s超。60GB初回が1-2分)
+    "ftfy gguf peft hf_transfer",
 ]
+
+# hf_transferが入っていればHFダウンロードを並列化する (未導入なら従来DL。
+# 「毎回DLよりドライブ読みが速いのでは」2026-07-13の疑問への回答は逆で、
+# ColabのDriveマウントは30-80MB/s、HF直DLは実測280MB/s+hf_transferで更に上)
+try:
+    import hf_transfer  # noqa: F401
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------- 基本設定
 HERE = Path(__file__).resolve().parent
