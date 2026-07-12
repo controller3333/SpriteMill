@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.6"   # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
+__version__ = "0.6.7"   # 0.6.7: offload=model指定の受理(大判グリッドのOOM対策)
+# 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
 # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
 # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
 # 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
@@ -945,7 +946,17 @@ class AniSoraAdapter(_WanA14BBase):
         # "seq" のみ明示指定 (12GB級の省メモリモード)。
         off = str((extra or {}).get("offload")
                   or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
-        off = "seq" if off in ("seq", "sequential") else ""
+        # "model"(=model_cpu_offload) も受理する: エンジンは大判の
+        # グリッド生成でVRAM<60GBのとき offload=model を明示するが、
+        # 従来は"seq"以外を握りつぶして常駐へ落とし、720x1296の
+        # 活性化~21GBでOOM->方向別フォールバックしていた
+        # (2026-07-13実障害)
+        if off in ("seq", "sequential"):
+            off = "seq"
+        elif off in ("model", "offload"):
+            off = "model"
+        else:
+            off = ""
         return q, off
 
     def ensure_loaded(self, log):
@@ -1404,7 +1415,17 @@ class VACEAdapter(_WanA14BBase):
             q = "Q8_0"
         off = str(e.get("offload")
                   or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
-        off = "seq" if off in ("seq", "sequential") else ""
+        # "model"(=model_cpu_offload) も受理する: エンジンは大判の
+        # グリッド生成でVRAM<60GBのとき offload=model を明示するが、
+        # 従来は"seq"以外を握りつぶして常駐へ落とし、720x1296の
+        # 活性化~21GBでOOM->方向別フォールバックしていた
+        # (2026-07-13実障害)
+        if off in ("seq", "sequential"):
+            off = "seq"
+        elif off in ("model", "offload"):
+            off = "model"
+        else:
+            off = ""
         base = str(e.get("vace_base")
                    or os.environ.get("VIDEOLAB_VACE_BASE", "anisora")).lower()
         if base not in ("anisora", "fun"):
