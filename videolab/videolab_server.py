@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.4"   # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
+__version__ = "0.6.5"   # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
+# 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
 # 0.6.3: リファインのVRAM退避(A100-40のOOM対策)
 # 0.6.2: Colab同梱の古いtorchaoでLoRA適用が落ちる問題の回避
 # 0.6.1: vace用Lightning 4step LoRA + High段間引き
@@ -1046,32 +1047,49 @@ class AniSoraAdapter(_WanA14BBase):
             te.to("cpu")
             te_offloaded = True
         _free_cuda(log)
-        # ---- 1段目動画をlatentへ (81f encodeはタイリング必須) ----
+        # ---- 1段目動画をlatentへ ----
+        # ★ no_grad必須: diffusersのパイプラインは@torch.no_grad()装飾
+        # だが、アダプタから直接呼ぶvae.encodeは勾配グラフを全チャンク分
+        # 保持してVRAMを食い尽くす (2026-07-13実障害: A100-80でも78GB
+        # 積み上げてOOM。WanVAEは1+4+4...フレームのチャンク処理なので
+        # 推論だけなら81fでもスパイクは数GBで済む)
         had_tiling = getattr(pipe.vae, "use_tiling", False)
         try:
             pipe.vae.enable_tiling()
         except Exception:
             pass
-        vid = torch.cat(
-            [pipe.video_processor.preprocess(f, height=h, width=w)
-             .unsqueeze(2) for f in frames], dim=2)
-        vid = vid.to(device=dev, dtype=pipe.vae.dtype)
-        enc = pipe.vae.encode(vid)
-        x0 = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
-              else enc.latents)
-        lm = torch.tensor(pipe.vae.config.latents_mean).view(
-            1, -1, 1, 1, 1).to(x0.device, x0.dtype)
-        ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
-            1, -1, 1, 1, 1).to(x0.device, x0.dtype)
-        x0 = ((x0 - lm) * ls).to(torch.float32)
+
+        def _vram(tag):
+            try:
+                fr, tot = torch.cuda.mem_get_info()
+                log(f"リファインVRAM[{tag}]: 空き{fr / 2**30:.1f}"
+                    f"/{tot / 2**30:.0f}GB")
+            except Exception:
+                pass
+
+        _vram("encode前")
+        with torch.no_grad():
+            vid = torch.cat(
+                [pipe.video_processor.preprocess(f, height=h, width=w)
+                 .unsqueeze(2) for f in frames], dim=2)
+            vid = vid.to(device=dev, dtype=pipe.vae.dtype)
+            enc = pipe.vae.encode(vid)
+            x0 = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
+                  else enc.latents)
+            lm = torch.tensor(pipe.vae.config.latents_mean).view(
+                1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+            ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+                1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+            x0 = ((x0 - lm) * ls).to(torch.float32)
         del vid, enc
         try:
-            import torch as _t
-            _t.cuda.empty_cache()      # encodeの中間バッファを即返却
+            torch.cuda.empty_cache()   # encodeの中間バッファを即返却
         except Exception:
             pass
+        _vram("encode後")
         if te_offloaded:
             te.to(dev)                 # プロンプトembedで必要になる
+            te_offloaded = False
         # ---- スケジュール切詰めラッパ ----
         sched = pipe.scheduler
         orig_set = sched.set_timesteps
@@ -1123,6 +1141,13 @@ class AniSoraAdapter(_WanA14BBase):
                     pipe.vae.disable_tiling()
                 except Exception:
                     pass
+            if te_offloaded:
+                # encode中の例外でUMT5がCPUに取り残されると、以降の全ジョブ
+                # がdevice不一致で死ぬ (2026-07-13実障害: OOM後の連鎖)
+                try:
+                    te.to(dev)
+                except Exception:
+                    self.unload(log)
             for m in moved_back:      # High側を戻す (通常のanisoraジョブ用)
                 try:
                     m.to(dev)
