@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.5.1"   # 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
+__version__ = "0.6.0"   # 0.6.0: AniSoraリファイン(SDEdit式・Funポーズ+AniSora質感)
+# 0.5.1: vace_end=骨格制御の序盤限定適用(骨転写対策)
 # 0.5.0: vace=AniSoraベース移植(アニメprior+8step蒸留で骨格制御)
 # 0.4.3: トンネル生存判定をDNS(DoH)に+死産の作り直し
 # 0.4.2: トンネル据え置き判定をプロセス生存ベースに
@@ -901,7 +902,9 @@ class AniSoraAdapter(_WanA14BBase):
     desc = ("Bilibili のアニメ1000万クリップ特化モデル(Wan2.2ベース)。"
             "『motion score』で動きの強さを直接指定できる。i2vのみ。"
             "extra例: {\"motion_score\": 3.5}。量子化は環境変数 "
-            "VIDEOLAB_ANISORA_QUANT=Q8_0(既定・計32GB)/Q4_0(計18GB・24GB級GPU向け)")
+            "VIDEOLAB_ANISORA_QUANT=Q8_0(既定・計32GB)/Q4_0(計18GB・24GB級GPU向け)。"
+            "extra refine_frames_b64+refine_strength でSDEdit式リファイン"
+            "(既存動画の質感上塗り。stepsはスケジュール解像度、実行は尻尾のみ)")
     requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) / 12GB級はQ4_0+"
                 "逐次オフロード (低速・RAM32GB推奨)・DL 30〜45GB")
     gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
@@ -975,7 +978,118 @@ class AniSoraAdapter(_WanA14BBase):
         if not self.loaded:
             self._next_extra = dict(req.extra or {})
             self.ensure_loaded(log)
+        if req.extra.get("refine_frames_b64"):
+            return self._generate_refine(req, workdir, log, progress)
         return super().generate(req, workdir, log, progress)
+
+    def _generate_refine(self, req: GenRequest, workdir: Path, log,
+                         progress) -> Path:
+        """SDEdit式リファイン: 1段目(VACE骨格制御)の動画を途中ノイズまで
+        戻し、スケジュール終盤だけAniSoraで再デノイズして質感を上塗りする。
+
+        「Funでポーズ・AniSoraで仕上げ」の2段目 (2026-07-12設計)。素の
+        VACE-Funはポーズ・向きの制御が完璧だが、速い動きの末端(振り足の
+        靴など)が実写priorでブラー溶けする。動き・構図はlatentの低周波に
+        残したまま(開始σ=refine_strength、既定0.45)、アニメpriorが表面を
+        描き直す。追加コスト=terminalの2〜4step+VAEencode。
+
+        機構 (diffusers 0.39実測に基づく):
+        - WanImageToVideoPipeline.__call__ は latents= を素通しで使い、
+          条件テンソル(立ち絵)は通常どおり組む
+        - タイムステップはループ直前に scheduler.set_timesteps で決まる
+          ため、set_timesteps をラップして σ<=strength の尻尾へ切詰める
+          (timesteps/sigmas を同じオフセットでスライス+終端σ保持 —
+          UniPCはσを _step_index の位置参照で読むため両方必須)
+        - 初期latents = (1-σ0)·x0 + σ0·ε (use_flow_sigmasの順方向そのもの)
+        - 尻尾のtは全てboundary(0.9)未満 → 全stepがtransformer_2(Low=
+          ディテール側エキスパート)に自動ルーティングされる
+        """
+        import numpy as np                                       # noqa: F401
+        import torch
+        pipe = self.pipe
+        w = _snap(req.width, 16, 240)
+        h = _snap(req.height, 16, 240)
+        frames = load_images_b64(list(req.extra["refine_frames_b64"]))
+        n = max(5, ((len(frames) - 1) // 4) * 4 + 1)             # 4k+1
+        frames = frames[:n]
+        frames = [f if f.size == (w, h) else _fit_image(f, w, h)
+                  for f in frames]
+        strength = float(req.extra.get("refine_strength", 0.45))
+        strength = max(0.10, min(0.90, strength))
+        steps = max(8, int(req.steps))          # スケジュール解像度(既定24)
+        dev = pipe._execution_device
+        # ---- 1段目動画をlatentへ (81f encodeはタイリング必須) ----
+        had_tiling = getattr(pipe.vae, "use_tiling", False)
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+        vid = torch.cat(
+            [pipe.video_processor.preprocess(f, height=h, width=w)
+             .unsqueeze(2) for f in frames], dim=2)
+        vid = vid.to(device=dev, dtype=pipe.vae.dtype)
+        enc = pipe.vae.encode(vid)
+        x0 = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
+              else enc.latents)
+        lm = torch.tensor(pipe.vae.config.latents_mean).view(
+            1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+        ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+            1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+        x0 = ((x0 - lm) * ls).to(torch.float32)
+        del vid, enc
+        # ---- スケジュール切詰めラッパ ----
+        sched = pipe.scheduler
+        orig_set = sched.set_timesteps
+        box = {}
+
+        def _set_ts(nsteps, device=None, **kw3):
+            orig_set(nsteps, device=device, **kw3)
+            sig = sched.sigmas                    # CPU float32, 末尾に終端σ
+            hit = (sig[:-1] <= strength).nonzero()
+            idx = int(hit[0]) if len(hit) else int(len(sig) - 2)
+            idx = max(0, min(idx, len(sig) - 2))
+            sched.timesteps = sched.timesteps[idx:]
+            sched.sigmas = sched.sigmas[idx:]
+            sched.num_inference_steps = len(sched.timesteps)
+            box["s0"] = float(sched.sigmas[0])
+            box["tail"] = len(sched.timesteps)
+
+        sched.set_timesteps = _set_ts
+        try:
+            _set_ts(steps, device=dev)            # σ0確定のため先行実行
+            s0, tail = box["s0"], box["tail"]
+            g = torch.Generator("cpu").manual_seed(req.seed)
+            noise = torch.randn(x0.shape, generator=g).to(
+                x0.device, torch.float32)
+            x_t = (1.0 - s0) * x0 + s0 * noise
+            log(f"リファイン: {len(frames)}f σ0={s0:.2f} 実行{tail}/{steps}"
+                "step (全stepがLow=ディテール側)")
+            # 条件画像は「1段目動画の先頭フレーム」。立ち絵を渡すと
+            # frame0=直立ポーズを強制されて歩行中の先頭と矛盾する
+            # (identityは1段目の映像自体が持っている)
+            kw = dict(image=frames[0],
+                      prompt=self._build_prompt(req, log),
+                      negative_prompt=req.negative or None,
+                      width=w, height=h, num_frames=n,
+                      num_inference_steps=steps,
+                      guidance_scale=float(req.guidance),
+                      latents=x_t,
+                      generator=g,
+                      output_type="np", return_dict=False,
+                      callback_on_step_end=_step_callback(progress, tail))
+            # latents未対応の古いdiffusersなら明示エラーにする (黙って
+            # 落とすと「1段目を無視した素の生成」が静かに走る偽PASS)
+            out = _call_with_optional_kwargs(
+                self.pipe, kw, ["callback_on_step_end"], log)
+        finally:
+            sched.set_timesteps = orig_set
+            if not had_tiling:
+                try:
+                    pipe.vae.disable_tiling()
+                except Exception:
+                    pass
+        progress(0.92)
+        return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
 
 _GGML_BF16 = 30      # gguf.GGMLQuantizationType.BF16 (ggml固定値)
