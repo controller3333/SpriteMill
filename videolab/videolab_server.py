@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.4"   # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
+__version__ = "0.7.5"   # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
+# 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
 # 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
 # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
@@ -1769,6 +1770,24 @@ class VACEAdapter(_WanA14BBase):
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
 
+def _low_ram_vm(threshold_gb: float = 60.0) -> bool:
+    """システムRAMが少ないVMか (Colab L4=53GB / A100=83GB)。
+
+    latent直結は非稼働モデルをRAMへ退避させる設計のため、低RAM VMでは
+    RAM側が先に詰まりランタイムごとOOM killされる。該当時はUMT5の
+    ジョブ毎解放などの節約運転へ切り替える。"""
+    try:
+        import psutil
+        return psutil.virtual_memory().total < threshold_gb * 2**30
+    except Exception:
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                kb = int(f.readline().split()[1])
+            return kb * 1024 < threshold_gb * 2**30
+        except Exception:
+            return False
+
+
 def _slice_handoff_scheduler_state(scheduler, drop_frames: int,
                                    old_frames: int) -> None:
     """VACEの参照用time slotをUniPC履歴からも同時に外す。
@@ -2062,6 +2081,14 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             _free_cuda(log)
             _log_cuda_state(log, "condition前/DiT退避済み")
             # ---- promptを一度だけencode。UMT5は以後CPUへ ----
+            if pipe.text_encoder is None:
+                # 低RAM VMではジョブ末尾でUMT5をRAMから解放している
+                from transformers import UMT5EncoderModel
+                log("UMT5を再ロード (低RAM運転・約30秒)")
+                pipe.text_encoder = UMT5EncoderModel.from_pretrained(
+                    self.repo, subfolder="text_encoder",
+                    torch_dtype=torch.bfloat16)
+                self.ani_pipe.text_encoder = pipe.text_encoder
             self._move(pipe.text_encoder, device, log, "UMT5")
             prompt_embeds, negative_embeds = pipe.encode_prompt(
                 prompt=prompt, negative_prompt=negative,
@@ -2069,6 +2096,17 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 num_videos_per_prompt=1, max_sequence_length=512,
                 device=device)
             pipe.text_encoder.to("cpu")
+            if _low_ram_vm():
+                # L4級VM (RAM53GB) はモデルのCPU退避場所が足りず、RAMの
+                # 一時スパイクがランタイムごとOOM killされる (2026-07-13
+                # 実障害疑い: システムRAM 44.2/53GBで運転中にセッション消滅)。
+                # UMT5 (約11GB) をジョブ毎に解放して常時ヘッドルームを確保
+                import gc
+                log("低RAM VM: UMT5をRAMから解放 (44→33GB級。次ジョブ冒頭で"
+                    "再ロード)")
+                pipe.text_encoder = None
+                self.ani_pipe.text_encoder = None
+                gc.collect()
             _free_cuda(log)
             _log_cuda_state(log, "UMT5 encode後")
 
@@ -2182,13 +2220,29 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                                 "handoff temporal shape不一致: "
                                 f"latent={tuple(latents.shape)} / "
                                 f"condition={tuple(i2v_cond.shape)}")
-                        if not v_hooked:
-                            vmodel.to("cpu")
                         del control_cond, scale
                         _free_cuda(log)
                         a_hooked = (want_off and self._try_group_offload(
                             amodel, log, "AniSora Low"))
+                        # 低RAM VM対策の載せ替え順: 空きVRAMが足りるなら
+                        # 先にLowをGPUへ (CPU側が9GB空く) → HighをCPUへ。
+                        # 逆順だとCPU一時+8.5GBのスパイクがL4級VM (53GB)
+                        # のOOM killを招く。VRAMが狭いGPUは従来順のまま
+                        swap_first = False
                         if not a_hooked:
+                            try:
+                                swap_first = (torch.cuda.mem_get_info()[0]
+                                              > 10.5 * 2**30)
+                            except Exception:
+                                swap_first = False
+                            if swap_first:
+                                self._move(amodel, device, log,
+                                           "native AniSora Low (RAMスパイク"
+                                           "回避の先載せ)")
+                        if not v_hooked:
+                            vmodel.to("cpu")
+                            _free_cuda(log)
+                        if not a_hooked and not swap_first:
                             self._move(amodel, device, log,
                                        "native AniSora Low")
                         switched = True
