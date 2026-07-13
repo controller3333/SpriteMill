@@ -1814,9 +1814,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             "低step LoRAを維持。中間動画・VAE再encode・"
             "再ノイズ化なし。extra hybrid_boundary=0.90(既定) / 0.875。"
             "steps既定8 (6ではLow区間不足で黄変、2026-07-13実測)。")
-    requires = ("Colab A100 40GB推奨。Q4でVACE High約8.5GB + AniSora Low"
-                "約9GBを区間ごとにGPUへ載せ替え。High側へLightning低step"
-                "LoRAを適用。DL約77GB")
+    requires = ("Colab L4で十分 (Q4+動的キャンバス設計でほぼフル品質・"
+                "料金はA100の約1/5。A100は最速だが贅沢品)。Q4でVACE High"
+                "約8.5GB + AniSora Low約9GBを区間ごとにGPUへ載せ替え。"
+                "High側へLightning低step LoRAを適用。DL約77GB。"
+                "16GB未満のご家庭GPUはextra offloadでblock offload(実験的)")
     cache_repos = VACEAdapter.cache_repos + ("lightx2v/Wan2.2-Lightning",)
     disk_gb = 77
     defaults = {"width": 464, "height": 848, "num_frames": 49, "fps": 16,

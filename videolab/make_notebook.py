@@ -39,8 +39,9 @@ def main() -> None:
 ブラウザから直接試したり、SpriteMill本体の動画AIとして接続したりできる。
 
 **ランタイム**: `ランタイム → ランタイムのタイプを変更` で **GPU** を選ぶ。
-モデルごとの目安は起動後の webUI のモデル説明欄に表示される
-(大型モデルは A100、量子化版は L4/T4 でも可)。
+**推奨は L4**(料金はA100の約1/5。Q4量子化+動的キャンバス設計でほぼ
+フル品質が出る)。A100は最速だが贅沢品。モデルごとの目安は起動後の
+webUI のモデル説明欄に表示される。
 
 **使い方(Run All を2回)**
 1. `すべてのセルを実行` → セル2で一度だけ自動再起動される。
@@ -96,7 +97,7 @@ while True:
     nb = {
         "nbformat": 4, "nbformat_minor": 5,
         "metadata": {
-            "colab": {"provenance": [], "gpuType": "A100"},
+            "colab": {"provenance": [], "gpuType": "L4"},
             "accelerator": "GPU",
             "kernelspec": {"name": "python3", "display_name": "Python 3"},
             "language_info": {"name": "python"},
