@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.1"   # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
+__version__ = "0.7.2"   # 0.7.2: hybrid既定を8step/49fへ (6step黄変・1周期対策)
+# 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
 # 0.7.0: VACE High -> native AniSora Low latent直結
 # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
 # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
@@ -1806,14 +1807,15 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
     desc = ("前半だけOpenPose/VACEで構図と歩行を固定し、同じノイズlatentを"
             "後半の無改造AniSora Lowへ直接渡す。VACE HighにはLightning"
             "低step LoRAを維持。中間動画・VAE再encode・"
-            "再ノイズ化なし。extra hybrid_boundary=0.90(既定) / 0.875。")
+            "再ノイズ化なし。extra hybrid_boundary=0.90(既定) / 0.875。"
+            "steps既定8 (6ではLow区間不足で黄変、2026-07-13実測)。")
     requires = ("Colab A100 40GB推奨。Q4でVACE High約8.5GB + AniSora Low"
                 "約9GBを区間ごとにGPUへ載せ替え。High側へLightning低step"
                 "LoRAを適用。DL約77GB")
     cache_repos = VACEAdapter.cache_repos + ("lightx2v/Wan2.2-Lightning",)
     disk_gb = 77
-    defaults = {"width": 464, "height": 848, "num_frames": 33, "fps": 16,
-                "steps": 6, "guidance": 1.0}
+    defaults = {"width": 464, "height": 848, "num_frames": 49, "fps": 16,
+                "steps": 8, "guidance": 1.0}
 
     def __init__(self):
         super().__init__()
