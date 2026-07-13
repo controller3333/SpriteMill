@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.5"   # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
+__version__ = "0.7.6"   # 0.7.6: UMT5をロード段階から持たない (L4のRAM OOM kill根治)
+# 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
 # 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
@@ -1920,10 +1921,22 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             alp, quantization_config=qc, config=self.base_repo,
             subfolder="transformer_2", torch_dtype=torch.bfloat16)
 
-        log(f"共通VAE/UMT5読み込み: {self.repo}")
+        # 低RAM VM (L4=53GB) ではUMT5(約11GB)をロード段階から持たない:
+        # ロードピーク=モデル一式+移植ドナー+UMT5≈48GBが天井を叩き、
+        # ジョブ2回目の再ロードでランタイムごとRAM OOM killされる実障害
+        # (2026-07-13 L4実走で「RAMを増やす」画面を確認)。UMT5はジョブ毎に
+        # 遅延ロード→encode後に解放 (v0.7.5の解放/再ロード機構を流用)
+        _lowram = _low_ram_vm()
+        pipe_kwargs = dict(transformer=vhigh, transformer_2=None,
+                           torch_dtype=torch.bfloat16)
+        if _lowram:
+            pipe_kwargs["text_encoder"] = None
+            log(f"共通VAE読み込み (UMT5はジョブ毎に遅延ロード=低RAM運転): "
+                f"{self.repo}")
+        else:
+            log(f"共通VAE/UMT5読み込み: {self.repo}")
         self.pipe = WanVACEPipeline.from_pretrained(
-            self.repo, transformer=vhigh, transformer_2=None,
-            torch_dtype=torch.bfloat16)
+            self.repo, **pipe_kwargs)
         sched = UniPCMultistepScheduler.from_config(
             self.pipe.scheduler.config, flow_shift=self.flow_shift)
         self.pipe.scheduler = sched
