@@ -1816,10 +1816,23 @@ class VACEAdapter(_WanA14BBase):
                        Path(workdir) / "latent.pt")
             log(f"最終latent保存: {tuple(lat.shape)} -> latent.pt "
                 "(VAE未通過・AniSora latent再加工用)")
-            # プレビュー兼デバッグ用に一度だけdecode (成果物契約はmp4)
+            # プレビュー兼デバッグ用に一度だけdecode (成果物契約はmp4)。
+            # ★offloadフック運用時は重みとlatentのデバイスが食い違う
+            # (2026-07-13実障害: CPUBFloat16 vs CUDABFloat16) — CUDAへ
+            # 明示的に揃えてからdecodeする
             vae = self.pipe.vae
             with torch.no_grad():
-                vdev = next(vae.parameters()).device
+                try:
+                    vae.enable_tiling()
+                except Exception:
+                    pass
+                vdev = (torch.device("cuda")
+                        if torch.cuda.is_available()
+                        else next(vae.parameters()).device)
+                try:
+                    vae.to(vdev)
+                except Exception:      # フックと衝突したら実デバイスに従う
+                    vdev = next(vae.parameters()).device
                 lm = torch.tensor(vae.config.latents_mean).view(
                     1, -1, 1, 1, 1).to(vdev, vae.dtype)
                 ls = 1.0 / torch.tensor(vae.config.latents_std).view(
