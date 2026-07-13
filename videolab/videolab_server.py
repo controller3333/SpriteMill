@@ -44,7 +44,7 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.0"   # 0.8.0: latent再加工モード (VACEフル→VAE未通過でAniSora再デノイズ)
+__version__ = "0.8.1"   # 0.8.1: emit_latentのプレビューdecodeを既定省略 (時間節約)
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -1816,6 +1816,15 @@ class VACEAdapter(_WanA14BBase):
                        Path(workdir) / "latent.pt")
             log(f"最終latent保存: {tuple(lat.shape)} -> latent.pt "
                 "(VAE未通過・AniSora latent再加工用)")
+            if not req.extra.get("emit_latent_preview"):
+                # 本番はプレビューdecodeを省略 (2026-07-14お兄さま指示
+                # 「絶対重いし使わないものだから時間無駄」)。ジョブ契約
+                # (結果=mp4) は参照画像1フレームのサムネで満たす
+                import numpy as np
+                thumb = np.asarray(_fit_image(req.images[0], w, h)
+                                   .convert("RGB"), dtype=np.float32) / 255.0
+                log("プレビューdecode省略 (emit_latent_preview未指定)")
+                return _frames_to_mp4([thumb], req.fps, workdir, log)
             # プレビュー兼デバッグ用に一度だけdecode (成果物契約はmp4)。
             # ★offloadフック運用時は重みとlatentのデバイスが食い違う
             # (2026-07-13実障害: CPUBFloat16 vs CUDABFloat16) — CUDAへ
