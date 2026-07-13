@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.2"   # 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
+__version__ = "0.7.3"   # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
+# 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
 # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
 # 0.7.0: VACE High -> native AniSora Low latent直結
 # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
@@ -936,7 +937,7 @@ class AniSoraAdapter(_WanA14BBase):
     desc = ("Bilibili のアニメ1000万クリップ特化モデル(Wan2.2ベース)。"
             "『motion score』で動きの強さを直接指定できる。i2vのみ。"
             "extra例: {\"motion_score\": 3.5}。量子化は環境変数 "
-            "VIDEOLAB_ANISORA_QUANT=Q8_0(既定・計32GB)/Q4_0(計18GB・24GB級GPU向け)。"
+            "VIDEOLAB_ANISORA_QUANT=Q4_0(既定・計18GB)/Q8_0(計32GB・明示時のみ)。"
             "extra refine_frames_b64+refine_strength でSDEdit式リファイン"
             "(既存動画の質感上塗り。stepsはスケジュール解像度、実行は尻尾のみ)")
     requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) / 12GB級はQ4_0+"
@@ -955,10 +956,12 @@ class AniSoraAdapter(_WanA14BBase):
         Colabサーバは遠隔で環境変数を触れないため、アプリからはジョブの
         extra {"quant": "Q4_0", "offload": "seq"} で指定できる(共通設定、
         2026-07-12要望: A100ばかり使えないのでL4はQ4_0で運用したい)。"""
+        # 既定Q4_0 (2026-07-13方針: VRAM16GB未満級を上限に。Q8はGUI選択肢
+        # からも撤廃済みで、明示指定されたときだけ受理する)
         q = str((extra or {}).get("quant")
-                or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q8_0"))
+                or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0"))
         if q not in ("Q4_0", "Q8_0"):     # High側はQ4_0/Q8_0のみ存在
-            q = "Q8_0"
+            q = "Q4_0"
         # 既定は "" = auto (VRAMを見てGPU常駐 or model_cpu_offloadを選ぶ)。
         # "seq" のみ明示指定 (12GB級の省メモリモード)。
         off = str((extra or {}).get("offload")
@@ -1399,8 +1402,8 @@ class VACEAdapter(_WanA14BBase):
             "images[0]=参照立ち絵、骨格は extra pose_frames_b64 か images "
             "2枚目以降で渡す。extra例: {\"conditioning_scale\": 1.0, "
             "\"vace_base\": \"fun\"(移植なしの素のVACE-Fun・steps30/cfg5"
-            "推奨)}。量子化は共通quant (Q8_0既定/Q4_0。AniSora GGUFはこの"
-            "2種のみ)。bf16は移植なし=素のVACE-Fun")
+            "推奨)}。量子化は共通quant (Q4_0既定/Q8_0は明示時のみ。AniSora "
+            "GGUFはこの2種のみ)。bf16は移植なし=素のVACE-Fun")
     requires = ("Colab A100/L4 / ローカル24GB+ (Q4_0) — DL 75GB前後 "
                 "(VACE-Fun 31GB + AniSora 32GB + ベース12GB)。"
                 "移植中はRAMを一時+16GB(Q8)使用")
@@ -1436,10 +1439,11 @@ class VACEAdapter(_WanA14BBase):
         おっきいほうが使われます」対応 — 従来vaceはbf16固定だった)。
         戻り値 = (quant, offload, base, experts, patch)。"""
         e = extra or {}
+        # 既定Q4_0 (2026-07-13方針: 16GB未満級を上限に。Q8/bf16は明示時のみ)
         q = str(e.get("quant")
-                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q8_0"))
+                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
         if q not in ("Q4_0", "Q8_0", "bf16"):
-            q = "Q8_0"
+            q = "Q4_0"
         off = str(e.get("offload")
                   or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
         # "model"(=model_cpu_offload) も受理する: エンジンは大判の
