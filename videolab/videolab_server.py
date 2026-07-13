@@ -44,7 +44,7 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.6"   # 0.7.6: UMT5をロード段階から持たない (L4のRAM OOM kill根治)
+__version__ = "0.8.0"   # 0.8.0: latent再加工モード (VACEフル→VAE未通過でAniSora再デノイズ)
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -1028,7 +1028,7 @@ class AniSoraAdapter(_WanA14BBase):
         if not self.loaded:
             self._next_extra = dict(req.extra or {})
             self.ensure_loaded(log)
-        if req.extra.get("refine_frames_b64"):
+        if req.extra.get("refine_frames_b64") or req.extra.get("latent_from"):
             return self._generate_refine(req, workdir, log, progress)
         return super().generate(req, workdir, log, progress)
 
@@ -1059,11 +1059,22 @@ class AniSoraAdapter(_WanA14BBase):
         pipe = self.pipe
         w = _snap(req.width, 16, 240)
         h = _snap(req.height, 16, 240)
-        frames = load_images_b64(list(req.extra["refine_frames_b64"]))
-        n = max(5, ((len(frames) - 1) // 4) * 4 + 1)             # 4k+1
-        frames = frames[:n]
-        frames = [f if f.size == (w, h) else _fit_image(f, w, h)
-                  for f in frames]
+        lat_from = str(req.extra.get("latent_from") or "").strip()
+        if lat_from:
+            # latent再加工モード (2026-07-13お兄さま発案「VACEをフルで
+            # 当てて、その潜在をVAEを通す前にanisoraで再加工」):
+            # フレームは受け取らず、前段vaceジョブの最終latentを直接読む
+            if not req.images:
+                raise RuntimeError("latent_from には条件画像 (images[0]="
+                                   "参照キャンバス) が必要です")
+            n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)
+            frames = []
+        else:
+            frames = load_images_b64(list(req.extra["refine_frames_b64"]))
+            n = max(5, ((len(frames) - 1) // 4) * 4 + 1)         # 4k+1
+            frames = frames[:n]
+            frames = [f if f.size == (w, h) else _fit_image(f, w, h)
+                      for f in frames]
         strength = float(req.extra.get("refine_strength", 0.45))
         strength = max(0.10, min(0.90, strength))
         steps = max(8, int(req.steps))          # スケジュール解像度(既定24)
@@ -1113,19 +1124,39 @@ class AniSoraAdapter(_WanA14BBase):
                 pass
 
         _vram("encode前")
-        with torch.no_grad():
-            vid = torch.cat(
-                [pipe.video_processor.preprocess(f, height=h, width=w)
-                 .unsqueeze(2) for f in frames], dim=2)
-            vid = vid.to(device=dev, dtype=pipe.vae.dtype)
-            enc = pipe.vae.encode(vid)
-            x0 = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
-                  else enc.latents)
-            lm = torch.tensor(pipe.vae.config.latents_mean).view(
-                1, -1, 1, 1, 1).to(x0.device, x0.dtype)
-            ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
-                1, -1, 1, 1, 1).to(x0.device, x0.dtype)
-            x0 = ((x0 - lm) * ls).to(torch.float32)
+        if lat_from:
+            # VAEを一切通さないlatent直読み: decode→encode往復の劣化と
+            # 一括encodeのVRAMスパイクが両方消える
+            lp = WORK_ROOT / lat_from / "latent.pt"
+            if not lp.is_file():
+                raise RuntimeError(
+                    f"latent_from={lat_from}: latent.pt がありません "
+                    "(extra.emit_latent付きのvaceジョブIDを指定)")
+            with torch.no_grad():
+                x0 = torch.load(lp, map_location="cpu").to(
+                    dev, torch.float32)
+            t_expect = (n - 1) // 4 + 1
+            if x0.shape[2] != t_expect:
+                raise RuntimeError(
+                    f"latentの時間次元 {x0.shape[2]} が num_frames={n} "
+                    f"(期待{t_expect}) と一致しません")
+            log(f"latent再加工: {lat_from}/latent.pt {tuple(x0.shape)} "
+                "(VAE encodeスキップ)")
+            enc = vid = None
+        else:
+            with torch.no_grad():
+                vid = torch.cat(
+                    [pipe.video_processor.preprocess(f, height=h, width=w)
+                     .unsqueeze(2) for f in frames], dim=2)
+                vid = vid.to(device=dev, dtype=pipe.vae.dtype)
+                enc = pipe.vae.encode(vid)
+                x0 = (enc.latent_dist.mode()
+                      if hasattr(enc, "latent_dist") else enc.latents)
+                lm = torch.tensor(pipe.vae.config.latents_mean).view(
+                    1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+                ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+                    1, -1, 1, 1, 1).to(x0.device, x0.dtype)
+                x0 = ((x0 - lm) * ls).to(torch.float32)
         del vid, enc
         try:
             torch.cuda.empty_cache()   # encodeの中間バッファを即返却
@@ -1170,7 +1201,8 @@ class AniSoraAdapter(_WanA14BBase):
             # 時系列アテンションが劣化前の質感を全フレームから参照できる。
             # 前提=骨格の直立プレフィックス (frame0が直立なので立ち絵と
             # 矛盾しない。旧動画=全フレーム歩行に使うと先頭が跳ねる)
-            cond_img = frames[0]
+            cond_img = (frames[0] if frames
+                        else _fit_image(req.images[0], w, h))
             if req.extra.get("refine_cond_still") and req.images:
                 cond_img = _fit_image(req.images[0], w, h)
                 log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
@@ -1745,6 +1777,10 @@ class VACEAdapter(_WanA14BBase):
             step_box["i"] = step_index + 1
             return base_cb(pipe, step_index, timestep, callback_kwargs)
 
+        # latent直出しモード (2026-07-13お兄さま発案): VACEフル制御の
+        # 最終latentをVAE未通過のまま保存し、後段のAniSora latent再加工
+        # (anisoraジョブの extra.latent_from=このジョブID) へ渡す
+        emit_latent = bool(req.extra.get("emit_latent"))
         kw = dict(video=control, reference_images=[ref],
                   prompt=self._build_prompt(req, log),
                   negative_prompt=req.negative or self.WAN_NEGATIVE,
@@ -1754,10 +1790,12 @@ class VACEAdapter(_WanA14BBase):
                   conditioning_scale=float(
                       req.extra.get("conditioning_scale", 1.0)),
                   generator=torch.Generator("cpu").manual_seed(req.seed),
-                  output_type="np", return_dict=False,
+                  output_type="latent" if emit_latent else "np",
+                  return_dict=False,
                   callback_on_step_end=cb)
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance} "
-            f"骨格制御{len(control)}f cond={kw['conditioning_scale']}")
+            f"骨格制御{len(control)}f cond={kw['conditioning_scale']}"
+            + (" [latent直出し]" if emit_latent else ""))
         try:
             out = _call_with_optional_kwargs(
                 self.pipe, kw, ["callback_on_step_end", "conditioning_scale"],
@@ -1768,6 +1806,29 @@ class VACEAdapter(_WanA14BBase):
             if orig_set_ts is not None:
                 sched.set_timesteps = orig_set_ts
         progress(0.92)
+        if emit_latent:
+            lat = out[0]
+            lat = lat if torch.is_tensor(lat) else torch.as_tensor(lat)
+            t_expect = (n - 1) // 4 + 1
+            if lat.shape[2] > t_expect:      # VACEの参照タイムスロットを除去
+                lat = lat[:, :, lat.shape[2] - t_expect:]
+            torch.save(lat.detach().to("cpu", torch.float32),
+                       Path(workdir) / "latent.pt")
+            log(f"最終latent保存: {tuple(lat.shape)} -> latent.pt "
+                "(VAE未通過・AniSora latent再加工用)")
+            # プレビュー兼デバッグ用に一度だけdecode (成果物契約はmp4)
+            vae = self.pipe.vae
+            with torch.no_grad():
+                vdev = next(vae.parameters()).device
+                lm = torch.tensor(vae.config.latents_mean).view(
+                    1, -1, 1, 1, 1).to(vdev, vae.dtype)
+                ls = 1.0 / torch.tensor(vae.config.latents_std).view(
+                    1, -1, 1, 1, 1).to(vdev, vae.dtype)
+                dec = vae.decode(lat.to(vdev, vae.dtype) / ls + lm,
+                                 return_dict=False)[0]
+                video = self.pipe.video_processor.postprocess_video(
+                    dec, output_type="np")
+            return _frames_to_mp4(list(video[0]), req.fps, workdir, log)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
 
