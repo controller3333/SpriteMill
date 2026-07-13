@@ -44,7 +44,7 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.2"   # 0.7.2: hybrid既定を8step/49fへ (6step黄変・1周期対策)
+__version__ = "0.7.2"   # 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
 # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
 # 0.7.0: VACE High -> native AniSora Low latent直結
 # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
@@ -2109,6 +2109,10 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             i2v_cond = i2v_cond.to(device=device, dtype=amodel.dtype)
 
             self._move(vmodel, device, log, "VACE High")
+            # 49f×720x1296級はA100-40で残余0〜2GBの見積り (2026-07-13机上
+            # 外挿)。実測peakをログへ残し、次回のフレーム数/セル寸法の
+            # 可否判定を外挿でなく実測で行えるようにする
+            torch.cuda.reset_peak_memory_stats()
             switched = False
             for si, t in enumerate(timesteps):
                 use_vace = float(t) >= boundary_t
@@ -2173,6 +2177,9 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
 
             if not switched:
                 raise RuntimeError("native AniSora Lowへhandoffされませんでした")
+            log(f"denoise区間peak VRAM "
+                f"{torch.cuda.max_memory_allocated() / 2**30:.1f}GB "
+                f"({w}x{h} {n}f — フレーム数/セル寸法増の可否判定用)")
             amodel.to("cpu")
             del i2v_cond
             _free_cuda(log)
