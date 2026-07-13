@@ -44,7 +44,7 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.8"   # 0.6.8: refine_cond_still=リファイン条件画像を原画立ち絵に
+__version__ = "0.6.9"   # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
 # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
 # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
 # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
@@ -2484,8 +2484,12 @@ def run_in_colab(port: int = 8000, preload: str | None = None):
     token = ""
     if tok_file.is_file():
         token = tok_file.read_text(encoding="utf-8").strip()
-    if not token:
+    if not token or token.startswith("-"):
+        # '-'始まりはCLIでオプションと誤認される (実障害 2026-07-13
+        # "-w_v0...": argparseが --videolab-token の値を取れず起動失敗)
         token = secrets.token_urlsafe(16)
+        while token.startswith("-"):
+            token = secrets.token_urlsafe(16)
         tok_file.write_text(token, encoding="utf-8")
     if _health_up():
         print("既存のサーバを再利用します(トークン据え置き・トンネルのみ再作成)")
