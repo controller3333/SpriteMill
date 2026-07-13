@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.9"   # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
+__version__ = "0.7.0"   # 0.7.0: VACE High -> native AniSora Low latent直結
+# 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
 # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
 # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
 # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
@@ -1745,6 +1746,412 @@ class VACEAdapter(_WanA14BBase):
                 sched.set_timesteps = orig_set_ts
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
+
+
+def _slice_handoff_scheduler_state(scheduler, drop_frames: int,
+                                   old_frames: int) -> None:
+    """VACEの参照用time slotをUniPC履歴からも同時に外す。
+
+    latent本体だけを `[:, :, R:]` にすると、order-2 UniPCが保持する
+    model_outputs/last_sampleはT+Rのままで、handoff直後のcorrectorがshape
+    不一致になる。timestep_listやstep_indexは時間軸テンソルではないので
+    そのまま保持する。
+    """
+    if drop_frames <= 0:
+        return
+
+    def _slice(v):
+        if (hasattr(v, "ndim") and v.ndim >= 3
+                and int(v.shape[2]) == int(old_frames)):
+            return v[:, :, drop_frames:]
+        return v
+
+    outputs = getattr(scheduler, "model_outputs", None)
+    if isinstance(outputs, list):
+        scheduler.model_outputs = [_slice(v) for v in outputs]
+    elif isinstance(outputs, tuple):
+        scheduler.model_outputs = tuple(_slice(v) for v in outputs)
+    last = getattr(scheduler, "last_sample", None)
+    if last is not None:
+        scheduler.last_sample = _slice(last)
+
+
+@register
+class VACEAniSoraHandoffAdapter(VACEAdapter):
+    """VACE High -> native AniSora Lowを1本のlatent軌道で直結する。
+
+    完成VACE動画をMP4/JPEG化してVAE再encode・再加ノイズする旧refineとは
+    異なり、Wan2.2の通常のHigh/Low expert切替と同じUniPC scheduler上で
+    noise latentを一度も終了させない。VACEは16ch、AniSora I2Vは
+    latent16+参照条件20=36ch入力だが、両者のnoise predictionは16chなので
+    scheduler stateをそのまま継続できる。
+    """
+    id = "vace_anisora_handoff"
+    label = "VACE High → AniSora Low (latent直結・品質本命)"
+    desc = ("前半だけOpenPose/VACEで構図と歩行を固定し、同じノイズlatentを"
+            "後半の無改造AniSora Lowへ直接渡す。VACE HighにはLightning"
+            "低step LoRAを維持。中間動画・VAE再encode・"
+            "再ノイズ化なし。extra hybrid_boundary=0.90(既定) / 0.875。")
+    requires = ("Colab A100 40GB推奨。Q4でVACE High約8.5GB + AniSora Low"
+                "約9GBを区間ごとにGPUへ載せ替え。High側へLightning低step"
+                "LoRAを適用。DL約77GB")
+    cache_repos = VACEAdapter.cache_repos + ("lightx2v/Wan2.2-Lightning",)
+    disk_gb = 77
+    defaults = {"width": 464, "height": 848, "num_frames": 33, "fps": 16,
+                "steps": 6, "guidance": 1.0}
+
+    def __init__(self):
+        super().__init__()
+        self.ani_pipe = None
+
+    def unload(self, log):
+        self.ani_pipe = None
+        self.pipe = None
+        self.loaded = False
+
+    @staticmethod
+    def _hybrid_want(extra: dict) -> tuple:
+        e = extra or {}
+        q = str(e.get("quant")
+                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
+        if q not in ("Q4_0", "Q8_0"):
+            q = "Q4_0"
+        try:
+            boundary = float(e.get("hybrid_boundary")
+                             or os.environ.get("VIDEOLAB_HYBRID_BOUNDARY",
+                                               "0.90"))
+        except (TypeError, ValueError):
+            boundary = 0.90
+        return q, max(0.80, min(0.95, boundary))
+
+    @staticmethod
+    def _hybrid_lora(extra: dict) -> str:
+        """VACE Highに使う低step LoRA。既定lightning、offで比較用無効。"""
+        e = extra or {}
+        value = str(e.get("vace_lora")
+                    or os.environ.get("VIDEOLAB_VACE_LORA", "lightning"))
+        value = value.strip().lower()
+        return "off" if value in ("off", "none", "0", "false") else "lightning"
+
+    def ensure_loaded(self, log):
+        """必要なexpertだけロードする (VACE High + native AniSora Low)。"""
+        _require_deps(log)
+        import gc
+        import torch
+        from diffusers import (GGUFQuantizationConfig,
+                               UniPCMultistepScheduler,
+                               WanImageToVideoPipeline,
+                               WanTransformer3DModel,
+                               WanVACEPipeline,
+                               WanVACETransformer3DModel)
+        from huggingface_hub import hf_hub_download
+
+        next_extra = getattr(self, "_next_extra", {})
+        quant, _boundary = self._hybrid_want(next_extra)
+        lora = self._hybrid_lora(next_extra)
+        qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+        vname = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
+                 f"{quant}.gguf")
+        log(f"latent直結ロード: VACE High {quant}")
+        vp = hf_hub_download(self.gguf_repo, vname)
+        vhigh = WanVACETransformer3DModel.from_single_file(
+            vp, quantization_config=qc, config=self.repo,
+            subfolder="transformer", torch_dtype=torch.bfloat16)
+
+        # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
+        # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
+        ah_name = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
+        log(f"latent直結ロード: AniSora High移植ドナー {quant}")
+        ahp = hf_hub_download(self.anisora_gguf_repo, ah_name)
+        donor = WanTransformer3DModel.from_single_file(
+            ahp, quantization_config=qc, config=self.base_repo,
+            subfolder="transformer", torch_dtype=torch.bfloat16)
+        _transplant_base_weights(vhigh, donor, log, tag="HybridHigh")
+        del donor
+        gc.collect()
+
+        al_name = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
+        log(f"latent直結ロード: native AniSora Low {quant}")
+        alp = hf_hub_download(self.anisora_gguf_repo, al_name)
+        alow = WanTransformer3DModel.from_single_file(
+            alp, quantization_config=qc, config=self.base_repo,
+            subfolder="transformer_2", torch_dtype=torch.bfloat16)
+
+        log(f"共通VAE/UMT5読み込み: {self.repo}")
+        self.pipe = WanVACEPipeline.from_pretrained(
+            self.repo, transformer=vhigh, transformer_2=None,
+            torch_dtype=torch.bfloat16)
+        sched = UniPCMultistepScheduler.from_config(
+            self.pipe.scheduler.config, flow_shift=self.flow_shift)
+        self.pipe.scheduler = sched
+        if lora == "lightning":
+            # 旧VACE経路で使っていた低step LoRAをHigh側へ維持する。
+            # handoff後はnative AniSora Low（自身が蒸留済み）なので、VACE用
+            # low_noise LoRAは重ねず、High用だけをVACE transformerへ装着。
+            rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
+                                 "lightx2v/Wan2.2-Lightning")
+            fold = os.environ.get(
+                "VIDEOLAB_VACE_LORA_DIR",
+                "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
+            log(f"latent直結: VACE HighへLightning低step LoRA適用 "
+                f"({rep}/{fold})")
+            try:
+                from peft.tuners.lora import torchao as _plt
+                try:
+                    _plt.is_torchao_available()
+                except ImportError:
+                    _plt.is_torchao_available = lambda: False
+                    log("非互換torchaoを検出 -> peftのtorchao dispatcher"
+                        "を無効化")
+            except Exception:
+                pass
+            try:
+                self.pipe.load_lora_weights(
+                    rep, adapter_name="lightning",
+                    weight_name=f"{fold}/high_noise_model.safetensors")
+                self.pipe.set_adapters(["lightning"], [1.0])
+            except Exception as e:
+                raise RuntimeError(
+                    "latent直結のVACE HighへLightning LoRAを適用できません"
+                    f"でした: {str(e)[:300]}")
+            log("Lightning適用完了: VACE Highのみ（native AniSora Lowは"
+                "蒸留済み重みのまま）")
+        else:
+            log("latent直結: VACE Highの低step LoRAは比較用に無効")
+        # VAE/UMT5/tokenizer/schedulerは同一オブジェクトを共有。両repoのVAE
+        # safetensorsは同一hashなのでlatent scaleの変換も不要。
+        self.ani_pipe = WanImageToVideoPipeline.from_pretrained(
+            self.base_repo, transformer=None, transformer_2=alow,
+            vae=self.pipe.vae, text_encoder=self.pipe.text_encoder,
+            tokenizer=self.pipe.tokenizer, scheduler=sched,
+            torch_dtype=torch.bfloat16)
+        self.prompt_suffix = AniSoraAdapter.prompt_suffix
+        self.loaded_quant = quant
+        self.loaded_lora = lora
+        self.loaded = True
+        log("latent直結モデル準備完了: VACE High + native AniSora Low "
+            "(VAE/UMT5共有、通常時はCPU待機)")
+
+    @staticmethod
+    def _move(module, device, log, label):
+        if module is None:
+            return
+        module.to(device)
+        log(f"{label} -> {device}")
+
+    def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
+        import torch
+
+        quant, boundary = self._hybrid_want(req.extra)
+        lora = self._hybrid_lora(req.extra)
+        if self.loaded and (quant, lora) != (
+                getattr(self, "loaded_quant", None),
+                getattr(self, "loaded_lora", None)):
+            log(f"設定変更 {getattr(self, 'loaded_quant', '?')}/"
+                f"{getattr(self, 'loaded_lora', '?')} -> {quant}/{lora}: "
+                "latent直結モデルを積み替えます")
+            self.unload(log)
+            _free_cuda(log)
+        if not self.loaded:
+            self._next_extra = dict(req.extra or {})
+            self.ensure_loaded(log)
+        if not torch.cuda.is_available():
+            raise RuntimeError("VACE→AniSora latent直結にはCUDA GPUが必要です")
+
+        pipe, apipe = self.pipe, self.ani_pipe
+        vmodel, amodel = pipe.transformer, apipe.transformer_2
+        device = torch.device("cuda")
+        w = _snap(req.width, 16, 240)
+        h = _snap(req.height, 16, 240)
+        n = max(9, ((int(req.num_frames) - 1) // 8) * 8 + 1)
+        steps = max(4, int(req.steps))
+        guidance = float(req.guidance)
+
+        pf = list(req.extra.get("pose_frames_b64") or [])
+        if pf:
+            control = load_images_b64(pf)
+        elif len(req.images) > 1:
+            control = list(req.images[1:])
+        else:
+            raise RuntimeError("latent直結には extra.pose_frames_b64 が必要です")
+        got = len(control)
+        if got != n:
+            idx = [round(i * (got - 1) / max(1, n - 1)) for i in range(n)]
+            control = [control[i] for i in idx]
+            log(f"制御フレーム数を調整: {got} -> {n}")
+        control = [im if im.size == (w, h) else _fit_image(im, w, h)
+                   for im in control]
+        ref = _fit_image(req.images[0], w, h)
+        prompt = self._build_prompt(req, log)
+        negative = req.negative or self.WAN_NEGATIVE
+        generator = torch.Generator("cpu").manual_seed(req.seed)
+
+        moved = []
+        try:
+            # ---- promptを一度だけencode。UMT5は以後CPUへ ----
+            self._move(pipe.text_encoder, device, log, "UMT5")
+            prompt_embeds, negative_embeds = pipe.encode_prompt(
+                prompt=prompt, negative_prompt=negative,
+                do_classifier_free_guidance=guidance > 1.0,
+                num_videos_per_prompt=1, max_sequence_length=512,
+                device=device)
+            pipe.text_encoder.to("cpu")
+            _free_cuda(log)
+
+            # ---- VACE制御条件とnative I2V条件を同じVAEで一度だけencode ----
+            self._move(pipe.vae, device, log, "共有VAE(condition encode)")
+            try:
+                pipe.vae.enable_tiling()
+            except Exception:
+                pass
+            video, mask, refs = pipe.preprocess_conditions(
+                control, None, [ref], 1, h, w, n,
+                torch.float32, device)
+            num_refs = len(refs[0])
+            control_cond = pipe.prepare_video_latents(
+                video, mask, refs, generator, device)
+            mask_lat = pipe.prepare_masks(mask, refs, generator)
+            control_cond = torch.cat([control_cond, mask_lat], dim=1)
+
+            # native AniSoraの20ch条件(mask4+reference latent16)。dummyは
+            # condition生成のためだけで、noise stateには使用しない。
+            ref_tensor = apipe.video_processor.preprocess(
+                ref, height=h, width=w).to(device, dtype=torch.float32)
+            t_video = (n - 1) // apipe.vae_scale_factor_temporal + 1
+            dummy = torch.zeros(
+                (1, pipe.vae.config.z_dim, t_video,
+                 h // apipe.vae_scale_factor_spatial,
+                 w // apipe.vae_scale_factor_spatial),
+                device=device, dtype=torch.float32)
+            _dummy, i2v_cond = apipe.prepare_latents(
+                ref_tensor, 1, pipe.vae.config.z_dim, h, w, n,
+                torch.float32, device, generator, dummy, None)
+            del _dummy, dummy, ref_tensor, video, mask, mask_lat
+
+            # VACEは参照画像を時間軸先頭へ1slot追加するため、初期noiseも
+            # T+Rで作る。handoff時にstateとUniPC履歴から同時に外す。
+            latents = pipe.prepare_latents(
+                1, vmodel.config.in_channels, h, w,
+                n + num_refs * pipe.vae_scale_factor_temporal,
+                torch.float32, device, generator, None)
+            pipe.vae.to("cpu")
+            _free_cuda(log)
+
+            sched = pipe.scheduler
+            sched.set_timesteps(steps, device=device)
+            timesteps = sched.timesteps
+            boundary_t = boundary * sched.config.num_train_timesteps
+            high_count = sum(float(t) >= boundary_t for t in timesteps)
+            if high_count <= 0 or high_count >= len(timesteps):
+                raise RuntimeError(
+                    f"hybrid_boundary={boundary} ではHigh/Lowの両区間を"
+                    f"作れません (timesteps={len(timesteps)}, High={high_count})")
+            log(f"latent直結生成: {w}x{h} {n}f / {steps}step — "
+                f"VACE High {high_count}step → native AniSora Low "
+                f"{len(timesteps) - high_count}step (境界{boundary:.3f})")
+
+            scale = float(req.extra.get("conditioning_scale", 1.0))
+            scale = torch.tensor(
+                [scale] * len(vmodel.config.vace_layers),
+                device=device, dtype=vmodel.dtype)
+            prompt_embeds = prompt_embeds.to(device=device,
+                                              dtype=vmodel.dtype)
+            if negative_embeds is not None:
+                negative_embeds = negative_embeds.to(
+                    device=device, dtype=vmodel.dtype)
+            control_cond = control_cond.to(device=device, dtype=vmodel.dtype)
+            i2v_cond = i2v_cond.to(device=device, dtype=amodel.dtype)
+
+            self._move(vmodel, device, log, "VACE High")
+            switched = False
+            for si, t in enumerate(timesteps):
+                use_vace = float(t) >= boundary_t
+                timestep = t.expand(latents.shape[0])
+                if use_vace:
+                    latent_input = latents.to(vmodel.dtype)
+                    with vmodel.cache_context("cond"):
+                        pred = vmodel(
+                            hidden_states=latent_input, timestep=timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            control_hidden_states=control_cond,
+                            control_hidden_states_scale=scale,
+                            return_dict=False)[0]
+                    if guidance > 1.0:
+                        with vmodel.cache_context("uncond"):
+                            uncond = vmodel(
+                                hidden_states=latent_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_embeds,
+                                control_hidden_states=control_cond,
+                                control_hidden_states_scale=scale,
+                                return_dict=False)[0]
+                        pred = uncond + guidance * (pred - uncond)
+                else:
+                    if not switched:
+                        old_t = int(latents.shape[2])
+                        latents = latents[:, :, num_refs:]
+                        _slice_handoff_scheduler_state(
+                            sched, num_refs, old_t)
+                        if int(i2v_cond.shape[2]) != int(latents.shape[2]):
+                            raise RuntimeError(
+                                "handoff temporal shape不一致: "
+                                f"latent={tuple(latents.shape)} / "
+                                f"condition={tuple(i2v_cond.shape)}")
+                        vmodel.to("cpu")
+                        del control_cond, scale
+                        _free_cuda(log)
+                        self._move(amodel, device, log,
+                                   "native AniSora Low")
+                        switched = True
+                        log("handoff完了: pixel化せずlatent16chとUniPC履歴を"
+                            "native 36ch I2V入力へ接続")
+                    latent_input = torch.cat(
+                        [latents, i2v_cond], dim=1).to(amodel.dtype)
+                    with amodel.cache_context("cond"):
+                        pred = amodel(
+                            hidden_states=latent_input, timestep=timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_hidden_states_image=None,
+                            return_dict=False)[0]
+                    if guidance > 1.0:
+                        with amodel.cache_context("uncond"):
+                            uncond = amodel(
+                                hidden_states=latent_input,
+                                timestep=timestep,
+                                encoder_hidden_states=negative_embeds,
+                                encoder_hidden_states_image=None,
+                                return_dict=False)[0]
+                        pred = uncond + guidance * (pred - uncond)
+                latents = sched.step(pred, t, latents, return_dict=False)[0]
+                progress(0.10 + 0.76 * (si + 1) / len(timesteps))
+
+            if not switched:
+                raise RuntimeError("native AniSora Lowへhandoffされませんでした")
+            amodel.to("cpu")
+            del i2v_cond
+            _free_cuda(log)
+
+            # ---- decodeはここで一度だけ ----
+            self._move(pipe.vae, device, log, "共有VAE(final decode)")
+            latents = latents.to(pipe.vae.dtype)
+            lm = torch.tensor(pipe.vae.config.latents_mean).view(
+                1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+            ls = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+                1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+            decoded = pipe.vae.decode(
+                latents / ls + lm, return_dict=False)[0]
+            video = apipe.video_processor.postprocess_video(
+                decoded, output_type="np")
+            progress(0.94)
+            return _frames_to_mp4(list(video[0]), req.fps, workdir, log)
+        finally:
+            for module in (getattr(pipe, "text_encoder", None),
+                           getattr(pipe, "vae", None), vmodel, amodel):
+                try:
+                    module.to("cpu")
+                except Exception:
+                    pass
+            _free_cuda(log)
 
 
 @register
