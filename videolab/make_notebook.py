@@ -80,19 +80,55 @@ if "videolab_server" in sys.modules:      # 再実行時に最新コードを反
     videolab_server = importlib.reload(videolab_server)
 url, token = videolab_server.run_in_colab(preload=None)"""
 
-    c5 = """# ---- 5) keep-alive: アイドル切断防止 (回しっぱなしでOK) ----
-import time, urllib.request
+    c5 = """# ---- 5) keep-alive + 生成進捗ゲージ (回しっぱなしでOK) ----
+# 生成中はジョブごとに tqdm ゲージ (モデルDLと同じ見た目) がその場で伸びる
+# (2026-07-13要望「上みたいなゲージが出るように」)。3秒ごとに /api/jobs を
+# 確認し、待機中は5分ごとに alive を印字する。
+import time, json, urllib.request
+from tqdm.auto import tqdm
+try:
+    token
+except NameError:
+    token = ''
+_bars = {}
 _i = 0
-print('keep-alive 開始。放置でOK。')
+print('keep-alive 開始。生成が始まるとここに進捗ゲージが出ます。')
 while True:
-    time.sleep(300)
-    _i += 5
+    time.sleep(3)
+    _i += 3
     try:
-        with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10) as r:
-            _ok = (r.status == 200)
+        _rq = urllib.request.Request(
+            'http://127.0.0.1:8000/api/jobs',
+            headers={'Authorization': 'Bearer ' + token} if token else {})
+        with urllib.request.urlopen(_rq, timeout=10) as r:
+            jobs = json.loads(r.read().decode()).get('jobs') or []
     except Exception:
-        _ok = False
-    print(f'alive {_i} min  server={"up" if _ok else "??"}', flush=True)"""
+        if _i % 300 == 0:
+            print(f'alive {_i // 60} min  server=?? (応答なし)', flush=True)
+        continue
+    for j in jobs:
+        jid = str(j.get('id') or '')
+        st = str(j.get('status') or '')
+        p = max(0.0, min(1.0, float(j.get('progress') or 0.0)))
+        info = (st + ' ' + str(j.get('detail') or '').strip())[:48]
+        if st in ('queued', 'loading', 'running'):
+            if jid not in _bars:
+                _bars[jid] = tqdm(
+                    total=100, desc=f'生成 {jid[:8]}',
+                    bar_format='{desc} {percentage:3.0f}%|{bar}| {postfix}')
+            b = _bars[jid]
+            b.n = int(p * 100)
+            b.set_postfix_str(info, refresh=False)
+            b.refresh()
+        elif jid in _bars:
+            b = _bars.pop(jid)
+            if st == 'done':
+                b.n = 100
+            b.set_postfix_str(st, refresh=False)
+            b.refresh()
+            b.close()
+    if not _bars and _i % 300 == 0:
+        print(f'alive {_i // 60} min  server=up (待機中)', flush=True)"""
 
     nb = {
         "nbformat": 4, "nbformat_minor": 5,

@@ -44,7 +44,9 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.1"   # 0.8.1: emit_latentのプレビューdecodeを既定省略 (時間節約)
+__version__ = "0.8.2"   # 0.8.2: 素のvace/anisoraをL4対応 — UMT5遅延ロード
+#         (低RAM VM) + block offload (GGUF×seq非互換の代替) をlatent再加工
+#         経路に開通。latent_refine既定化のサーバ側前提
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -738,14 +740,100 @@ class _WanA14BBase(VideoAdapter):
     def __init__(self):
         super().__init__()
         self.pipe = None
+        self._te_lazy = False    # 低RAM VM: UMT5を持たずにロードしたか
+        self._te_from = None     # UMT5遅延ロード元リポ
 
     def unload(self, log):
         self.pipe = None
         self.loaded = False
 
+    @staticmethod
+    def _try_group_offload(model, log, label) -> bool:
+        """extra.offload=block のblock単位ストリーミング退避。
+
+        16GB未満級のご家庭GPUで8方向まとめ生成をオミットしないための
+        手段 (2026-07-13方針)。常駐9GB -> 約2GB+転送に置き換わる。
+        GGUF×enable_sequential_cpu_offloadはdiffusersの既知バグ
+        (quant_type喪失のKeyError)で使えないため、GGUFの省メモリは
+        こちらが本線 (v0.7系で実GPU検証済み: 720x1296/49fピーク11.3GB)。
+        適用に失敗したら従来経路へ戻す。"""
+        import torch
+        try:
+            model.enable_group_offload(
+                onload_device=torch.device("cuda"),
+                offload_device=torch.device("cpu"),
+                offload_type="block_level",
+                num_blocks_per_group=1,
+                use_stream=True)
+            log(f"{label}: block offload適用 (重みCPU常駐+ブロック転送)")
+            return True
+        except Exception as e:      # noqa: BLE001
+            log(f"{label}: block offload不可 -> 従来経路へ ({str(e)[:120]})")
+            return False
+
+    @staticmethod
+    def _group_offloaded(model) -> bool:
+        """グループオフロードhookが載っているか。載っているモデルへの
+        .to() はdiffusersが例外を出すため、手動退避の前に必ず確認する。"""
+        try:
+            from diffusers.hooks.group_offloading import (
+                _get_group_onload_device)
+            _get_group_onload_device(model)
+            return True
+        except Exception:
+            return False
+
+    def _encode_prompt_lazy(self, prompt, negative, guidance, log):
+        """UMT5遅延運転 (低RAM VM): text_encoder=Noneでロードしたpipe用に
+        UMT5をジョブ内で一時ロードしてprompt embedsを作り、即解放する。
+
+        v0.8.2: handoff(v0.7.6)と同じ低RAM対策を素のvace/anisoraにも適用。
+        L4 VM (RAM53GB) はUMT5(11GB)を常駐させたままモデル切替すると
+        RAMスパイクでランタイムごとOOM killされる (2026-07-13実障害)。"""
+        import gc
+        import torch
+        from transformers import UMT5EncoderModel
+        pipe = self.pipe
+        src = self._te_from or self.base_repo
+        log("UMT5を一時ロード (低RAM運転: encode後に即解放・約30秒)")
+        te = UMT5EncoderModel.from_pretrained(
+            src, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        pipe.text_encoder = te
+        try:
+            te.to(dev)
+            with torch.no_grad():
+                pe, ne = pipe.encode_prompt(
+                    prompt=prompt, negative_prompt=negative,
+                    do_classifier_free_guidance=float(guidance) > 1.0,
+                    num_videos_per_prompt=1, max_sequence_length=512,
+                    device=torch.device(dev))
+        finally:
+            pipe.text_encoder = None
+            del te
+            gc.collect()
+            _free_cuda(log)
+        return pe, ne
+
+    def _prompt_kwargs(self, prompt, negative, guidance, log) -> dict:
+        """pipe呼び出し用のプロンプト系kwargs。UMT5遅延運転ではembedを
+        先に作って文字列の代わりに渡す (pipeline内のencodeは
+        text_encoder=Noneで失敗するため)。判定は _te_lazy フラグ基準:
+        text_encoder属性の有無だけで判定するとテストのモックpipeまで
+        遅延経路へ入ってしまう。"""
+        if (not getattr(self, "_te_lazy", False)
+                or getattr(self.pipe, "text_encoder", None) is not None):
+            return {"prompt": prompt, "negative_prompt": negative}
+        pe, ne = self._encode_prompt_lazy(prompt, negative, guidance, log)
+        kw = {"prompt_embeds": pe}
+        if ne is not None:
+            kw["negative_prompt_embeds"] = ne
+        return kw
+
     def _finalize_pipe(self, log, offload: str = "", footprint_gb=None,
                        vae_tiling: bool = False,
-                       resident_margin_gb: float = 6):
+                       resident_margin_gb: float = 6,
+                       gguf: bool = False):
         """vae_tiling=True: GPU常駐でもVAEタイリングを有効にする。
         動画を丸ごとVAEでencodeするアダプタ(VACEの81f条件動画など)は、
         タイリング無しだと中間テンソルが数十GBになりA100-80でもOOMする
@@ -771,8 +859,8 @@ class _WanA14BBase(VideoAdapter):
         # model = 主要モデルを順次GPUへ(中VRAM)。 seq = 逐次(12GB級)。
         mode = (offload or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
         mode = {"sequential": "seq", "offload": "model", "full": "cuda",
-                "none": "cuda"}.get(mode, mode)
-        if mode not in ("seq", "model", "cuda"):
+                "none": "cuda", "group": "block"}.get(mode, mode)
+        if mode not in ("seq", "model", "cuda", "block"):
             # auto: VRAM総量とモデル実測サイズから常駐可否を判定
             mode = "model"
             try:
@@ -785,6 +873,34 @@ class _WanA14BBase(VideoAdapter):
                     f"{footprint_gb}GB -> {mode}")
             except Exception:
                 pass
+        if gguf and mode == "seq":
+            # GGUF×sequential offloadはdiffusers既知バグ (quant_type喪失の
+            # KeyError) -> block offloadへ振替 (v0.8.2)
+            log("GGUF量子化はsequential offload不可 -> block offloadへ振替")
+            mode = "block"
+
+        if mode == "block":
+            ok = True
+            for name in ("transformer", "transformer_2"):
+                m = getattr(self.pipe, name, None)
+                if m is not None:
+                    ok = self._try_group_offload(m, log, name) and ok
+            if ok:
+                # DiT以外の小物 (VAE等) はGPUへ。text_encoderは遅延運転
+                # なら不在 (None)。tokenizer/schedulerはnn.Moduleでない
+                for cname, comp in self.pipe.components.items():
+                    if cname in ("transformer", "transformer_2"):
+                        continue
+                    if isinstance(comp, torch.nn.Module):
+                        comp.to("cuda")
+                try:
+                    self.pipe.vae.enable_tiling()
+                except Exception:
+                    pass
+                log("block offload: VRAM使用=活性化ぶんのみ "
+                    "(重み転送のぶん低速・16GB未満級GPU向け)")
+                return self._log_attn_backend(log)
+            mode = "model"   # 適用不可 -> 従来経路へ
 
         if mode == "cuda":
             try:
@@ -876,14 +992,16 @@ class _WanA14BBase(VideoAdapter):
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
         img = _fit_image(req.images[0], w, h)
-        kw = dict(image=img, prompt=self._build_prompt(req, log),
-                  negative_prompt=req.negative or None,
+        kw = dict(image=img,
                   width=w, height=h, num_frames=n,
                   num_inference_steps=steps,
                   guidance_scale=float(req.guidance),
                   generator=torch.Generator("cpu").manual_seed(req.seed),
                   output_type="np", return_dict=False,
                   callback_on_step_end=_step_callback(progress, steps))
+        kw.update(self._prompt_kwargs(self._build_prompt(req, log),
+                                      req.negative or None,
+                                      req.guidance, log))
         # 終端画像アンカー (2026-07-12): 2枚目の画像があれば last_image に。
         # 「imageとlast_imageの間を補間する」diffusers公式仕様。開始と同じ
         # 立ち絵を渡すと始点=終点のループ拘束になり、後ろ向きの回転を
@@ -978,6 +1096,8 @@ class AniSoraAdapter(_WanA14BBase):
             off = "seq"
         elif off in ("model", "offload"):
             off = "model"
+        elif off in ("block", "group"):
+            off = "block"    # v0.8.2: 重みCPU常駐+ブロック転送 (GGUF向け)
         else:
             off = ""
         return q, off
@@ -1004,14 +1124,26 @@ class AniSoraAdapter(_WanA14BBase):
         t_lo = WanTransformer3DModel.from_single_file(
             lo, quantization_config=qc, config=self.base_repo,
             subfolder="transformer_2", torch_dtype=torch.bfloat16)
+        pipe_kwargs = {}
+        self._te_lazy = _low_ram_vm()
+        if self._te_lazy:
+            # v0.8.2: 低RAM VM (L4=53GB) ではUMT5(11GB)を持たずにロードし、
+            # ジョブ内で一時ロード→即解放する (handoff v0.7.6と同じ対策。
+            # 従来は素のanisora/vaceがUMT5常駐のままモデル切替するたび
+            # RAMスパイクでランタイムがOOM killされた)
+            pipe_kwargs["text_encoder"] = None
+            log("低RAM VM: UMT5はロードせずジョブ内で一時ロードします")
         log(f"ベース部品 DL/読み込み: {self.base_repo} (VAE+UMT5 約12GB)")
         self.pipe = WanImageToVideoPipeline.from_pretrained(
             self.base_repo, transformer=t_hi, transformer_2=t_lo,
-            torch_dtype=torch.bfloat16)
+            torch_dtype=torch.bfloat16, **pipe_kwargs)
+        self._te_from = self.base_repo
         # GPU常駐可否の判定用フットプリント(GB): High+Low GGUF常駐 +
         # bf16テキストエンコーダ(~6) + VAE(~0.5) + 生成アクティベーション(~4)
         fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
-        self._finalize_pipe(log, offload=offload, footprint_gb=fp)
+        if self._te_lazy:
+            fp -= 6          # UMT5不在ぶん常駐判定を緩める
+        self._finalize_pipe(log, offload=offload, footprint_gb=fp, gguf=True)
         self.loaded_quant, self.loaded_offload = quant, offload
         self.loaded = True
 
@@ -1093,7 +1225,9 @@ class AniSoraAdapter(_WanA14BBase):
         # encodeスパイク9-12GBで39.5GBの天井に激突した) ----
         moved_back = []
         hi_t = getattr(pipe, "transformer", None)
-        if hi_t is not None and _dev_of(hi_t) == "cuda":
+        if (hi_t is not None and _dev_of(hi_t) == "cuda"
+                and not self._group_offloaded(hi_t)):
+            # block offload時は重みが既にCPU側 (.to()はdiffusersが拒否)
             log("リファイン: High側transformerをCPUへ退避 (尻尾では不使用)")
             hi_t.to("cpu")
             moved_back.append(hi_t)
@@ -1208,8 +1342,6 @@ class AniSoraAdapter(_WanA14BBase):
                 log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
                     "させないための参照注入)")
             kw = dict(image=cond_img,
-                      prompt=self._build_prompt(req, log),
-                      negative_prompt=req.negative or None,
                       width=w, height=h, num_frames=n,
                       num_inference_steps=steps,
                       guidance_scale=float(req.guidance),
@@ -1217,6 +1349,9 @@ class AniSoraAdapter(_WanA14BBase):
                       generator=g,
                       output_type="np", return_dict=False,
                       callback_on_step_end=_step_callback(progress, tail))
+            kw.update(self._prompt_kwargs(self._build_prompt(req, log),
+                                          req.negative or None,
+                                          req.guidance, log))
             # latents未対応の古いdiffusersなら明示エラーにする (黙って
             # 落とすと「1段目を無視した素の生成」が静かに走る偽PASS)
             out = _call_with_optional_kwargs(
@@ -1490,6 +1625,8 @@ class VACEAdapter(_WanA14BBase):
             off = "seq"
         elif off in ("model", "offload"):
             off = "model"
+        elif off in ("block", "group"):
+            off = "block"    # v0.8.2: 重みCPU常駐+ブロック転送 (GGUF向け)
         else:
             off = ""
         base = str(e.get("vace_base")
@@ -1535,6 +1672,12 @@ class VACEAdapter(_WanA14BBase):
                 "サーバを再起動してください")
         want = self._resolve_want(getattr(self, "_next_extra", {}))
         quant, offload, base, experts, patch, lora = want
+        pipe_kwargs = {}
+        self._te_lazy = _low_ram_vm()
+        if self._te_lazy:
+            # v0.8.2: 低RAM VMではUMT5を持たずにロード (AniSora側と同じ)
+            pipe_kwargs["text_encoder"] = None
+            log("低RAM VM: UMT5はロードせずジョブ内で一時ロードします")
         if quant == "bf16":
             # フル精度: 常駐70GB+81f attentionの活性化~9GBはA100-80にも
             # 入らない(2026-07-12実測: 残り324MiBでOOM)ため余白12GBで判定
@@ -1542,7 +1685,7 @@ class VACEAdapter(_WanA14BBase):
             # (AniSora移植はGGUF経路のみ。_resolve_wantがbase=funに固定)
             log(f"読み込み開始: {self.repo} (bf16・素のVACE-Fun・DL約70GB)")
             self.pipe = WanVACEPipeline.from_pretrained(
-                self.repo, torch_dtype=torch.bfloat16)
+                self.repo, torch_dtype=torch.bfloat16, **pipe_kwargs)
             fp, margin = 79, 12
         else:
             from diffusers import GGUFQuantizationConfig
@@ -1600,10 +1743,13 @@ class VACEAdapter(_WanA14BBase):
             log(f"ベース部品 DL/読み込み: {self.repo} (VAE+UMT5 約12GB)")
             self.pipe = WanVACEPipeline.from_pretrained(
                 self.repo, transformer=t_hi, transformer_2=t_lo,
-                torch_dtype=torch.bfloat16)
+                torch_dtype=torch.bfloat16, **pipe_kwargs)
             # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
             fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
             margin = 10
+        self._te_from = self.repo
+        if self._te_lazy:
+            fp -= 6          # UMT5不在ぶん常駐判定を緩める
         if lora == "lightning":
             # Lightning 4step蒸留LoRA (T2V-A14B用がVACE-Funに適合。
             # cfg=1で回すためCFGパスも消え、14step/cfg5比で約7倍速)。
@@ -1649,7 +1795,8 @@ class VACEAdapter(_WanA14BBase):
         # VACEは81fの骨格条件動画を丸ごとVAE encodeするため、常駐でも
         # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
         self._finalize_pipe(log, offload=offload, footprint_gb=fp,
-                            vae_tiling=True, resident_margin_gb=margin)
+                            vae_tiling=True, resident_margin_gb=margin,
+                            gguf=(quant != "bf16"))
         # AniSoraベース時はmotion scoreプロンプト接尾辞も効く(蒸留ベースの
         # 学習時プロンプト形式。_build_prompt が extra.motion_score を反映)
         self.prompt_suffix = (AniSoraAdapter.prompt_suffix
@@ -1782,8 +1929,6 @@ class VACEAdapter(_WanA14BBase):
         # (anisoraジョブの extra.latent_from=このジョブID) へ渡す
         emit_latent = bool(req.extra.get("emit_latent"))
         kw = dict(video=control, reference_images=[ref],
-                  prompt=self._build_prompt(req, log),
-                  negative_prompt=req.negative or self.WAN_NEGATIVE,
                   width=w, height=h, num_frames=n,
                   num_inference_steps=steps,
                   guidance_scale=float(req.guidance),
@@ -1793,6 +1938,9 @@ class VACEAdapter(_WanA14BBase):
                   output_type="latent" if emit_latent else "np",
                   return_dict=False,
                   callback_on_step_end=cb)
+        kw.update(self._prompt_kwargs(self._build_prompt(req, log),
+                                      req.negative or self.WAN_NEGATIVE,
+                                      req.guidance, log))
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance} "
             f"骨格制御{len(control)}f cond={kw['conditioning_scale']}"
             + (" [latent直出し]" if emit_latent else ""))
@@ -2087,27 +2235,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         module.to(device)
         log(f"{label} -> {device}")
 
-    @staticmethod
-    def _try_group_offload(model, log, label) -> bool:
-        """extra.offload指定時のblock単位ストリーミング退避 (実験的)。
-
-        16GB未満級のご家庭GPUで8方向まとめ生成をオミットしないための
-        最終手段 (2026-07-13方針)。常駐9GB -> 約2GB+転送に置き換わる。
-        GGUF量子化層との相性は実GPU検証待ちのため、適用に失敗したら
-        常駐運転へ戻す (その場合は従来どおりOOMし得る)。"""
-        import torch
-        try:
-            model.enable_group_offload(
-                onload_device=torch.device("cuda"),
-                offload_device=torch.device("cpu"),
-                offload_type="block_level",
-                num_blocks_per_group=1,
-                use_stream=True)
-            log(f"{label}: block offload適用 (実験的・弱GPU向け・低速)")
-            return True
-        except Exception as e:      # noqa: BLE001
-            log(f"{label}: block offload不可 -> 常駐へ ({str(e)[:120]})")
-            return False
+    # _try_group_offload は _WanA14BBase へ移設 (v0.8.2: 素のvace/anisora
+    # でも使うため。挙動は同一)
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
