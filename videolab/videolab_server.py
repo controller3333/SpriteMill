@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.0"   # 0.7.0: VACE High -> native AniSora Low latent直結
+__version__ = "0.7.1"   # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
+# 0.7.0: VACE High -> native AniSora Low latent直結
 # 0.6.9: '-'始まりトークンを再生成 (CLI誤認対策) +0.6.8 refine_cond_still
 # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
 # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
@@ -205,6 +206,20 @@ def _free_cuda(log):
         gc.collect()
         torch.cuda.empty_cache()
         log("VRAM解放: torch.cuda.empty_cache()")
+    except Exception:
+        pass
+
+
+def _log_cuda_state(log, label: str) -> None:
+    """GPU実機ログへ現在のallocated/reserved/freeを残す。"""
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        log(f"VRAM[{label}]: alloc={alloc / 2**30:.2f}GB / "
+            f"reserved={reserved / 2**30:.2f}GB / "
+            f"free={free / 2**30:.2f}GB / total={total / 2**30:.2f}GB")
     except Exception:
         pass
 
@@ -1925,6 +1940,15 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             vae=self.pipe.vae, text_encoder=self.pipe.text_encoder,
             tokenizer=self.pipe.tokenizer, scheduler=sched,
             torch_dtype=torch.bfloat16)
+        # load_lora_weights/from_pretrainedが内部で置いたdeviceに依存しない。
+        # condition encode前はDiT 2体を必ずCPUへ戻し、VAE/UMT5用の空きを作る。
+        for module in (vhigh, alow, self.pipe.vae, self.pipe.text_encoder):
+            try:
+                module.to("cpu")
+            except Exception:
+                pass
+        _free_cuda(log)
+        _log_cuda_state(log, "ロード後CPU待機")
         self.prompt_suffix = AniSoraAdapter.prompt_suffix
         self.loaded_quant = quant
         self.loaded_lora = lora
@@ -1958,6 +1982,19 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         if not torch.cuda.is_available():
             raise RuntimeError("VACE→AniSora latent直結にはCUDA GPUが必要です")
 
+        # diffusers Pipeline.__call__は@torch.no_gradだが、ここはVAE/modelを
+        # 直接呼ぶ独自ループ。推論モードなしではVAE encodeの全チャンクに
+        # autograd graphが残り、464x832でもA100-80GBを78GBまで食い尽くす
+        # (v0.7.0実機障害)。モデルロード/LoRA装着は外で済ませ、推論だけを
+        # inference_modeへ入れる。
+        with torch.inference_mode():
+            return self._generate_inference(
+                req, workdir, log, progress, boundary)
+
+    def _generate_inference(self, req: GenRequest, workdir: Path, log,
+                            progress, boundary: float) -> Path:
+        import torch
+
         pipe, apipe = self.pipe, self.ani_pipe
         vmodel, amodel = pipe.transformer, apipe.transformer_2
         device = torch.device("cuda")
@@ -1986,8 +2023,13 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         negative = req.negative or self.WAN_NEGATIVE
         generator = torch.Generator("cpu").manual_seed(req.seed)
 
-        moved = []
         try:
+            # 前ジョブやLoRA loaderのdevice状態にかかわらず、条件生成中に
+            # DiTがVRAMへ残らないことを毎回保証する。
+            vmodel.to("cpu")
+            amodel.to("cpu")
+            _free_cuda(log)
+            _log_cuda_state(log, "condition前/DiT退避済み")
             # ---- promptを一度だけencode。UMT5は以後CPUへ ----
             self._move(pipe.text_encoder, device, log, "UMT5")
             prompt_embeds, negative_embeds = pipe.encode_prompt(
@@ -1997,6 +2039,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 device=device)
             pipe.text_encoder.to("cpu")
             _free_cuda(log)
+            _log_cuda_state(log, "UMT5 encode後")
 
             # ---- VACE制御条件とnative I2V条件を同じVAEで一度だけencode ----
             self._move(pipe.vae, device, log, "共有VAE(condition encode)")
@@ -2036,6 +2079,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 torch.float32, device, generator, None)
             pipe.vae.to("cpu")
             _free_cuda(log)
+            _log_cuda_state(log, "condition encode後")
 
             sched = pipe.scheduler
             sched.set_timesteps(steps, device=device)
