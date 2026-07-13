@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.7.3"   # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
+__version__ = "0.7.4"   # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
+# 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
 # 0.7.2: hybrid既定8step/49f (6step黄変対策) +peakVRAMログ
 # 0.7.1: inference_mode/DiT明示退避でVAE 80GB OOM修正
 # 0.7.0: VACE High -> native AniSora Low latent直結
@@ -1969,6 +1970,28 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         module.to(device)
         log(f"{label} -> {device}")
 
+    @staticmethod
+    def _try_group_offload(model, log, label) -> bool:
+        """extra.offload指定時のblock単位ストリーミング退避 (実験的)。
+
+        16GB未満級のご家庭GPUで8方向まとめ生成をオミットしないための
+        最終手段 (2026-07-13方針)。常駐9GB -> 約2GB+転送に置き換わる。
+        GGUF量子化層との相性は実GPU検証待ちのため、適用に失敗したら
+        常駐運転へ戻す (その場合は従来どおりOOMし得る)。"""
+        import torch
+        try:
+            model.enable_group_offload(
+                onload_device=torch.device("cuda"),
+                offload_device=torch.device("cpu"),
+                offload_type="block_level",
+                num_blocks_per_group=1,
+                use_stream=True)
+            log(f"{label}: block offload適用 (実験的・弱GPU向け・低速)")
+            return True
+        except Exception as e:      # noqa: BLE001
+            log(f"{label}: block offload不可 -> 常駐へ ({str(e)[:120]})")
+            return False
+
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
 
@@ -2112,7 +2135,13 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             control_cond = control_cond.to(device=device, dtype=vmodel.dtype)
             i2v_cond = i2v_cond.to(device=device, dtype=amodel.dtype)
 
-            self._move(vmodel, device, log, "VACE High")
+            want_off = str((req.extra or {}).get("offload")
+                           or "").lower() in ("seq", "model")
+            v_hooked = (want_off
+                        and self._try_group_offload(vmodel, log, "VACE High"))
+            a_hooked = False
+            if not v_hooked:
+                self._move(vmodel, device, log, "VACE High")
             # 49f×720x1296級はA100-40で残余0〜2GBの見積り (2026-07-13机上
             # 外挿)。実測peakをログへ残し、次回のフレーム数/セル寸法の
             # 可否判定を外挿でなく実測で行えるようにする
@@ -2151,11 +2180,15 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                                 "handoff temporal shape不一致: "
                                 f"latent={tuple(latents.shape)} / "
                                 f"condition={tuple(i2v_cond.shape)}")
-                        vmodel.to("cpu")
+                        if not v_hooked:
+                            vmodel.to("cpu")
                         del control_cond, scale
                         _free_cuda(log)
-                        self._move(amodel, device, log,
-                                   "native AniSora Low")
+                        a_hooked = (want_off and self._try_group_offload(
+                            amodel, log, "AniSora Low"))
+                        if not a_hooked:
+                            self._move(amodel, device, log,
+                                       "native AniSora Low")
                         switched = True
                         log("handoff完了: pixel化せずlatent16chとUniPC履歴を"
                             "native 36ch I2V入力へ接続")
@@ -2184,9 +2217,16 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             log(f"denoise区間peak VRAM "
                 f"{torch.cuda.max_memory_allocated() / 2**30:.1f}GB "
                 f"({w}x{h} {n}f — フレーム数/セル寸法増の可否判定用)")
-            amodel.to("cpu")
+            if not a_hooked:
+                amodel.to("cpu")
             del i2v_cond
             _free_cuda(log)
+            if v_hooked or a_hooked:
+                # group offloadフックはモデルへ残留し次ジョブの常駐運転を
+                # 汚すため、このジョブ限りでモデルを解放する (弱GPU運用の
+                # 割り切り: 次ジョブは再ロードから)
+                self.unload(log)
+                log("offload構成のためモデルを解放 (次ジョブで再ロード)")
 
             # ---- decodeはここで一度だけ ----
             self._move(pipe.vae, device, log, "共有VAE(final decode)")
