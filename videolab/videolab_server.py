@@ -44,7 +44,7 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.6.7"   # 0.6.7: offload=model指定の受理(大判グリッドのOOM対策)
+__version__ = "0.6.8"   # 0.6.8: refine_cond_still=リファイン条件画像を原画立ち絵に
 # 0.6.6: hf_transferでモデルDL高速化(60GB初回が1-2分へ)
 # 0.6.5: リファインencodeのno_grad化(勾配グラフでOOMの真因)
 # 0.6.4: /api/shutdown=ランタイム自動解放(終了時の片付け)
@@ -1139,10 +1139,20 @@ class AniSoraAdapter(_WanA14BBase):
             x_t = (1.0 - s0) * x0 + s0 * noise
             log(f"リファイン: {len(frames)}f σ0={s0:.2f} 実行{tail}/{steps}"
                 "step (全stepがLow=ディテール側)")
-            # 条件画像は「1段目動画の先頭フレーム」。立ち絵を渡すと
-            # frame0=直立ポーズを強制されて歩行中の先頭と矛盾する
-            # (identityは1段目の映像自体が持っている)
-            kw = dict(image=frames[0],
+            # 条件画像は既定で「1段目動画の先頭フレーム」。ただし
+            # refine_cond_still 指定時は原画の立ち絵を条件にする:
+            # 1段目の劣化(量子化+蒸留の粘土)がノイズ済みlatentの中では
+            # 「正常な構造」に見えてしまい、リファインが安定した粘土に
+            # 確定する (2026-07-13お兄さま指摘)。原画をframe0に注入すると
+            # 時系列アテンションが劣化前の質感を全フレームから参照できる。
+            # 前提=骨格の直立プレフィックス (frame0が直立なので立ち絵と
+            # 矛盾しない。旧動画=全フレーム歩行に使うと先頭が跳ねる)
+            cond_img = frames[0]
+            if req.extra.get("refine_cond_still") and req.images:
+                cond_img = _fit_image(req.images[0], w, h)
+                log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
+                    "させないための参照注入)")
+            kw = dict(image=cond_img,
                       prompt=self._build_prompt(req, log),
                       negative_prompt=req.negative or None,
                       width=w, height=h, num_frames=n,
