@@ -548,12 +548,23 @@ class ColabDriver:
             self._last_nudge = state
             log(msg)
 
-    _RT_DLG_RX = (r"ランタイムのタイプ|ハードウェア\s*アクセラレータ"
-                  r"|runtime type|hardware accelerator")
-
     def _rt_dialog_open(self) -> bool:
-        return bool(re.search(self._RT_DLG_RX, self._dialogs_text() or "",
-                              re.I))
+        """ランタイムタイプ設定ダイアログが開いているか。
+
+        Playwrightのtext=ロケータで判定する — shadow DOMを貫通するため。
+        (旧実装のJS innerText収集はshadow DOMを貫通せず検出漏れ →
+        パレット掃除のEscapeがダイアログを1秒で閉じる実バグ 2026-07-14。
+        文言は「ハードウェア アクセラレータ」限定: 「ランタイムのタイプ」は
+        ノート冒頭の説明文にも書かれており誤検出する)"""
+        try:
+            loc = self.page.locator(
+                "text=/ハードウェア\\s*アクセラレータ|Hardware accelerator/i")
+            for i in range(min(loc.count(), 5)):
+                if loc.nth(i).is_visible(timeout=200):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _prompt_runtime_type(self, log, timeout: int = 600) -> None:
         """「ランタイムのタイプを変更」ダイアログを開いて人間の確認を待つ。
@@ -574,12 +585,18 @@ class ColabDriver:
                 self.page.keyboard.type(query, delay=25)
                 time.sleep(0.8)
                 self.page.keyboard.press("Enter")
-                for _ in range(6):
+                for _ in range(10):
                     time.sleep(0.5)
                     if self._rt_dialog_open():
                         opened = True
                         break
                 if opened:
+                    break
+                # Escapeはダイアログも閉じてしまうため、掃除する前に
+                # もう一度だけ検出を試す (描画遅延の保険)
+                time.sleep(2)
+                if self._rt_dialog_open():
+                    opened = True
                     break
                 self.page.keyboard.press("Escape")
                 time.sleep(0.3)
