@@ -471,8 +471,10 @@ class ColabDriver:
             return {"url": got[0], "token": got[1]}
         # 1.7) ランタイムタイプの確認を先に人間へ (2026-07-14要望「GPUの
         # 設定をどのタイミングでやればいいかいつも迷う」— 自動化が走る前に
-        # 設定画面を開いて、閉じられるまで待つ)
-        self._prompt_runtime_type(log)
+        # 設定画面を開いて、閉じられるまで待つ)。ヘッドレス検証は
+        # prompt_runtime=False でスキップ
+        if getattr(self, "prompt_runtime", True):
+            self._prompt_runtime_type(log)
         # 2) 1回目のRun all
         log("すべてのセルを実行します(1回目)…")
         if not self._run_all(log):
@@ -800,7 +802,8 @@ class ColabDriver:
 
 
 def drive_colab(profile_dir: Path, notebook_url: str, log=print,
-                poll_timeout: int = 2400, browser: str = "webview2") -> dict:
+                poll_timeout: int = 2400, browser: str = "webview2",
+                prompt_runtime: bool = True) -> dict:
     """公開エントリ: ノートを開いて起動し {'url','token'} を返す。
 
     browser: "webview2"=完全内蔵ブラウザ(既定・普段の環境に不干渉) /
@@ -809,6 +812,7 @@ def drive_colab(profile_dir: Path, notebook_url: str, log=print,
     try:
         drv = ColabDriver(Path(profile_dir), notebook_url,
                           browser=browser, log=log)
+        drv.prompt_runtime = prompt_runtime
         return drv.run(log, poll_timeout=poll_timeout)
     finally:
         if drv is not None:

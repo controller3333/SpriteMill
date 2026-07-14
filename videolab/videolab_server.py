@@ -44,7 +44,9 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.4"   # 0.9.4: HF先行チャレンジ — Driveの保険がある
+__version__ = "0.9.5"   # 0.9.5: Illustrious-XL t2iアダプタ (SDXL+ControlNet
+#         OpenPose・8方向シート1枚生成・PNG結果) — ローカル完結の画像生成
+#         (次点プロバイダ)。0.9.4: HF先行チャレンジ — Driveの保険がある
 #         ときだけHFを1回試し (10秒毎監視)、停滞30秒で即Driveへ切替。
 #         健康なHF(トークン認証)はDrive読みの約2倍速い。0.9.3: セッション
 #         ディスクの既存コピーを再利用 — モデル切替のたびにDriveから
@@ -1473,6 +1475,108 @@ class _WanA14BBase(VideoAdapter):
                 self.pipe.prepare_latents = orig_prep
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
+
+
+@register
+class IllustriousAdapter(VideoAdapter):
+    """Illustrious-XL (SDXL・アニメ特化) + ControlNet OpenPose の静止画t2i。
+
+    2026-07-14ユーザー発案「ローカル完結の画像生成」: 8方向の直立OpenPose
+    骨格グリッド(4x2)を条件に、キャラの8方向コンタクトシートを1枚で生成。
+    1枚の中に閉じ込めることでキャラ一貫性を確保し、骨格が向きと左右を
+    構造的に指定する (Codex比: 無料・左右取り違えに強い設計)。
+    契約: mode="t2i" / prompt=danbooruタグ寄り /
+    extra.pose_image_b64=骨格グリッドPNG(必須) /
+    extra.controlnet_scale(既定0.9)。結果はPNG (resultはpngで配信)。"""
+    id = "illustrious"
+    label = "Illustrious-XL (画像・SDXL+OpenPose)"
+    desc = ("アニメ特化SDXLで8方向シートを1枚生成 (ControlNet OpenPoseで"
+            "向き・左右を骨格指定)。extra.pose_image_b64 必須、"
+            "extra例: {\"controlnet_scale\": 0.9}")
+    requires = "Colab T4/L4 / ローカル8GB+ (fp16・DL約10GB)"
+    modes = ("t2i",)
+    ckpt_repo = os.environ.get(
+        "VIDEOLAB_ILLUSTRIOUS_REPO",
+        "OnomaAIResearch/Illustrious-xl-early-release-v0")
+    ckpt_file = os.environ.get("VIDEOLAB_ILLUSTRIOUS_FILE",
+                               "Illustrious-XL-v0.1.safetensors")
+    cn_repo = os.environ.get("VIDEOLAB_ILLUSTRIOUS_CN",
+                             "xinsir/controlnet-openpose-sdxl-1.0")
+    vae_repo = "madebyollin/sdxl-vae-fp16-fix"
+    cache_repos = (ckpt_repo, cn_repo, vae_repo)
+    disk_gb = 12
+    defaults = {"width": 1152, "height": 896, "num_frames": 1, "fps": 1,
+                "steps": 28, "guidance": 6.0}
+    NEG = ("worst quality, low quality, bad anatomy, bad hands, "
+           "extra digits, fewer digits, watermark, signature, text, "
+           "jpeg artifacts, blurry, lowres")
+
+    def __init__(self):
+        super().__init__()
+        self.pipe = None
+
+    def unload(self, log):
+        self.pipe = None
+        self.loaded = False
+
+    def ensure_loaded(self, log):
+        _require_deps(log)
+        import torch
+        from diffusers import (AutoencoderKL, ControlNetModel,
+                               EulerAncestralDiscreteScheduler,
+                               StableDiffusionXLControlNetPipeline)
+        ck = _hf_download(self.ckpt_repo, self.ckpt_file, log)
+        cn_dir = _snapshot_local(self.cn_repo, log)
+        vae_dir = _snapshot_local(self.vae_repo, log)
+        log("Illustrious-XL 読み込み (fp16) + OpenPose ControlNet")
+        cn = ControlNetModel.from_pretrained(
+            cn_dir, torch_dtype=torch.float16)
+        vae = AutoencoderKL.from_pretrained(
+            vae_dir, torch_dtype=torch.float16)
+        pipe = StableDiffusionXLControlNetPipeline.from_single_file(
+            ck, controlnet=cn, vae=vae, torch_dtype=torch.float16)
+        # Illustrious標準レシピ: Euler a / cfg 5-7 / 24-32step
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            pipe.scheduler.config)
+        pipe.to("cuda")
+        self.pipe = pipe
+        self.loaded = True
+
+    def generate(self, req: GenRequest, workdir: Path, log,
+                 progress) -> Path:
+        import torch
+        from PIL import Image
+        if not self.loaded:
+            self.ensure_loaded(log)
+        w = _snap(req.width, 8, 512)
+        h = _snap(req.height, 8, 512)
+        pb = req.extra.get("pose_image_b64")
+        if not pb:
+            raise RuntimeError("illustrious には extra.pose_image_b64 "
+                               "(OpenPose骨格グリッドPNG) が必要です")
+        pose = load_images_b64([pb])[0].convert("RGB")
+        if pose.size != (w, h):
+            pose = pose.resize((w, h), Image.LANCZOS)
+        steps = max(8, int(req.steps or 28))
+        scale = float(req.extra.get("controlnet_scale", 0.9))
+        log(f"t2i生成: {w}x{h} steps={steps} cfg={req.guidance} "
+            f"CN openpose={scale}")
+        g = torch.Generator("cpu").manual_seed(req.seed)
+        kw = dict(prompt=req.prompt,
+                  negative_prompt=req.negative or self.NEG,
+                  image=pose,
+                  controlnet_conditioning_scale=scale,
+                  num_inference_steps=steps,
+                  guidance_scale=float(req.guidance or 6.0),
+                  width=w, height=h, generator=g,
+                  callback_on_step_end=_step_callback(progress, steps))
+        out = _call_with_optional_kwargs(self.pipe, kw,
+                                         ["callback_on_step_end"], log)
+        img = out.images[0] if hasattr(out, "images") else out[0][0]
+        dst = workdir / "out.png"
+        img.save(dst)
+        progress(0.98)
+        return dst
 
 
 @register
@@ -3431,8 +3535,12 @@ def build_app(token: str | None):
         j = JOBS.get(jid)
         if not j or j.get("status") != "done" or not j.get("path"):
             raise HTTPException(404, "not ready")
-        return FileResponse(j["path"], media_type="video/mp4",
-                            filename=f"videolab_{jid}.mp4")
+        # 拡張子でメディアタイプを推定 (v0.9.5: illustriousはPNGを返す)
+        _p = Path(j["path"])
+        _mt = ("image/png" if _p.suffix.lower() == ".png"
+               else "video/mp4")
+        return FileResponse(str(_p), media_type=_mt,
+                            filename=f"videolab_{jid}{_p.suffix}")
 
     @app.get("/api/jobs")
     def jobs(request: Request):
