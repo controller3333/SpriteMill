@@ -44,7 +44,9 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.9"   # 0.8.9: 初回セットアップセル (populate_drive:
+__version__ = "0.9.0"   # 0.9.0: /healthにdrive状態 (only/mounted/ready) —
+#         ⚡自動運転のマウント承諾待ちゲート用。0.8.9: 初回セットアップセル
+#         (populate_drive:
 #         配置済みなら数秒スキップ・不足分だけHFから取得してDriveへ配置。
 #         Run All毎回で安全)。0.8.8: Colabは完全Drive固定 (HF直DL封止)。
 #         0.8.7: Driveキャッシュ+curl -f修正。0.8.6: DL経路多段。
@@ -3210,10 +3212,19 @@ def build_app(token: str | None):
                     libs[pkg] = None
         except Exception:
             pass
+        # Drive固定運転の状態 (v0.9.0: ⚡自動運転がマウント承諾待ちを
+        # ここで判定する — DOM文字列より確実)
+        drv = {"only": _drive_only(),
+               "mounted": _drive_cache_dir() is not None, "ready": False}
+        if drv["mounted"]:
+            try:
+                drv["ready"] = bool(drive_cache_ready()[0])
+            except Exception:
+                pass
         return {"ok": True, "app": "SpriteMill VideoLab", "version": __version__,
                 "auth": bool(token), "queued": WORK_Q.qsize(),
                 "current_model": CURRENT_MODEL, "gpu": gpu, "disk": disk,
-                "libs": libs}
+                "drive": drv, "libs": libs}
 
     @app.get("/api/models")
     def models(request: Request):

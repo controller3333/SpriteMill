@@ -110,27 +110,55 @@ def _port_up(port: int) -> bool:
         return False
 
 
-def _probe_health(url: str, timeout: float = 4.0) -> bool:
-    """トンネルURLの /health に届くか(認証不要エンドポイント)。"""
+def _probe_health(url: str, timeout: float = 4.0):
+    """トンネルURLの /health に届けばそのJSONを返す(不達はNone)。
+    v0.9.0: Drive固定運転の状態(drive.only/mounted/ready)も載ってくるので
+    ⚡自動運転のマウント承諾待ちゲートに使う。"""
+    import json as _json
     import urllib.request as _rq
     try:
-        with _rq.urlopen(f"{url}/health", timeout=timeout):
-            return True
+        with _rq.urlopen(f"{url}/health", timeout=timeout) as r:
+            try:
+                return _json.loads(r.read().decode()) or {"ok": True}
+            except Exception:
+                return {"ok": True}
     except Exception:
-        return False
+        return None
 
 
 _PW = None
+_PW_TID = None
 
 
 def _playwright():
-    """Playwrightドライバは使い回す(web_drive._PW と同じ方針)。
-    呼び出しごとに start() すると、close() で stop() されない node
-    ドライバが⚡を押すたびに1個ずつ孤児化して蓄積するため。"""
-    global _PW
+    """Playwrightドライバの取得。同一スレッド内でだけ使い回す。
+
+    sync版Playwrightは start() したスレッドに束縛され、GUIの⚡は毎回
+    新しいワーカースレッドで走るため、前回のドライバを別スレッドから
+    使うと「cannot switch to a different thread (which happens to have
+    exited)」で必ず落ちる (2026-07-14実障害: ⚡の2回目で毎回発生)。
+    スレッドが変わっていたら旧ドライバのnodeプロセスをbest-effortで
+    直接killして(stop()も旧スレッド束縛なので呼べない)作り直す。"""
+    global _PW, _PW_TID
+    import threading as _th
+    tid = _th.get_ident()
+    if _PW is not None and _PW_TID != tid:
+        try:
+            # 内部のnodeドライバ子プロセスを直接落とす (Popen.killは
+            # スレッド安全。greenlet経由のstop()は死んだスレッド束縛で
+            # 呼べないため、孤児化させないにはこれしかない)
+            proc = getattr(getattr(getattr(_PW, "_impl_obj", None),
+                                   "_connection", None), "_transport", None)
+            proc = getattr(proc, "_proc", None)
+            if proc is not None:
+                proc.kill()
+        except Exception:
+            pass
+        _PW = None
     if _PW is None:
         from playwright.sync_api import sync_playwright
         _PW = sync_playwright().start()
+        _PW_TID = tid
     return _PW
 
 
@@ -441,6 +469,10 @@ class ColabDriver:
         if got:
             log(f"サーバは既に稼働中です -- そのまま採用: {got[0]}")
             return {"url": got[0], "token": got[1]}
+        # 1.7) ランタイムタイプの確認を先に人間へ (2026-07-14要望「GPUの
+        # 設定をどのタイミングでやればいいかいつも迷う」— 自動化が走る前に
+        # 設定画面を開いて、閉じられるまで待つ)
+        self._prompt_runtime_type(log)
         # 2) 1回目のRun all
         log("すべてのセルを実行します(1回目)…")
         if not self._run_all(log):
@@ -469,13 +501,24 @@ class ColabDriver:
             log("  再起動を検知できませんでした。1回目の実行がまだ進行中"
                 "ならそのまま待ち、止まっているようならColab画面で"
                 "「すべてのセルを実行」を押してください(自動回収は続行)")
-        # 4) URL/TOKEN をポーリング回収
+        # 4) URL/TOKEN をポーリング回収 (+Drive固定運転の準備完了ゲート)
         log("サーバ起動待ち: URL と TOKEN を探しています"
             "(初回はモデルDLで時間がかかります)…")
         deadline = time.time() + poll_timeout
         while time.time() < deadline:
             got = self._fresh_url_token()
             if got:
+                # Drive固定 (v0.8.8+) のサーバは、マウント承諾やモデル配置が
+                # 済むまで生成できない。/healthのdrive状態で人間待ちにする
+                # (2026-07-14要望「ポップアップまで自動→人間が承諾したら
+                # 続きを進める」)
+                d = ((getattr(self, "_last_health", None) or {})
+                     .get("drive") or {})
+                if d.get("only") and not d.get("ready"):
+                    self._nudge_drive(log, mounted=bool(d.get("mounted")))
+                    deadline = max(deadline, time.time() + 600)
+                    time.sleep(5)
+                    continue
                 log(f"URL/TOKEN を取得しました: {got[0]}")
                 return {"url": got[0], "token": got[1]}
             time.sleep(5)
@@ -483,6 +526,78 @@ class ColabDriver:
             "URL/TOKENを取得できませんでした。Colab画面の最後のセルに"
             "URLが出ているか確認し、出ていれば手でアプリの欄に貼って"
             "ください")
+
+    def _nudge_drive(self, log, mounted: bool) -> None:
+        """Drive固定運転の人間待ちアナウンス (状態が変わったときだけ)。"""
+        if mounted:
+            state = "populate"
+            msg = ("モデルをDriveから配置中です — このまま待ちます"
+                   " (初回セットアップ中なら30〜60分)")
+        else:
+            dt = self._dialogs_text()
+            if re.search(r"ドライブ|Drive", dt or "", re.I):
+                state = "consent"
+                msg = ("🖐 Google Driveの接続許可ポップアップが出ています — "
+                       "内蔵ブラウザで「Google ドライブに接続」を押して"
+                       "ください (承諾されるまで待機します)")
+            else:
+                state = "unmounted"
+                msg = ("Driveマウント待ち — 内蔵ブラウザに認可ポップアップが"
+                       "出たら「許可」を押してください (待機します)")
+        if getattr(self, "_last_nudge", "") != state:
+            self._last_nudge = state
+            log(msg)
+
+    _RT_DLG_RX = (r"ランタイムのタイプ|ハードウェア\s*アクセラレータ"
+                  r"|runtime type|hardware accelerator")
+
+    def _rt_dialog_open(self) -> bool:
+        return bool(re.search(self._RT_DLG_RX, self._dialogs_text() or "",
+                              re.I))
+
+    def _prompt_runtime_type(self, log, timeout: int = 600) -> None:
+        """「ランタイムのタイプを変更」ダイアログを開いて人間の確認を待つ。
+
+        開く手段はコマンドパレット (Ctrl+Shift+P) — メニューDOMより
+        UI変更に強い。開けなければ従来どおり続行する (best effort、
+        2026-07-14要望「できるなら」)。閉じられるまで待機=保存/キャンセル
+        どちらでも人間が確認したとみなす。"""
+        try:
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
+            opened = False
+            for query in ("ランタイムのタイプ", "runtime type"):
+                self.page.keyboard.press("Control+Shift+P")
+                time.sleep(0.8)
+                self.page.keyboard.type(query, delay=25)
+                time.sleep(0.8)
+                self.page.keyboard.press("Enter")
+                for _ in range(6):
+                    time.sleep(0.5)
+                    if self._rt_dialog_open():
+                        opened = True
+                        break
+                if opened:
+                    break
+                self.page.keyboard.press("Escape")
+                time.sleep(0.3)
+            if not opened:
+                log("  ランタイムタイプ画面を自動で開けませんでした — "
+                    "必要ならメニューから確認してください (続行します)")
+                return
+            log("🖐 GPUタイプを確認して「保存」を押してください (推奨: L4) — "
+                "押されるまで待機します")
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not self._rt_dialog_open():
+                    log("ランタイムタイプの確認を受領 — 続行します")
+                    return
+                time.sleep(2)
+            log("  確認待ちがタイムアウトしました — そのまま続行します")
+        except Exception as e:   # noqa: BLE001
+            log(f"  ランタイムタイプ確認をスキップ ({str(e)[:80]})")
 
     def _scroll_to_server_output(self) -> bool:
         """トンネルURLを印字するセル(サーバ起動セル)を画面内に出す。
@@ -520,7 +635,9 @@ class ColabDriver:
             neg = self._url_probe_neg = {}
         if now < neg.get(u, 0.0):
             return None
-        if _probe_health(u):
+        h = _probe_health(u)
+        if h:
+            self._last_health = h   # Drive状態ゲート用 (v0.9.0)
             return got
         neg[u] = now + 30
         return None
