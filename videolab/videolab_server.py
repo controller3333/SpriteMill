@@ -272,7 +272,7 @@ def _drive_cache_dir() -> Path | None:
     """Google Driveのモデルキャッシュ (v0.8.7)。ノートのDRIVE_CACHEセルが
     マウント成功時に VIDEOLAB_DRIVE_CACHE を設定する。HFへ一切触らずに
     毎セッション数分でモデルを積める恒久脱出路 (2026-07-14 HF側の
-    429拒否がIP/アカウント割当で解けなくなった際のお兄さま発案)。"""
+    429拒否がIP/アカウント割当で解けなくなった際のユーザー発案)。"""
     p = os.environ.get("VIDEOLAB_DRIVE_CACHE", "").strip()
     return Path(p) if p else None
 
@@ -1152,7 +1152,7 @@ class _WanA14BBase(VideoAdapter):
         チャネル連結 (先頭=1、中間=0、終端=1)。AniSora V3.2は任意時間位置の
         画像ガイド(時空間マスク)で学習されているため、中間位置のマスクを
         立てて同じ立ち絵のlatentを書き込めば「真ん中も固定」できる
-        (2026-07-12 お兄さま発案: 終端だけでは中盤で一回転して戻る
+        (2026-07-12 ユーザー発案: 終端だけでは中盤で一回転して戻る
         「往復回転」が起きた=ロップで実証)。"""
         import torch
         pipe = self.pipe
@@ -1391,7 +1391,7 @@ class AniSoraAdapter(_WanA14BBase):
         h = _snap(req.height, 16, 240)
         lat_from = str(req.extra.get("latent_from") or "").strip()
         if lat_from:
-            # latent再加工モード (2026-07-13お兄さま発案「VACEをフルで
+            # latent再加工モード (2026-07-13ユーザー発案「VACEをフルで
             # 当てて、その潜在をVAEを通す前にanisoraで再加工」):
             # フレームは受け取らず、前段vaceジョブの最終latentを直接読む
             if not req.images:
@@ -1529,7 +1529,7 @@ class AniSoraAdapter(_WanA14BBase):
             # refine_cond_still 指定時は原画の立ち絵を条件にする:
             # 1段目の劣化(量子化+蒸留の粘土)がノイズ済みlatentの中では
             # 「正常な構造」に見えてしまい、リファインが安定した粘土に
-            # 確定する (2026-07-13お兄さま指摘)。原画をframe0に注入すると
+            # 確定する (2026-07-13ユーザー指摘)。原画をframe0に注入すると
             # 時系列アテンションが劣化前の質感を全フレームから参照できる。
             # 前提=骨格の直立プレフィックス (frame0が直立なので立ち絵と
             # 矛盾しない。旧動画=全フレーム歩行に使うと先頭が跳ねる)
@@ -1738,7 +1738,7 @@ class VACEAdapter(_WanA14BBase):
 
     v0.4.xの素のWan2.2 VACE-Fun(汎用ベース・非蒸留30step/cfg5)は
     「粘土のような崩れ+激遅」でAniSoraに遠く及ばず不採用(2026-07-12
-    お兄さま裁定)。v0.5.0からはコミュニティ定石「AniSoraベース+VACE
+    ユーザー裁定)。v0.5.0からはコミュニティ定石「AniSoraベース+VACE
     モジュール」をdiffusersで再現する: VACE-Fun GGUFのtransformerに
     AniSora V3.2 GGUFのbase重み(blocks/condition_embedder/proj_out、
     40層で命名・形状が完全一致)を移植し、vace_*ブロックと16ch
@@ -2132,7 +2132,7 @@ class VACEAdapter(_WanA14BBase):
             step_box["i"] = step_index + 1
             return base_cb(pipe, step_index, timestep, callback_kwargs)
 
-        # latent直出しモード (2026-07-13お兄さま発案): VACEフル制御の
+        # latent直出しモード (2026-07-13ユーザー発案): VACEフル制御の
         # 最終latentをVAE未通過のまま保存し、後段のAniSora latent再加工
         # (anisoraジョブの extra.latent_from=このジョブID) へ渡す
         emit_latent = bool(req.extra.get("emit_latent"))
@@ -2173,7 +2173,7 @@ class VACEAdapter(_WanA14BBase):
             log(f"最終latent保存: {tuple(lat.shape)} -> latent.pt "
                 "(VAE未通過・AniSora latent再加工用)")
             if not req.extra.get("emit_latent_preview"):
-                # 本番はプレビューdecodeを省略 (2026-07-14お兄さま指示
+                # 本番はプレビューdecodeを省略 (2026-07-14ユーザー指示
                 # 「絶対重いし使わないものだから時間無駄」)。ジョブ契約
                 # (結果=mp4) は参照画像1フレームのサムネで満たす
                 import numpy as np
