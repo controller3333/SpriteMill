@@ -44,10 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.5"   # 0.8.5: DL停滞の自動再接続 (_hf_download: 子プロセス
-#         +キャッシュ成長監視+resume再試行) + HFトークン対応 (認証DLで
-#         ColabのIP帯域制限を回避)。0.8.4: hf_transfer撤去 (無限ハング) +
-#         DL進捗ウォッチャ。0.8.3: ロード鼓動。0.8.2: 素のvace/anisoraを
+__version__ = "0.8.6"   # 0.8.6: DL経路の多段フォールバック (Xet⇄従来CDN
+#         交互+curl直DL最終ライン。Colab→HF経路の窒息はトークンでも
+#         直らない=経路障害と確定したため経路自体を替える)。0.8.5: DL停滞
+#         の自動再接続+HFトークン対応。0.8.4: hf_transfer撤去 (無限ハング)
+#         +DL進捗ウォッチャ。0.8.3: ロード鼓動。0.8.2: 素のvace/anisoraを
 #         L4対応 (UMT5遅延+block offload)。latent_refine既定化の前提
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
@@ -87,8 +88,10 @@ COLAB_PIP = [
     "fastapi uvicorn pillow imageio-ffmpeg",
     "-U \"diffusers>=0.39.0\" transformers accelerate safetensors sentencepiece",
     # ftfy=Wan系プロンプト前処理 / gguf=GGUF量子化ロード / peft=LoRA
+    # hf_xet=HFのXet転送経路 (v0.8.6: Colab→HF CDN経路の窒息障害への
+    # 迂回路。従来経路とは別インフラ)
     # (hf_transferはv0.8.4で撤去 — 無限ハング障害。下のコメント参照)
-    "ftfy gguf peft",
+    "ftfy gguf peft hf_xet",
 ]
 
 # hf_transferは撤去 (v0.8.4、2026-07-14実障害): 接続が途中停止すると
@@ -232,15 +235,50 @@ def _log_cuda_state(log, label: str) -> None:
         pass
 
 
+def _disk_used_gb() -> float:
+    try:
+        return shutil.disk_usage(str(Path.home())).used / 2**30
+    except Exception:
+        return -1.0
+
+
+def _run_with_stall_watch(cmd, env, log, tag, stall_secs=90) -> int:
+    """子プロセスを起動し、ディスク使用量が stall_secs 増えなければkill。
+    転送プロトコルによらず「何かが書かれているか」で生死判定する
+    (v0.8.6: リポキャッシュdir監視だとXet等のチャンクキャッシュを
+    見落とすため、ディスク全体のusedへ変更)。戻り値=returncode
+    (killしたら None 扱いで -1)。"""
+    p = subprocess.Popen(cmd, env=env)
+    last, stall = -1.0, 0.0
+    while True:
+        time.sleep(10)
+        if p.poll() is not None:
+            return p.returncode
+        cur = _disk_used_gb()
+        if cur < 0 or cur - last > 0.01:
+            stall = 0.0
+        else:
+            stall += 10
+            if stall >= stall_secs:
+                log(f"⚠ DL停滞{int(stall)}秒 -> 打ち切って別経路で再試行 "
+                    f"({tag})")
+                p.kill()
+                p.wait()
+                return -1
+        last = cur
+
+
 def _hf_download(repo: str, filename: str, log, attempts: int = 8,
                  stall_secs: int = 90) -> str:
-    """hf_hub_downloadの停滞監視付きラッパ (v0.8.5)。
+    """モデルDLの多段フォールバック (v0.8.5-0.8.6)。
 
-    ColabのIPはHF側に帯域制限されがちで、数GB全速で出た後トリクルに
-    絞られて事実上停止する (2026-07-14実障害: +5.2GB/20s→+0→180秒無音。
-    エラーにならないので標準ダウンローダのタイムアウトも発動しない)。
-    子プロセスでDLし、キャッシュ成長が stall_secs 止まったらkill→
-    .incompleteから再開。認証つき (HF_TOKEN) なら絞られにくい。"""
+    実測 (2026-07-14): Colab VM→HF CDNの経路だけが「数GB流れて完全停止」
+    する (ローカル回線からは同一ファイルが全速=HF本体は健在、認証
+    トークンでも改善なし=権限でなく経路の問題)。対策は経路の切替:
+      試行1,3,5: hf_hub_download そのまま (Xetが入っていればXet経路)
+      試行2,4,6: HF_HUB_DISABLE_XET=1 (従来CDN経路へ強制)
+      試行7,8 : curl直DL (resolve URL・-C - resume・低速自動打ち切り)
+    いずれもディスク成長監視つきで、停滞したらkillして次へ。"""
     from huggingface_hub import hf_hub_download
     try:
         return hf_hub_download(repo, filename, local_files_only=True)
@@ -251,32 +289,40 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 8,
         pass
     code = ("from huggingface_hub import hf_hub_download; "
             f"hf_hub_download({repo!r}, {filename!r})")
+    curl_dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
     for att in range(1, attempts + 1):
-        p = subprocess.Popen([sys.executable, "-c", code])
-        last, stall = -1.0, 0.0
-        while True:
-            time.sleep(10)
-            if p.poll() is not None:
-                break
-            cur = _repo_cache_gb(repo)
-            if cur - last > 0.01:
-                stall = 0.0
+        env = dict(os.environ)
+        if att >= attempts - 1:
+            # curl直DL: hf経路が全滅したときの最終ライン。-C - で続きから、
+            # 30秒間 500KB/s を下回ったら自ら切断してリトライへ
+            curl_dst.parent.mkdir(parents=True, exist_ok=True)
+            url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+            cmd = ["curl", "-sSL", "-C", "-", "--speed-limit", "500000",
+                   "--speed-time", "30", "-o", str(curl_dst), url]
+            tok = os.environ.get("HF_TOKEN", "")
+            if tok:
+                cmd[1:1] = ["-H", f"Authorization: Bearer {tok}"]
+            tag = f"curl直DL 試行{att}/{attempts}"
+        else:
+            if att % 2 == 0:
+                env["HF_HUB_DISABLE_XET"] = "1"   # 従来CDN経路へ強制
+                tag = f"hf(従来経路) 試行{att}/{attempts}"
             else:
-                stall += 10
-                if stall >= stall_secs:
-                    log(f"⚠ DL停滞{int(stall)}秒 -> 接続を張り直して続きから"
-                        f"再開します (試行{att}/{attempts})")
-                    p.kill()
-                    p.wait()
-                    break
-            last = cur
-        if p.returncode == 0:
+                tag = f"hf(既定経路) 試行{att}/{attempts}"
+            cmd = [sys.executable, "-c", code]
+        log(f"DL開始: {tag}")
+        rc = _run_with_stall_watch(cmd, env, log, tag,
+                                   stall_secs=stall_secs)
+        if rc == 0:
+            if att >= attempts - 1:
+                log(f"curl直DL成功: {curl_dst.name}")
+                return str(curl_dst)
             return hf_hub_download(repo, filename, local_files_only=True)
         time.sleep(min(60, 5 * att))
     raise RuntimeError(
-        f"HFダウンロードが{attempts}回とも停滞しました: {repo}/{filename}"
-        " — HF側のIP帯域制限の可能性が高いです。アプリの🌐欄に"
-        "HuggingFaceトークン(無料)を設定すると認証枠になり回避できます")
+        f"モデルDLが{attempts}回とも停滞しました: {repo}/{filename} — "
+        "Colab→HFの経路障害の可能性。ランタイムを一度終了して別のVM"
+        "(別リージョン)を引き直すと直ることがあります")
 
 
 def _repo_cache_dir(repo: str) -> Path:
@@ -2798,27 +2844,25 @@ def worker_loop():
                 _done = threading.Event()
 
                 def _dl_watch(_a=adapter):
-                    repos = (getattr(_a, "cache_repos", None)
-                             or [getattr(_a, "repo", "")])
+                    # v0.8.6: リポキャッシュdirでなくディスクusedを見る
+                    # (Xet経路はチャンクを別キャッシュへ書くため)
                     last = -1.0
                     still = 0
                     while not _done.wait(20):
-                        try:
-                            cur = sum(_repo_cache_gb(r) for r in repos if r)
-                        except Exception:
+                        cur = _disk_used_gb()
+                        if cur < 0:
                             continue
                         if last < 0:
                             last = cur
                             continue
                         if cur - last > 0.05:
-                            log(f"DL/読込 進行中: キャッシュ {cur:.1f}GB "
-                                f"(+{cur - last:.1f}GB/20s)")
+                            log(f"DL/読込 進行中: +{cur - last:.1f}GB/20s")
                             still = 0
                         else:
                             still += 1
                             if still in (3, 9):
                                 log(f"⚠ DLが{still * 20}秒進んでいません "
-                                    "(HF側の一時渋滞の可能性・リトライ待ち)")
+                                    "(停滞検知が別経路への切替を行います)")
                         last = cur
                 threading.Thread(target=_dl_watch, daemon=True).start()
                 try:
