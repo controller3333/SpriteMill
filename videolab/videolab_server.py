@@ -44,11 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.4"   # 0.8.4: hf_transfer撤去 (DL無限ハング実障害) +
-#         DL進捗ウォッチャ。0.8.3: ロード鼓動 — モデルDL/読込中もジョブ
-#         進捗を刻む。0.8.2: 素のvace/anisoraをL4対応 — UMT5遅延ロード
-#         (低RAM VM) + block offload (GGUF×seq非互換の代替) をlatent
-#         再加工経路に開通。latent_refine既定化のサーバ側前提
+__version__ = "0.8.5"   # 0.8.5: DL停滞の自動再接続 (_hf_download: 子プロセス
+#         +キャッシュ成長監視+resume再試行) + HFトークン対応 (認証DLで
+#         ColabのIP帯域制限を回避)。0.8.4: hf_transfer撤去 (無限ハング) +
+#         DL進捗ウォッチャ。0.8.3: ロード鼓動。0.8.2: 素のvace/anisoraを
+#         L4対応 (UMT5遅延+block offload)。latent_refine既定化の前提
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -230,6 +230,53 @@ def _log_cuda_state(log, label: str) -> None:
             f"free={free / 2**30:.2f}GB / total={total / 2**30:.2f}GB")
     except Exception:
         pass
+
+
+def _hf_download(repo: str, filename: str, log, attempts: int = 8,
+                 stall_secs: int = 90) -> str:
+    """hf_hub_downloadの停滞監視付きラッパ (v0.8.5)。
+
+    ColabのIPはHF側に帯域制限されがちで、数GB全速で出た後トリクルに
+    絞られて事実上停止する (2026-07-14実障害: +5.2GB/20s→+0→180秒無音。
+    エラーにならないので標準ダウンローダのタイムアウトも発動しない)。
+    子プロセスでDLし、キャッシュ成長が stall_secs 止まったらkill→
+    .incompleteから再開。認証つき (HF_TOKEN) なら絞られにくい。"""
+    from huggingface_hub import hf_hub_download
+    try:
+        return hf_hub_download(repo, filename, local_files_only=True)
+    except TypeError:
+        # テストの偽hf_hub_download(位置引数のみ)はそのまま呼ぶ
+        return hf_hub_download(repo, filename)
+    except Exception:
+        pass
+    code = ("from huggingface_hub import hf_hub_download; "
+            f"hf_hub_download({repo!r}, {filename!r})")
+    for att in range(1, attempts + 1):
+        p = subprocess.Popen([sys.executable, "-c", code])
+        last, stall = -1.0, 0.0
+        while True:
+            time.sleep(10)
+            if p.poll() is not None:
+                break
+            cur = _repo_cache_gb(repo)
+            if cur - last > 0.01:
+                stall = 0.0
+            else:
+                stall += 10
+                if stall >= stall_secs:
+                    log(f"⚠ DL停滞{int(stall)}秒 -> 接続を張り直して続きから"
+                        f"再開します (試行{att}/{attempts})")
+                    p.kill()
+                    p.wait()
+                    break
+            last = cur
+        if p.returncode == 0:
+            return hf_hub_download(repo, filename, local_files_only=True)
+        time.sleep(min(60, 5 * att))
+    raise RuntimeError(
+        f"HFダウンロードが{attempts}回とも停滞しました: {repo}/{filename}"
+        " — HF側のIP帯域制限の可能性が高いです。アプリの🌐欄に"
+        "HuggingFaceトークン(無料)を設定すると認証枠になり回避できます")
 
 
 def _repo_cache_dir(repo: str) -> Path:
@@ -1115,8 +1162,8 @@ class AniSoraAdapter(_WanA14BBase):
         qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
         log(f"GGUF DL: {self.gguf_repo} {quant} "
             f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB'})")
-        hi = hf_hub_download(self.gguf_repo, gguf_high)
-        lo = hf_hub_download(self.gguf_repo, gguf_low)
+        hi = _hf_download(self.gguf_repo, gguf_high, log)
+        lo = _hf_download(self.gguf_repo, gguf_low, log)
         log("transformer(High) 読み込み — configはWan2.2ベースを明示")
         t_hi = WanTransformer3DModel.from_single_file(
             hi, quantization_config=qc, config=self.base_repo,
@@ -1705,8 +1752,8 @@ class VACEAdapter(_WanA14BBase):
             qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
             log(f"GGUF DL: {self.gguf_repo} {quant} "
                 f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB'})")
-            hi = hf_hub_download(self.gguf_repo, gguf_high)
-            lo = hf_hub_download(self.gguf_repo, gguf_low)
+            hi = _hf_download(self.gguf_repo, gguf_high, log)
+            lo = _hf_download(self.gguf_repo, gguf_low, log)
             log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
             t_hi = WanVACETransformer3DModel.from_single_file(
                 hi, quantization_config=qc, config=self.repo,
@@ -1728,7 +1775,7 @@ class VACEAdapter(_WanA14BBase):
                         continue
                     fname = f"{tag}/Index-Anisora-V3.2-{tag}-{quant}.gguf"
                     log(f"AniSora GGUF DL: {self.anisora_gguf_repo} {fname}")
-                    dp = hf_hub_download(self.anisora_gguf_repo, fname)
+                    dp = _hf_download(self.anisora_gguf_repo, fname, log)
                     log(f"AniSora {tag} 読み込み (移植ドナー・config="
                         "Wan2.2-I2Vベースを明示)")
                     donor = WanTransformer3DModel.from_single_file(
@@ -2709,6 +2756,13 @@ def worker_loop():
             adapter = ADAPTERS[j["model"]]
             # ロード時にジョブのextra(量子化指定など)を参照できるように渡す
             adapter._next_extra = dict(getattr(j["_req"], "extra", {}) or {})
+            # HFトークン (v0.8.5): アプリのconfig hf_tokenがextraで届く。
+            # 認証つきDLはIP帯域制限の対象外になりやすい (値はログに出さない)
+            _hft = str(adapter._next_extra.pop("hf_token", "") or "").strip()
+            if _hft:
+                os.environ["HF_TOKEN"] = _hft
+                os.environ["HUGGING_FACE_HUB_TOKEN"] = _hft
+                log("HFトークンを受領 (認証つきDL — IP帯域制限を回避)")
             # モデル切替: 前のモデルをアンロードしてVRAMを空ける
             if CURRENT_MODEL not in (None, j["model"]):
                 prev = ADAPTERS.get(CURRENT_MODEL)
