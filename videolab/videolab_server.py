@@ -44,7 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.7"   # 0.9.7: Illustrious i2iのOOM根治 — VAEタイリング
+__version__ = "0.9.8"   # 0.9.8: latent固定 — 再加工(SDEdit)中に指定フレーム
+#         のlatentスロットを毎step stage1へ描き戻す (extra.latent_pin_frames
+#         / latent_pin_release)。歩行周期の位相流れ (先頭=終端同位相の崩れ)
+#         を錨止めする (2026-07-15要望「中間フレームと最終フレームを固定化」)。
+# 0.9.7: Illustrious i2iのOOM根治 — VAEタイリング
 #         (1536のinit encode / 1152のdecodeがL4 22GBを超える実測) +
 #         ジョブ末のVRAM掃除 (断片化の持ち越しで2回目以降が落ちる)。
 #         i2iの画像必須ガード・modes広告・denoiseクランプ・進捗eff計算
@@ -942,6 +946,53 @@ def _call_with_optional_kwargs(fn, kwargs: dict, optional: list, log):
             kw.pop(hit)
             log(f"引数 {hit} は未対応のため外して再試行")
     return fn(**kw)
+
+
+def _latent_pin_slots(frames, t_dim: int) -> list:
+    """動画フレーム番号 -> Wan VAEのlatent時間スロット番号。
+
+    Wanの時間圧縮は 1+4+4+…: slot0=frame0、slot s>=1 が frames 4s-3..4s
+    を担う。frame0はI2Vの条件画像側で既に固定されるため slot0 は対象外
+    (条件注入と喧嘩させない)。範囲外・重複・非数は黙って落とす。"""
+    out = set()
+    for f in (frames or []):
+        try:
+            fi = int(f)
+        except (TypeError, ValueError):
+            continue
+        if fi <= 0:
+            continue
+        s = (fi - 1) // 4 + 1
+        if 0 < s < int(t_dim):
+            out.add(s)
+    return sorted(out)
+
+
+def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float):
+    """リファインの毎step後、固定スロットを (1-σ)x0 + σε へ描き戻す。
+
+    SDEdit再デノイズは全フレームを自由に動かすため、歩行周期の位相が
+    stage1からわずかに流れて「先頭=終端同位相」(コマ選出の前提) が崩れる。
+    描き戻しは初期化と同じ noise を使い、固定スロットにflow matchingの
+    直線補間路そのものを歩かせる — モデルから見て軌道上の点なので予測が
+    暴れず、終端σ=0で厳密にstage1へ着地する。release>0 ならσ<release の
+    終盤stepは描き戻しを止め、質感の馴染ませに開放する。"""
+    def cb(pipe, step_index, timestep, callback_kwargs):
+        callback_kwargs = (inner(pipe, step_index, timestep, callback_kwargs)
+                           or callback_kwargs)
+        lat = callback_kwargs.get("latents")
+        if lat is None:
+            return callback_kwargs
+        sig = sched.sigmas          # 切詰め済み(尻尾+終端σ)
+        s = float(sig[min(step_index + 1, len(sig) - 1)])
+        if s < release:
+            return callback_kwargs
+        ref = (1.0 - s) * x0 + s * noise
+        for sl in slots:
+            lat[:, :, sl] = ref[:, :, sl].to(lat.device, lat.dtype)
+        callback_kwargs["latents"] = lat
+        return callback_kwargs
+    return cb
 
 
 # ------------------------------------------------ LTX-2.3 (diffusers)
@@ -1959,6 +2010,15 @@ class AniSoraAdapter(_WanA14BBase):
             x_t = (1.0 - s0) * x0 + s0 * noise
             log(f"リファイン: {len(frames)}f σ0={s0:.2f} 実行{tail}/{steps}"
                 "step (全stepがLow=ディテール側)")
+            pin_frames = req.extra.get("latent_pin_frames") or []
+            pin_slots = _latent_pin_slots(pin_frames, x0.shape[2])
+            pin_release = float(req.extra.get("latent_pin_release") or 0.0)
+            if pin_slots:
+                log(f"latent固定: フレーム{list(pin_frames)}"
+                    f" -> 時間スロット{pin_slots}"
+                    + (f" (σ<{pin_release:.2f}で解放=質感馴染ませ)"
+                       if pin_release > 0
+                       else " (終端まで固定=stage1へ厳密着地)"))
             # 条件画像は既定で「1段目動画の先頭フレーム」。ただし
             # refine_cond_still 指定時は原画の立ち絵を条件にする:
             # 1段目の劣化(量子化+蒸留の粘土)がノイズ済みlatentの中では
@@ -1973,6 +2033,10 @@ class AniSoraAdapter(_WanA14BBase):
                 cond_img = _fit_image(req.images[0], w, h)
                 log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
                     "させないための参照注入)")
+            cb = _step_callback(progress, tail)
+            if pin_slots:
+                cb = _pin_step_callback(cb, sched, x0, noise,
+                                        pin_slots, pin_release)
             kw = dict(image=cond_img,
                       width=w, height=h, num_frames=n,
                       num_inference_steps=steps,
@@ -1980,14 +2044,17 @@ class AniSoraAdapter(_WanA14BBase):
                       latents=x_t,
                       generator=g,
                       output_type="np", return_dict=False,
-                      callback_on_step_end=_step_callback(progress, tail))
+                      callback_on_step_end=cb)
             kw.update(self._prompt_kwargs(self._build_prompt(req, log),
                                           req.negative or None,
                                           req.guidance, log))
             # latents未対応の古いdiffusersなら明示エラーにする (黙って
-            # 落とすと「1段目を無視した素の生成」が静かに走る偽PASS)
+            # 落とすと「1段目を無視した素の生成」が静かに走る偽PASS)。
+            # latent固定が要求されているときは callback_on_step_end も
+            # 必須扱い — 黙って外すと「固定なしの再加工」が静かに走る
             out = _call_with_optional_kwargs(
-                self.pipe, kw, ["callback_on_step_end"], log)
+                self.pipe, kw,
+                [] if pin_slots else ["callback_on_step_end"], log)
         finally:
             sched.set_timesteps = orig_set
             if not had_tiling:
