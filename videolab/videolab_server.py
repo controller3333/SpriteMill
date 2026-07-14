@@ -394,8 +394,10 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         raise RuntimeError(
             f"Driveの {filename} が読み切れません (同期未完了の疑い)。"
             "PC側のGoogle Drive同期の完了を待ってからやり直してください")
-    if _drive_only():
-        # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
+    if _drive_only() and dc is None:
+        # Drive固定でマウントも無い=取得手段なし (v0.9.5改: マウント済みで
+        # Driveに無いだけなら、HFから取得してDriveへ書き戻す=その場populate。
+        # Illustrious等の新モデルをDrive固定が永久ブロックしない)
         raise _drive_only_error(filename, dsrc)
 
     def _ok(path: Path) -> bool:
@@ -537,8 +539,9 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         raise RuntimeError(
             f"Driveのベース部品 {repo} が読み切れません (同期未完了の疑い)。"
             "PC側のGoogle Drive同期の完了を待ってからやり直してください")
-    if _drive_only():
-        # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
+    if _drive_only() and dc is None:
+        # マウント無しのDrive固定のみブロック (マウント済みならHFから
+        # 取得してDriveへ書き戻す=その場populate)
         raise _drive_only_error(f"ベース部品 {repo}",
                                 dsrc / ".complete" if dsrc else None)
     ig = "['transformer/*.safetensors','transformer_2/*.safetensors','*.bin','*.md','.git*']"
