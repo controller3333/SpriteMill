@@ -70,11 +70,11 @@ if not os.path.exists(_sentinel):
     os.kill(os.getpid(), 9)
 else:
     print('再起動済み — cell 3 へ進みます')
-    # Driveキャッシュ: マウントできれば MyDrive/SpriteMill_models からモデルを
-    # 読み書きし、HuggingFaceのDL制限(429)を完全回避する。初回のみ認可の
-    # ポップアップに許可が必要(未認可なら黙ってスキップ=従来どおりHFからDL)。
-    # 一度どこかのセッションでDLに成功すると自動でDriveへ書き戻されるので、
-    # 以降のセッションはHFに触らず数分でモデルが揃う。
+    # モデルは完全Drive固定 (2026-07-14指示「毎回DLは詰まることがわかった」):
+    # MyDrive/SpriteMill_models から読み込む。HuggingFaceへは一切行かない
+    # (ColabのIP/割当はHFに429で絞られ、毎セッションのDLが成立しないため)。
+    # 初回のみDriveの認可ポップアップに「許可」が必要。
+    os.environ['VIDEOLAB_DRIVE_ONLY'] = '1'
     import threading
     def _mount_drive():
         try:
@@ -85,7 +85,9 @@ else:
             os.environ['VIDEOLAB_DRIVE_CACHE'] = p
             print('Driveモデルキャッシュ有効:', p)
         except Exception as e:
-            print('Driveキャッシュなしで続行:', str(e)[:80])
+            print('⚠ Driveをマウントできませんでした:', str(e)[:80])
+            print('⚠ モデルはDrive固定です — このセルを単独で再実行して'
+                  '認可ポップアップに「許可」してください')
     threading.Thread(target=_mount_drive, daemon=True).start()"""
 
     c3 = "%%writefile videolab_server.py\n" + code

@@ -44,12 +44,12 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.7"   # 0.8.7: Google Driveモデルキャッシュ (読み優先+
-#         自動書き戻し=HF不要化) + curl -f修正 (429エラーページを成功と
-#         誤認する実バグ) + ベース部品/LoRAも多段DL経路へ。0.8.6: DL経路の
-#         多段フォールバック (Xet⇄従来CDN+curl)。0.8.5: 停滞自動再接続+
-#         HFトークン。0.8.4: hf_transfer撤去+DLウォッチャ。0.8.3: ロード
-#         鼓動。0.8.2: L4対応 (UMT5遅延+block offload)。latent_refine既定
+__version__ = "0.8.8"   # 0.8.8: Colabは完全Drive固定 (VIDEOLAB_DRIVE_ONLY、
+#         HF直DLを封止 — 毎回DLは429で詰まると実証されたため)。handoffも
+#         snapshot経由へ。0.8.7: Driveモデルキャッシュ+curl -f修正+
+#         ベース部品/LoRAも多段DL。0.8.6: DL経路多段。0.8.5: 停滞自動再接続
+#         +HFトークン。0.8.4: hf_transfer撤去。0.8.3: ロード鼓動。
+#         0.8.2: L4対応 (UMT5遅延+block offload)。latent_refine既定
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -277,6 +277,23 @@ def _drive_cache_dir() -> Path | None:
     return Path(p) if p else None
 
 
+def _drive_only() -> bool:
+    """Colabはモデル取得を完全Drive固定 (v0.8.8、2026-07-14ユーザー指示
+    「毎回DLは詰まることがわかったので」)。ノートのcell2が
+    VIDEOLAB_DRIVE_ONLY=1 を立てる。ローカルGPUモード (家庭回線) は
+    HF直DLが健全なので従来どおり多段DL。"""
+    return os.environ.get("VIDEOLAB_DRIVE_ONLY", "").strip() == "1"
+
+
+def _drive_only_error(what: str, expect) -> RuntimeError:
+    hint = (f"期待する配置: {expect}" if expect is not None
+            else "Drive未マウント: セル2を再実行して許可してください")
+    return RuntimeError(
+        f"Drive固定運転: {what} がDriveキャッシュにありません — {hint} "
+        "(PCの G:\\マイドライブ\\SpriteMill_models へ配置するか、"
+        "セル2のDriveマウント許可を確認)")
+
+
 def _hf_download(repo: str, filename: str, log, attempts: int = 6,
                  stall_secs: int = 90) -> str:
     """モデルDLの多段フォールバック (v0.8.5-0.8.7)。
@@ -307,6 +324,9 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
             f"({dsrc.stat().st_size / 2**30:.1f}GB・HF不要)")
         shutil.copy2(dsrc, dst)
         return str(dst)
+    if _drive_only():
+        # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
+        raise _drive_only_error(filename, dsrc)
 
     def _ok(path: Path) -> bool:
         return path.is_file() and path.stat().st_size > 2**30
@@ -394,6 +414,10 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
         shutil.copytree(dsrc, local, dirs_exist_ok=True)
         return str(local)
+    if _drive_only():
+        # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
+        raise _drive_only_error(f"ベース部品 {repo}",
+                                dsrc / ".complete" if dsrc else None)
     ig = "['transformer/*.safetensors','transformer_2/*.safetensors','*.bin','*.md','.git*']"
     code = ("from huggingface_hub import snapshot_download; "
             f"snapshot_download({repo!r}, local_dir={str(local)!r}, "
@@ -2336,9 +2360,13 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         vname = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
                  f"{quant}.gguf")
         log(f"latent直結ロード: VACE High {quant}")
+        # ベース部品はsnapshot経由 (v0.8.8: Drive固定運転でもhandoffが動く
+        # ように。configもここから読む)
+        snap_vace = _snapshot_local(self.repo, log)
+        snap_base = _snapshot_local(self.base_repo, log)
         vp = _hf_download(self.gguf_repo, vname, log)
         vhigh = WanVACETransformer3DModel.from_single_file(
-            vp, quantization_config=qc, config=self.repo,
+            vp, quantization_config=qc, config=snap_vace,
             subfolder="transformer", torch_dtype=torch.bfloat16)
 
         # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
@@ -2347,7 +2375,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         log(f"latent直結ロード: AniSora High移植ドナー {quant}")
         ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
         donor = WanTransformer3DModel.from_single_file(
-            ahp, quantization_config=qc, config=self.base_repo,
+            ahp, quantization_config=qc, config=snap_base,
             subfolder="transformer", torch_dtype=torch.bfloat16)
         _transplant_base_weights(vhigh, donor, log, tag="HybridHigh")
         del donor
@@ -2357,7 +2385,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         log(f"latent直結ロード: native AniSora Low {quant}")
         alp = _hf_download(self.anisora_gguf_repo, al_name, log)
         alow = WanTransformer3DModel.from_single_file(
-            alp, quantization_config=qc, config=self.base_repo,
+            alp, quantization_config=qc, config=snap_base,
             subfolder="transformer_2", torch_dtype=torch.bfloat16)
 
         # 低RAM VM (L4=53GB) ではUMT5(約11GB)をロード段階から持たない:
@@ -2375,7 +2403,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         else:
             log(f"共通VAE/UMT5読み込み: {self.repo}")
         self.pipe = WanVACEPipeline.from_pretrained(
-            self.repo, **pipe_kwargs)
+            snap_vace, **pipe_kwargs)
+        self._te_from = snap_vace
         sched = UniPCMultistepScheduler.from_config(
             self.pipe.scheduler.config, flow_shift=self.flow_shift)
         self.pipe.scheduler = sched
@@ -2401,9 +2430,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             except Exception:
                 pass
             try:
+                _hi_p = Path(_hf_download(
+                    rep, f"{fold}/high_noise_model.safetensors", log))
                 self.pipe.load_lora_weights(
-                    rep, adapter_name="lightning",
-                    weight_name=f"{fold}/high_noise_model.safetensors")
+                    str(_hi_p.parent), adapter_name="lightning",
+                    weight_name=_hi_p.name)
                 self.pipe.set_adapters(["lightning"], [1.0])
             except Exception as e:
                 raise RuntimeError(
@@ -2416,7 +2447,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         # VAE/UMT5/tokenizer/schedulerは同一オブジェクトを共有。両repoのVAE
         # safetensorsは同一hashなのでlatent scaleの変換も不要。
         self.ani_pipe = WanImageToVideoPipeline.from_pretrained(
-            self.base_repo, transformer=None, transformer_2=alow,
+            snap_base, transformer=None, transformer_2=alow,
             vae=self.pipe.vae, text_encoder=self.pipe.text_encoder,
             tokenizer=self.pipe.tokenizer, scheduler=sched,
             torch_dtype=torch.bfloat16)
@@ -2519,8 +2550,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 from transformers import UMT5EncoderModel
                 log("UMT5を再ロード (低RAM運転・約30秒)")
                 pipe.text_encoder = UMT5EncoderModel.from_pretrained(
-                    self.repo, subfolder="text_encoder",
-                    torch_dtype=torch.bfloat16)
+                    getattr(self, "_te_from", None) or self.repo,
+                    subfolder="text_encoder", torch_dtype=torch.bfloat16)
                 self.ani_pipe.text_encoder = pipe.text_encoder
             self._move(pipe.text_encoder, device, log, "UMT5")
             prompt_embeds, negative_embeds = pipe.encode_prompt(
