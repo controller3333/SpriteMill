@@ -44,7 +44,12 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.6"   # 0.9.6: Drive経由スナップショットに.completeを
+__version__ = "0.9.7"   # 0.9.7: Illustrious i2iのOOM根治 — VAEタイリング
+#         (1536のinit encode / 1152のdecodeがL4 22GBを超える実測) +
+#         ジョブ末のVRAM掃除 (断片化の持ち越しで2回目以降が落ちる)。
+#         i2iの画像必須ガード・modes広告・denoiseクランプ・進捗eff計算
+#         (静的検証ワークフローの指摘4件)。
+# 0.9.6: Drive経由スナップショットに.completeを
 #         打ち忘れ — セッション内の2回目以降のロードでもHFチャレンジ+
 #         Drive再コピーが走っていた (実障害 2026-07-14)。あわせてHF先行
 #         チャレンジは1セッション1回だけ (停滞実績が付いたら以後スキップ)。
@@ -1525,7 +1530,7 @@ class IllustriousAdapter(VideoAdapter):
             "向き・左右を骨格指定)。extra.pose_image_b64 必須、"
             "extra例: {\"controlnet_scale\": 0.9}")
     requires = "Colab T4/L4 / ローカル8GB+ (fp16・DL約10GB)"
-    modes = ("t2i",)
+    modes = ("t2i", "i2i")
     # 既定はv2.0 (2026-07-14ユーザー指定「高い安定してるやつ」。公開・
     # ゲートなし・ε-pred。v0.1はextra.ill_repo/ill_fileで戻せる)
     ckpt_repo = os.environ.get(
@@ -1580,6 +1585,14 @@ class IllustriousAdapter(VideoAdapter):
         pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
             pipe.scheduler.config)
         pipe.to("cuda")
+        # VAEタイリング: 1536級のencode(i2i下地)/decodeがL4 22GBを超える
+        # 実測 (2026-07-14: i2i 1536でinit encodeがOOM、1152でも断片化と
+        # 重なりdecodeで落ちた)。タイル境界の縫い目はflat color画風では
+        # 実害なし
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
         self.pipe = pipe
         self.loaded = True
 
@@ -1620,14 +1633,18 @@ class IllustriousAdapter(VideoAdapter):
             init = req.images[0].convert("RGB")
             if init.size != (w, h):
                 init = init.resize((w, h), Image.LANCZOS)
-            den = float(req.extra.get("denoise", 0.7))
+            den = min(1.0, max(0.05, float(req.extra.get("denoise", 0.7))))
             pipe = getattr(self, "_i2i_pipe", None)
             if pipe is None:
-                # 部品共有の別ファサード (VRAM追加なし)
+                # 部品共有の別ファサード (VRAM追加なし)。schedulerも共有
+                # だが、ジョブはworker_loop単線でset_timestepsが毎回
+                # リセットするため安全 — 並列化するときは要分離
                 pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(
                     self.pipe)
                 self._i2i_pipe = pipe
-            eff = max(1, int(round(steps * den)))
+            # diffusersのget_timestepsはfloor — roundだと+1件多く数えて
+            # ゲージが張り付く
+            eff = max(1, min(steps, int(steps * den)))
             log(f"i2i生成: {w}x{h} steps={steps} denoise={den} "
                 f"cfg={req.guidance} CN openpose={scale}")
             kw.update(image=init, control_image=pose, strength=den,
@@ -1645,6 +1662,11 @@ class IllustriousAdapter(VideoAdapter):
         img = out.images[0] if hasattr(out, "images") else out[0][0]
         dst = workdir / "out.png"
         img.save(dst)
+        # ジョブ末にVRAMを掃除 — 断片化の持ち越しで2回目以降のジョブが
+        # decodeで落ちる実測 (2026-07-14: 0.7と0.9は通ったのに0.8が
+        # 「必要1.27GB/空き1.21GB」で失敗)
+        del out
+        torch.cuda.empty_cache()
         progress(0.98)
         return dst
 
@@ -3544,7 +3566,9 @@ def build_app(token: str | None):
             raise HTTPException(400, f"unknown model: {model}")
         mode = body.get("mode", "i2v")
         images = load_images_b64(body.get("images_b64", []))
-        if mode in ("i2v", "multikey") and not images:
+        if mode in ("i2v", "multikey", "i2i") and not images:
+            # i2iも必須: 欠けたまま通すと黙ってt2i挙動になり、i2iの目的
+            # (下地の背景・配置維持) が視認でしか気づけない形で消える
             raise HTTPException(400, "画像がありません (images_b64)")
         req = GenRequest(
             mode=mode, prompt=body.get("prompt", ""),
