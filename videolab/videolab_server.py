@@ -44,7 +44,13 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.5"   # 0.9.5: Illustrious-XL t2iアダプタ (SDXL+ControlNet
+__version__ = "0.9.6"   # 0.9.6: Drive経由スナップショットに.completeを
+#         打ち忘れ — セッション内の2回目以降のロードでもHFチャレンジ+
+#         Drive再コピーが走っていた (実障害 2026-07-14)。あわせてHF先行
+#         チャレンジは1セッション1回だけ (停滞実績が付いたら以後スキップ)。
+#         Illustriousにi2iモード追加 (マネキンコンパス下地+骨格CN併用 —
+#         マゼンタ背景とセル配置・斜め向きを下地から引き継ぐ)。
+#         0.9.5: Illustrious-XL t2iアダプタ (SDXL+ControlNet
 #         OpenPose・8方向シート1枚生成・PNG結果) — ローカル完結の画像生成
 #         (次点プロバイダ)。0.9.4: HF先行チャレンジ — Driveの保険がある
 #         ときだけHFを1回試し (10秒毎監視)、停滞30秒で即Driveへ切替。
@@ -307,6 +313,11 @@ def _drive_only_error(what: str, expect) -> RuntimeError:
         "セル2のDriveマウント許可を確認)")
 
 
+_HF_STALLED = False   # このセッションでHF先行チャレンジが停滞した実績
+#                       (一度死んだHFは部品ごとに再挑戦しない — 30秒/部品
+#                       の無駄待ちを1セッション1回に抑える v0.9.6)
+
+
 def _hf_download(repo: str, filename: str, log, attempts: int = 6,
                  stall_secs: int = 90) -> str:
     """モデルDLの多段フォールバック (v0.8.5-0.8.7)。
@@ -364,19 +375,26 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         # HF先行チャレンジ (v0.9.4、ユーザー要望「トークンせっかく用意
         # してるから最初1回だけHFからDLチャレンジして、10秒ごとに監視、
         # 駄目ならドライブへ」)。健康なHFはDrive FUSE読み(~150MB/s)の
-        # 約2倍速い。Driveの保険があるときだけ試し、30秒停滞で即切替
-        tag = "HF先行チャレンジ (停滞30秒でDriveへ切替)"
-        log(f"DL開始: {tag}")
-        rc = _run_with_stall_watch([sys.executable, "-c", code],
-                                   dict(os.environ), log, tag,
-                                   stall_secs=30)
-        if rc == 0:
-            try:
-                return hf_hub_download(repo, filename,
-                                       local_files_only=True)
-            except Exception:
-                pass
-        log("HFが進まないためDriveキャッシュへ切り替えます")
+        # 約2倍速い。Driveの保険があるときだけ試し、30秒停滞で即切替。
+        # 停滞実績が付いたセッションでは以後スキップ (v0.9.6)
+        global _HF_STALLED
+        if not _HF_STALLED:
+            tag = "HF先行チャレンジ (停滞30秒でDriveへ切替)"
+            log(f"DL開始: {tag}")
+            rc = _run_with_stall_watch([sys.executable, "-c", code],
+                                       dict(os.environ), log, tag,
+                                       stall_secs=30)
+            if rc == 0:
+                try:
+                    return hf_hub_download(repo, filename,
+                                           local_files_only=True)
+                except Exception:
+                    pass
+            _HF_STALLED = True
+            log("HFが進まないためDriveキャッシュへ切り替えます")
+        else:
+            log("HF先行チャレンジをスキップ (このセッションで停滞済み) — "
+                "Driveキャッシュから取得します")
         want_sz = dsrc.stat().st_size
         for att in (1, 2):
             log(f"Driveキャッシュからコピー: {filename} "
@@ -515,22 +533,32 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
              f"ignore_patterns={_ig})")
     if dsrc is not None and (dsrc / ".complete").is_file():
         # HF先行チャレンジ (v0.9.4): Driveの保険があるときだけ1回試す。
-        # 停滞30秒で即Driveへ切替 (10秒ごと監視は_run_with_stall_watch)
-        tag = "ベース部品HF先行チャレンジ (停滞30秒でDriveへ切替)"
-        log(f"DL開始: {tag} ({repo})")
-        rc = _run_with_stall_watch([sys.executable, "-c", _code],
-                                   dict(os.environ), log, tag,
-                                   stall_secs=30)
-        if rc == 0 and not _snap_valid(local):
-            marker.touch()
-            return str(local)
-        log("HFが進まないためDriveキャッシュへ切り替えます")
+        # 停滞30秒で即Driveへ切替 (10秒ごと監視は_run_with_stall_watch)。
+        # 停滞実績が付いたセッションでは以後スキップ (v0.9.6)
+        global _HF_STALLED
+        if not _HF_STALLED:
+            tag = "ベース部品HF先行チャレンジ (停滞30秒でDriveへ切替)"
+            log(f"DL開始: {tag} ({repo})")
+            rc = _run_with_stall_watch([sys.executable, "-c", _code],
+                                       dict(os.environ), log, tag,
+                                       stall_secs=30)
+            if rc == 0 and not _snap_valid(local):
+                marker.touch()
+                return str(local)
+            _HF_STALLED = True
+            log("HFが進まないためDriveキャッシュへ切り替えます")
+        else:
+            log("HF先行チャレンジをスキップ (このセッションで停滞済み) — "
+                "Driveキャッシュから取得します")
         for att in (1, 2):
             log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
             shutil.copytree(dsrc, local, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns(".cache"))
             bad = _snap_valid(local)
             if not bad:
+                # Drive経由でも完成マーカーを打つ (v0.9.6: 打ち忘れで
+                # 2回目以降のロードが毎回ここへ落ちて再コピーしていた)
+                marker.touch()
                 return str(local)
             log(f"⚠ Driveから空のファイルを掴みました ({bad}) — Drive同期が"
                 f"未完の可能性。30秒待って再コピーします ({att}/2)")
@@ -1522,6 +1550,7 @@ class IllustriousAdapter(VideoAdapter):
 
     def unload(self, log):
         self.pipe = None
+        self._i2i_pipe = None
         self.loaded = False
 
     def _want_ckpt(self, extra: dict) -> tuple:
@@ -1577,18 +1606,41 @@ class IllustriousAdapter(VideoAdapter):
             pose = pose.resize((w, h), Image.LANCZOS)
         steps = max(8, int(req.steps or 28))
         scale = float(req.extra.get("controlnet_scale", 0.9))
-        log(f"t2i生成: {w}x{h} steps={steps} cfg={req.guidance} "
-            f"CN openpose={scale}")
         g = torch.Generator("cpu").manual_seed(req.seed)
         kw = dict(prompt=req.prompt,
                   negative_prompt=req.negative or self.NEG,
-                  image=pose,
                   controlnet_conditioning_scale=scale,
-                  num_inference_steps=steps,
                   guidance_scale=float(req.guidance or 6.0),
-                  width=w, height=h, generator=g,
-                  callback_on_step_end=_step_callback(progress, steps))
-        out = _call_with_optional_kwargs(self.pipe, kw,
+                  generator=g)
+        if req.mode == "i2i" and req.images:
+            # マネキンコンパス下地のi2i (v0.9.6): マゼンタ背景とセル配置・
+            # 向きを下地から引き継ぐ (t2iは背景色指定を無視し、斜め45°を
+            # 正面/背面へ丸める実測への対策)。骨格CNはt2iと同じく併用
+            from diffusers import StableDiffusionXLControlNetImg2ImgPipeline
+            init = req.images[0].convert("RGB")
+            if init.size != (w, h):
+                init = init.resize((w, h), Image.LANCZOS)
+            den = float(req.extra.get("denoise", 0.7))
+            pipe = getattr(self, "_i2i_pipe", None)
+            if pipe is None:
+                # 部品共有の別ファサード (VRAM追加なし)
+                pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pipe(
+                    self.pipe)
+                self._i2i_pipe = pipe
+            eff = max(1, int(round(steps * den)))
+            log(f"i2i生成: {w}x{h} steps={steps} denoise={den} "
+                f"cfg={req.guidance} CN openpose={scale}")
+            kw.update(image=init, control_image=pose, strength=den,
+                      num_inference_steps=steps,
+                      callback_on_step_end=_step_callback(progress, eff))
+        else:
+            pipe = self.pipe
+            log(f"t2i生成: {w}x{h} steps={steps} cfg={req.guidance} "
+                f"CN openpose={scale}")
+            kw.update(image=pose, num_inference_steps=steps,
+                      width=w, height=h,
+                      callback_on_step_end=_step_callback(progress, steps))
+        out = _call_with_optional_kwargs(pipe, kw,
                                          ["callback_on_step_end"], log)
         img = out.images[0] if hasattr(out, "images") else out[0][0]
         dst = workdir / "out.png"
