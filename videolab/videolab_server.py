@@ -44,9 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.3"   # 0.9.3: セッションディスクの既存コピーを再利用 —
-#         モデル切替のたびにDriveから~19GBを再コピーしていた (2回目以降の
-#         生成が無駄に低速)。0.9.2: スナップショットのマニフェスト照合 —
+__version__ = "0.9.4"   # 0.9.4: HF先行チャレンジ — Driveの保険がある
+#         ときだけHFを1回試し (10秒毎監視)、停滞30秒で即Driveへ切替。
+#         健康なHF(トークン認証)はDrive読みの約2倍速い。0.9.3: セッション
+#         ディスクの既存コピーを再利用 — モデル切替のたびにDriveから
+#         ~19GBを再コピーしていた。0.9.2: スナップショットのマニフェスト照合 —
 #         Drive同期未完だと大きいシャードが丸ごと欠ける (実障害:
 #         text_encoderのsafetensorsがFileNotFound)。.manifest.jsonの
 #         パス+サイズ台帳と照合し、欠けは「同期未完了の疑い」で明示。
@@ -354,7 +356,25 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
             or dst.stat().st_size == dsrc.stat().st_size):
         log(f"セッションディスクの既存コピーを再利用: {filename}")
         return str(dst)
+    code = ("from huggingface_hub import hf_hub_download; "
+            f"hf_hub_download({repo!r}, {filename!r})")
     if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
+        # HF先行チャレンジ (v0.9.4、ユーザー要望「トークンせっかく用意
+        # してるから最初1回だけHFからDLチャレンジして、10秒ごとに監視、
+        # 駄目ならドライブへ」)。健康なHFはDrive FUSE読み(~150MB/s)の
+        # 約2倍速い。Driveの保険があるときだけ試し、30秒停滞で即切替
+        tag = "HF先行チャレンジ (停滞30秒でDriveへ切替)"
+        log(f"DL開始: {tag}")
+        rc = _run_with_stall_watch([sys.executable, "-c", code],
+                                   dict(os.environ), log, tag,
+                                   stall_secs=30)
+        if rc == 0:
+            try:
+                return hf_hub_download(repo, filename,
+                                       local_files_only=True)
+            except Exception:
+                pass
+        log("HFが進まないためDriveキャッシュへ切り替えます")
         want_sz = dsrc.stat().st_size
         for att in (1, 2):
             log(f"Driveキャッシュからコピー: {filename} "
@@ -484,7 +504,23 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         shutil.rmtree(local, ignore_errors=True)
     dc = _drive_cache_dir()
     dsrc = (dc / "_snap" / name) if dc else None
+    _ig = ("['transformer/*.safetensors','transformer_2/*.safetensors',"
+           "'*.bin','*.md','.git*']")
+    _code = ("from huggingface_hub import snapshot_download; "
+             f"snapshot_download({repo!r}, local_dir={str(local)!r}, "
+             f"ignore_patterns={_ig})")
     if dsrc is not None and (dsrc / ".complete").is_file():
+        # HF先行チャレンジ (v0.9.4): Driveの保険があるときだけ1回試す。
+        # 停滞30秒で即Driveへ切替 (10秒ごと監視は_run_with_stall_watch)
+        tag = "ベース部品HF先行チャレンジ (停滞30秒でDriveへ切替)"
+        log(f"DL開始: {tag} ({repo})")
+        rc = _run_with_stall_watch([sys.executable, "-c", _code],
+                                   dict(os.environ), log, tag,
+                                   stall_secs=30)
+        if rc == 0 and not _snap_valid(local):
+            marker.touch()
+            return str(local)
+        log("HFが進まないためDriveキャッシュへ切り替えます")
         for att in (1, 2):
             log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
             shutil.copytree(dsrc, local, dirs_exist_ok=True,
