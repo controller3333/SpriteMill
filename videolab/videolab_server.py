@@ -44,7 +44,10 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.0"   # 0.9.0: /healthにdrive状態 (only/mounted/ready) —
+__version__ = "0.9.1"   # 0.9.1: Drive読みの健全性検査 — FUSEは同期未完の
+#         ファイルを「サイズはあるのに空/短い」で読ませる (実障害:
+#         config.json 0バイト)。JSON検証+サイズ照合+再試行+明示エラー。
+#         0.9.0: /healthにdrive状態 (only/mounted/ready) —
 #         ⚡自動運転のマウント承諾待ちゲート用。0.8.9: 初回セットアップセル
 #         (populate_drive:
 #         配置済みなら数秒スキップ・不足分だけHFから取得してDriveへ配置。
@@ -340,10 +343,23 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
     dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
-        log(f"Driveキャッシュからコピー: {filename} "
-            f"({dsrc.stat().st_size / 2**30:.1f}GB・HF不要)")
-        shutil.copy2(dsrc, dst)
-        return str(dst)
+        want_sz = dsrc.stat().st_size
+        for att in (1, 2):
+            log(f"Driveキャッシュからコピー: {filename} "
+                f"({want_sz / 2**30:.1f}GB・HF不要)")
+            shutil.copy2(dsrc, dst)
+            got_sz = dst.stat().st_size if dst.is_file() else 0
+            if got_sz == want_sz:
+                return str(dst)
+            # Drive FUSEは同期未完のファイルを短く読ませることがある
+            # (2026-07-14実障害と同族) — サイズ照合で検出して再試行
+            log(f"⚠ コピーがサイズ不一致 ({got_sz}/{want_sz}) — Drive同期"
+                f"未完の疑い。30秒待って再コピー ({att}/2)")
+            dst.unlink(missing_ok=True)
+            time.sleep(30)
+        raise RuntimeError(
+            f"Driveの {filename} が読み切れません (同期未完了の疑い)。"
+            "PC側のGoogle Drive同期の完了を待ってからやり直してください")
     if _drive_only():
         # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
         raise _drive_only_error(filename, dsrc)
@@ -417,14 +433,46 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     name = repo.replace("/", "--")
     local = WORK_ROOT / "_snap" / name
     marker = local / ".complete"
+
+    def _snap_valid(root: Path) -> str:
+        """スナップショットの健全性検査 (v0.9.1)。Drive FUSEは同期未完の
+        ファイルを『サイズはあるのに読むと空』で返すことがある (2026-07-14
+        実障害: config.jsonが0バイトでJSONDecodeError)。全JSONのパースと
+        非空を確かめ、問題があればその相対パスを返す (""=健全)。"""
+        import json as _json
+        for jp in root.rglob("*.json"):
+            if ".cache" in jp.parts:
+                continue
+            try:
+                if not _json.loads(jp.read_text(encoding="utf-8")):
+                    return str(jp.relative_to(root))
+            except Exception:
+                return str(jp.relative_to(root))
+        return ""
+
     if marker.is_file():
-        return str(local)
+        bad = _snap_valid(local)
+        if not bad:
+            return str(local)
+        log(f"⚠ ローカルスナップショット破損 ({bad}) — 取り直します")
+        shutil.rmtree(local, ignore_errors=True)
     dc = _drive_cache_dir()
     dsrc = (dc / "_snap" / name) if dc else None
     if dsrc is not None and (dsrc / ".complete").is_file():
-        log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
-        shutil.copytree(dsrc, local, dirs_exist_ok=True)
-        return str(local)
+        for att in (1, 2):
+            log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
+            shutil.copytree(dsrc, local, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(".cache"))
+            bad = _snap_valid(local)
+            if not bad:
+                return str(local)
+            log(f"⚠ Driveから空のファイルを掴みました ({bad}) — Drive同期が"
+                f"未完の可能性。30秒待って再コピーします ({att}/2)")
+            shutil.rmtree(local, ignore_errors=True)
+            time.sleep(30)
+        raise RuntimeError(
+            f"Driveのベース部品 {repo} が読み切れません (同期未完了の疑い)。"
+            "PC側のGoogle Drive同期の完了を待ってからやり直してください")
     if _drive_only():
         # Colab=完全Drive固定 (v0.8.8): HFへは一切行かない
         raise _drive_only_error(f"ベース部品 {repo}",
