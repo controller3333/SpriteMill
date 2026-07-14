@@ -92,6 +92,13 @@ else:
 
     c3 = "%%writefile videolab_server.py\n" + code
 
+    c35 = """# ---- 3.5) モデルのDrive配置チェック (初回だけHFから取得) ----
+# 配置済みなら数秒でスキップします (Run All 毎回実行しても安全)。
+# 未配置のときだけ、HFから一度だけ取得してDriveへ配置します (30〜60分)。
+# ※共有フォルダ利用の人 (配布リンクからショートカット追加) は常にスキップ
+import videolab_server
+videolab_server.populate_drive()"""
+
     c4 = """# ---- 4) サーバ起動 + トンネル公開 (URL/TOKEN が表示される) ----
 import sys, importlib
 import videolab_server
@@ -159,7 +166,8 @@ while True:
             "language_info": {"name": "python"},
         },
         "cells": [_cell("markdown", md0), _cell("code", c1), _cell("code", c2),
-                  _cell("code", c3), _cell("code", c4), _cell("code", c5)],
+                  _cell("code", c3), _cell("code", c35),
+                  _cell("code", c4), _cell("code", c5)],
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding="utf-8")

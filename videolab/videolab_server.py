@@ -44,12 +44,12 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.8"   # 0.8.8: Colabは完全Drive固定 (VIDEOLAB_DRIVE_ONLY、
-#         HF直DLを封止 — 毎回DLは429で詰まると実証されたため)。handoffも
-#         snapshot経由へ。0.8.7: Driveモデルキャッシュ+curl -f修正+
-#         ベース部品/LoRAも多段DL。0.8.6: DL経路多段。0.8.5: 停滞自動再接続
-#         +HFトークン。0.8.4: hf_transfer撤去。0.8.3: ロード鼓動。
-#         0.8.2: L4対応 (UMT5遅延+block offload)。latent_refine既定
+__version__ = "0.8.9"   # 0.8.9: 初回セットアップセル (populate_drive:
+#         配置済みなら数秒スキップ・不足分だけHFから取得してDriveへ配置。
+#         Run All毎回で安全)。0.8.8: Colabは完全Drive固定 (HF直DL封止)。
+#         0.8.7: Driveキャッシュ+curl -f修正。0.8.6: DL経路多段。
+#         0.8.5: 停滞自動再接続+HFトークン。0.8.4: hf_transfer撤去。
+#         0.8.3: ロード鼓動。0.8.2: L4対応。latent_refine既定
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -308,8 +308,28 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
          サイズ1GB未満も失敗扱い)
     成功したらDriveキャッシュへ自動書き戻し (次セッションからHF不要)。"""
     from huggingface_hub import hf_hub_download
+    dc = _drive_cache_dir()
+    dsrc = (dc / repo.replace("/", "--") / filename) if dc else None
+
+    def _writeback(src: str) -> None:
+        """Drive書き戻し (populate再実行でも収束するようキャッシュ命中時も
+        行う)。"""
+        if dsrc is None or dsrc.is_file():
+            return
+        try:
+            log(f"Driveキャッシュへ書き戻し: {filename} (次セッションから"
+                "HF不要になります)")
+            dsrc.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dsrc.with_suffix(dsrc.suffix + ".part")
+            shutil.copy2(src, tmp)
+            tmp.rename(dsrc)
+        except OSError as e:
+            log(f"Drive書き戻しスキップ: {str(e)[:120]}")
+
     try:
-        return hf_hub_download(repo, filename, local_files_only=True)
+        got0 = hf_hub_download(repo, filename, local_files_only=True)
+        _writeback(got0)
+        return got0
     except TypeError:
         # テストの偽hf_hub_download(位置引数のみ)はそのまま呼ぶ
         return hf_hub_download(repo, filename)
@@ -317,8 +337,6 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         pass
     dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dc = _drive_cache_dir()
-    dsrc = (dc / repo.replace("/", "--") / filename) if dc else None
     if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
         log(f"Driveキャッシュからコピー: {filename} "
             f"({dsrc.stat().st_size / 2**30:.1f}GB・HF不要)")
@@ -380,16 +398,7 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
             "429拒否 (IP/アカウントのDL割当) の可能性。①ランタイムを終了して"
             "別VMを引き直す ②DriveキャッシュにGGUFを置く (ノートの"
             "DRIVE_CACHEセル参照) のどちらかで回避できます")
-    if dsrc is not None and not dsrc.is_file():
-        try:
-            log(f"Driveキャッシュへ書き戻し: {filename} (次セッションから"
-                "HF不要になります)")
-            dsrc.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dsrc.with_suffix(dsrc.suffix + ".part")
-            shutil.copy2(got, tmp)
-            tmp.rename(dsrc)
-        except OSError as e:
-            log(f"Drive書き戻しスキップ: {str(e)[:120]}")
+    _writeback(got)
     return got
 
 
@@ -448,6 +457,90 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         except OSError as e:
             log(f"Drive書き戻しスキップ: {str(e)[:120]}")
     return str(local)
+
+
+def _drive_manifest() -> list:
+    """Drive固定運転が要求する全部品 (Q4_0既定構成、v0.8.9)。
+    リポ名はアダプタ定数から導出してドリフトを防ぐ。"""
+    va = ADAPTERS.get("vace")
+    an = ADAPTERS.get("anisora")
+    rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
+                         "lightx2v/Wan2.2-Lightning")
+    fold = os.environ.get("VIDEOLAB_VACE_LORA_DIR",
+                          "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
+    return [
+        ("file", va.gguf_repo,
+         "HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-Q4_0.gguf"),
+        ("file", va.gguf_repo,
+         "LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-Q4_0.gguf"),
+        ("file", an.gguf_repo, "High/Index-Anisora-V3.2-High-Q4_0.gguf"),
+        ("file", an.gguf_repo, "Low/Index-Anisora-V3.2-Low-Q4_0.gguf"),
+        ("file", rep, f"{fold}/high_noise_model.safetensors"),
+        ("file", rep, f"{fold}/low_noise_model.safetensors"),
+        ("snap", va.repo, None),
+        ("snap", an.base_repo, None),
+    ]
+
+
+def drive_cache_ready() -> tuple:
+    """(全部品が揃っているか, 不足リスト)。LoRAは1.2GBなので1GiB閾値、
+    それ以外のGGUFも同閾値 (エラーページ等のゴミを完備と誤認しない)。"""
+    dc = _drive_cache_dir()
+    if dc is None:
+        return False, ["(Drive未マウント)"]
+    missing = []
+    for kind, repo, fname in _drive_manifest():
+        if kind == "file":
+            p = dc / repo.replace("/", "--") / fname
+            if not (p.is_file() and p.stat().st_size > 2**30):
+                missing.append(f"{repo}/{fname}")
+        elif not (dc / "_snap" / repo.replace("/", "--")
+                  / ".complete").is_file():
+            missing.append(f"_snap/{repo}")
+    return not missing, missing
+
+
+def populate_drive(log=print, wait_mount_secs: int = 180) -> bool:
+    """初回セットアップ: Driveに不足しているモデルをHFから一度だけ取得して
+    配置する (ノートのセル3.5)。**配置済みなら数秒でスキップ**するので、
+    ⚡自動運転のRun Allで毎回実行されても安全 (2026-07-14ユーザー要件
+    「DL済みならやらない感じの」)。取得中だけDrive固定を解除し、
+    _hf_download/_snapshot_localの自動書き戻しがDriveへ配置する。"""
+    deadline = time.time() + wait_mount_secs
+    while _drive_cache_dir() is None and time.time() < deadline:
+        time.sleep(3)   # セル2のマウンドスレッド完了待ち
+    if _drive_cache_dir() is None:
+        log("⚠ Driveが未マウントです — セル2の認可ポップアップに「許可」して"
+            "から、このセルを再実行してください")
+        return False
+    ok, missing = drive_cache_ready()
+    if ok:
+        log("モデル配置済み — セットアップをスキップ (Drive固定運転OK)")
+        return True
+    log(f"Driveに未配置のモデル {len(missing)}件 — HFから一度だけ取得して"
+        "配置します (初回のみ・30〜60分。以後のセッションはスキップ)")
+    dc = _drive_cache_dir()
+    prev = os.environ.pop("VIDEOLAB_DRIVE_ONLY", None)
+    try:
+        for kind, repo, fname in _drive_manifest():
+            if kind == "file":
+                p = dc / repo.replace("/", "--") / fname
+                if p.is_file() and p.stat().st_size > 2**30:
+                    continue
+                _hf_download(repo, fname, log)
+            else:
+                if (dc / "_snap" / repo.replace("/", "--")
+                        / ".complete").is_file():
+                    continue
+                _snapshot_local(repo, log)
+    finally:
+        if prev is not None:
+            os.environ["VIDEOLAB_DRIVE_ONLY"] = prev
+    ok, missing = drive_cache_ready()
+    log("配置完了 — Drive固定運転OK" if ok
+        else f"⚠ 配置しきれませんでした (HF側の渋滞の可能性): {missing} — "
+             "このセルの再実行で続きから再開できます")
+    return ok
 
 
 def _repo_cache_dir(repo: str) -> Path:
