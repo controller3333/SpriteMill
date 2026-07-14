@@ -115,7 +115,8 @@ while True:
             if jid not in _bars:
                 _bars[jid] = tqdm(
                     total=100, desc=f'生成 {jid[:8]}',
-                    bar_format='{desc} {percentage:3.0f}%|{bar}| {postfix}')
+                    bar_format=('{desc} {percentage:3.0f}%|{bar}| '
+                                '{elapsed} {postfix}'))
             b = _bars[jid]
             b.n = int(p * 100)
             b.set_postfix_str(info, refresh=False)

@@ -44,9 +44,10 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.2"   # 0.8.2: 素のvace/anisoraをL4対応 — UMT5遅延ロード
-#         (低RAM VM) + block offload (GGUF×seq非互換の代替) をlatent再加工
-#         経路に開通。latent_refine既定化のサーバ側前提
+__version__ = "0.8.3"   # 0.8.3: ロード鼓動 — モデルDL/読込中もジョブ進捗を
+#         刻む (ゲージ凍結不安の解消)。0.8.2: 素のvace/anisoraをL4対応 —
+#         UMT5遅延ロード (低RAM VM) + block offload (GGUF×seq非互換の代替)
+#         をlatent再加工経路に開通。latent_refine既定化のサーバ側前提
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -2686,6 +2687,14 @@ def worker_loop():
             line = f"[{time.strftime('%H:%M:%S')}] {msg}"
             _j["log"].append(line)
             print(f"[{_j['id']}] {msg}", flush=True)
+            # ロード鼓動 (v0.8.3): モデルDL/読み込み中はログ1行ごとに
+            # 進捗を+1%刻む (上限10%)。「ゲージが全く動かない」不安の解消
+            # — denoise開始で_step_callbackが5%+から上書きし単調性は
+            # クライアント側(_bump_progress)が保証する
+            if _j.get("status") == "loading":
+                _j["progress"] = min(0.10,
+                                     round(float(_j.get("progress") or 0)
+                                           + 0.01, 4))
 
         def progress(p, _j=j):
             _j["progress"] = round(float(p), 4)
