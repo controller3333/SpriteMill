@@ -1498,11 +1498,13 @@ class IllustriousAdapter(VideoAdapter):
             "extra例: {\"controlnet_scale\": 0.9}")
     requires = "Colab T4/L4 / ローカル8GB+ (fp16・DL約10GB)"
     modes = ("t2i",)
+    # 既定はv2.0 (2026-07-14ユーザー指定「高い安定してるやつ」。公開・
+    # ゲートなし・ε-pred。v0.1はextra.ill_repo/ill_fileで戻せる)
     ckpt_repo = os.environ.get(
         "VIDEOLAB_ILLUSTRIOUS_REPO",
-        "OnomaAIResearch/Illustrious-xl-early-release-v0")
+        "OnomaAIResearch/Illustrious-XL-v2.0")
     ckpt_file = os.environ.get("VIDEOLAB_ILLUSTRIOUS_FILE",
-                               "Illustrious-XL-v0.1.safetensors")
+                               "Illustrious-XL-v2.0.safetensors")
     cn_repo = os.environ.get("VIDEOLAB_ILLUSTRIOUS_CN",
                              "xinsir/controlnet-openpose-sdxl-1.0")
     vae_repo = "madebyollin/sdxl-vae-fp16-fix"
@@ -1522,13 +1524,20 @@ class IllustriousAdapter(VideoAdapter):
         self.pipe = None
         self.loaded = False
 
+    def _want_ckpt(self, extra: dict) -> tuple:
+        e = extra or {}
+        return (str(e.get("ill_repo") or self.ckpt_repo),
+                str(e.get("ill_file") or self.ckpt_file))
+
     def ensure_loaded(self, log):
         _require_deps(log)
         import torch
         from diffusers import (AutoencoderKL, ControlNetModel,
                                EulerAncestralDiscreteScheduler,
                                StableDiffusionXLControlNetPipeline)
-        ck = _hf_download(self.ckpt_repo, self.ckpt_file, log)
+        repo, fname = self._want_ckpt(getattr(self, "_next_extra", {}))
+        ck = _hf_download(repo, fname, log)
+        self._loaded_ckpt = (repo, fname)
         cn_dir = _snapshot_local(self.cn_repo, log)
         vae_dir = _snapshot_local(self.vae_repo, log)
         log("Illustrious-XL 読み込み (fp16) + OpenPose ControlNet")
@@ -1549,7 +1558,13 @@ class IllustriousAdapter(VideoAdapter):
                  progress) -> Path:
         import torch
         from PIL import Image
+        want = self._want_ckpt(req.extra)
+        if self.loaded and want != getattr(self, "_loaded_ckpt", want):
+            log(f"チェックポイント変更 -> {want[1]}: 積み替えます")
+            self.unload(log)
+            _free_cuda(log)
         if not self.loaded:
+            self._next_extra = dict(req.extra or {})
             self.ensure_loaded(log)
         w = _snap(req.width, 8, 512)
         h = _snap(req.height, 8, 512)
