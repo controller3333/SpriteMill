@@ -44,7 +44,9 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.2"   # 0.9.2: スナップショットのマニフェスト照合 —
+__version__ = "0.9.3"   # 0.9.3: セッションディスクの既存コピーを再利用 —
+#         モデル切替のたびにDriveから~19GBを再コピーしていた (2回目以降の
+#         生成が無駄に低速)。0.9.2: スナップショットのマニフェスト照合 —
 #         Drive同期未完だと大きいシャードが丸ごと欠ける (実障害:
 #         text_encoderのsafetensorsがFileNotFound)。.manifest.jsonの
 #         パス+サイズ台帳と照合し、欠けは「同期未完了の疑い」で明示。
@@ -344,6 +346,14 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         pass
     dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
     dst.parent.mkdir(parents=True, exist_ok=True)
+    # セッションディスクの前回コピーを再利用 (v0.9.3、2026-07-14ユーザー
+    # 指摘「2回目以降の生成もドライブから毎回DLしてる」— モデル切替の
+    # たびに~19GBを再コピーしていた)。Driveの原本とサイズ一致なら採用
+    if dst.is_file() and dst.stat().st_size > 2**30 and (
+            dsrc is None or not dsrc.is_file()
+            or dst.stat().st_size == dsrc.stat().st_size):
+        log(f"セッションディスクの既存コピーを再利用: {filename}")
+        return str(dst)
     if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
         want_sz = dsrc.stat().st_size
         for att in (1, 2):
