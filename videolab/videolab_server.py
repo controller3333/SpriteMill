@@ -44,9 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.1"   # 0.9.1: Drive読みの健全性検査 — FUSEは同期未完の
-#         ファイルを「サイズはあるのに空/短い」で読ませる (実障害:
-#         config.json 0バイト)。JSON検証+サイズ照合+再試行+明示エラー。
+__version__ = "0.9.2"   # 0.9.2: スナップショットのマニフェスト照合 —
+#         Drive同期未完だと大きいシャードが丸ごと欠ける (実障害:
+#         text_encoderのsafetensorsがFileNotFound)。.manifest.jsonの
+#         パス+サイズ台帳と照合し、欠けは「同期未完了の疑い」で明示。
+#         0.9.1: Drive読みの健全性検査 (空JSON/サイズ不一致)。
 #         0.9.0: /healthにdrive状態 (only/mounted/ready) —
 #         ⚡自動運転のマウント承諾待ちゲート用。0.8.9: 初回セットアップセル
 #         (populate_drive:
@@ -435,13 +437,27 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     marker = local / ".complete"
 
     def _snap_valid(root: Path) -> str:
-        """スナップショットの健全性検査 (v0.9.1)。Drive FUSEは同期未完の
-        ファイルを『サイズはあるのに読むと空』で返すことがある (2026-07-14
-        実障害: config.jsonが0バイトでJSONDecodeError)。全JSONのパースと
-        非空を確かめ、問題があればその相対パスを返す (""=健全)。"""
+        """スナップショットの健全性検査 (v0.9.1-0.9.2)。
+
+        ①.manifest.json (PC配置時に生成した 相対パス→サイズ の台帳) と
+        照合 — Drive同期が未完だと大きいシャードが丸ごと欠ける実障害
+        (2026-07-14: text_encoderのsafetensorsがFileNotFound)。
+        ②全JSONのパース — FUSEは同期未完ファイルを『サイズはあるのに
+        読むと空』で返す実障害 (config.json 0バイト)。
+        問題があればその相対パスを返す (""=健全)。"""
         import json as _json
+        mf = root / ".manifest.json"
+        if mf.is_file():
+            try:
+                man = _json.loads(mf.read_text(encoding="utf-8"))
+            except Exception:
+                return ".manifest.json"
+            for rel, size in man.items():
+                p = root / rel
+                if not p.is_file() or p.stat().st_size != int(size):
+                    return rel
         for jp in root.rglob("*.json"):
-            if ".cache" in jp.parts:
+            if ".cache" in jp.parts or jp.name == ".manifest.json":
                 continue
             try:
                 if not _json.loads(jp.read_text(encoding="utf-8")):
@@ -503,7 +519,16 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     if dsrc is not None and not (dsrc / ".complete").is_file():
         try:
             log(f"Driveキャッシュへベース部品を書き戻し: {repo}")
-            shutil.copytree(local, dsrc, dirs_exist_ok=True)
+            shutil.copytree(local, dsrc, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(".cache"))
+            # マニフェスト (v0.9.2): 次セッションが同期未完を検出できる
+            import json as _json
+            man = {f.relative_to(local).as_posix(): f.stat().st_size
+                   for f in local.rglob("*")
+                   if f.is_file() and ".cache" not in f.parts
+                   and f.name not in (".complete", ".manifest.json")}
+            (dsrc / ".manifest.json").write_text(
+                _json.dumps(man, ensure_ascii=False), encoding="utf-8")
         except OSError as e:
             log(f"Drive書き戻しスキップ: {str(e)[:120]}")
     return str(local)
