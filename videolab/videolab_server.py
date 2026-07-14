@@ -44,10 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.3"   # 0.8.3: ロード鼓動 — モデルDL/読込中もジョブ進捗を
-#         刻む (ゲージ凍結不安の解消)。0.8.2: 素のvace/anisoraをL4対応 —
-#         UMT5遅延ロード (低RAM VM) + block offload (GGUF×seq非互換の代替)
-#         をlatent再加工経路に開通。latent_refine既定化のサーバ側前提
+__version__ = "0.8.4"   # 0.8.4: hf_transfer撤去 (DL無限ハング実障害) +
+#         DL進捗ウォッチャ。0.8.3: ロード鼓動 — モデルDL/読込中もジョブ
+#         進捗を刻む。0.8.2: 素のvace/anisoraをL4対応 — UMT5遅延ロード
+#         (低RAM VM) + block offload (GGUF×seq非互換の代替) をlatent
+#         再加工経路に開通。latent_refine既定化のサーバ側前提
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -86,18 +87,17 @@ COLAB_PIP = [
     "fastapi uvicorn pillow imageio-ffmpeg",
     "-U \"diffusers>=0.39.0\" transformers accelerate safetensors sentencepiece",
     # ftfy=Wan系プロンプト前処理 / gguf=GGUF量子化ロード / peft=LoRA
-    # hf_transfer=HF並列DL(Colab⇔HFで500MB/s超。60GB初回が1-2分)
-    "ftfy gguf peft hf_transfer",
+    # (hf_transferはv0.8.4で撤去 — 無限ハング障害。下のコメント参照)
+    "ftfy gguf peft",
 ]
 
-# hf_transferが入っていればHFダウンロードを並列化する (未導入なら従来DL。
-# 「毎回DLよりドライブ読みが速いのでは」2026-07-13の疑問への回答は逆で、
-# ColabのDriveマウントは30-80MB/s、HF直DLは実測280MB/s+hf_transferで更に上)
-try:
-    import hf_transfer  # noqa: F401
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-except ImportError:
-    pass
+# hf_transferは撤去 (v0.8.4、2026-07-14実障害): 接続が途中停止すると
+# エラーもタイムアウトも出さず永久に固まる (ユーザー実機で再現3回以上:
+# GGUF DLのログ行から進まず、ディスク使用量も60秒間±0で完全停止)。
+# 標準のPythonダウンローダはHF_HUB_DOWNLOAD_TIMEOUT(既定10秒)の
+# 読み取りタイムアウト→自動リトライ+.incompleteからの再開があるので
+# 無限ハングしない。速度は実測280MB/s (60GB初回でも数分) で十分。
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 # ---------------------------------------------------------------- 基本設定
 HERE = Path(__file__).resolve().parent
@@ -2738,7 +2738,39 @@ def worker_loop():
                 j["status"] = "loading"
                 j["detail"] = f"{adapter.label} を読み込み中(初回はDLに数分〜数十分)"
                 t0 = time.time()
-                adapter.ensure_loaded(log)
+                # DL進捗ウォッチャ (v0.8.4): HFキャッシュ実サイズを20秒毎に
+                # 見て進行をログへ (ログ行はロード鼓動=ゲージ+1%も兼ねる)。
+                # 成長ゼロが続くときは停滞を明示 — 「固まった?」の判別材料
+                _done = threading.Event()
+
+                def _dl_watch(_a=adapter):
+                    repos = (getattr(_a, "cache_repos", None)
+                             or [getattr(_a, "repo", "")])
+                    last = -1.0
+                    still = 0
+                    while not _done.wait(20):
+                        try:
+                            cur = sum(_repo_cache_gb(r) for r in repos if r)
+                        except Exception:
+                            continue
+                        if last < 0:
+                            last = cur
+                            continue
+                        if cur - last > 0.05:
+                            log(f"DL/読込 進行中: キャッシュ {cur:.1f}GB "
+                                f"(+{cur - last:.1f}GB/20s)")
+                            still = 0
+                        else:
+                            still += 1
+                            if still in (3, 9):
+                                log(f"⚠ DLが{still * 20}秒進んでいません "
+                                    "(HF側の一時渋滞の可能性・リトライ待ち)")
+                        last = cur
+                threading.Thread(target=_dl_watch, daemon=True).start()
+                try:
+                    adapter.ensure_loaded(log)
+                finally:
+                    _done.set()
                 log(f"モデル準備完了 ({time.time() - t0:.0f}s)")
             CURRENT_MODEL = j["model"]
 
