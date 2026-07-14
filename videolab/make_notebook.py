@@ -60,7 +60,7 @@ webUI のモデル説明欄に表示される。
 !chmod +x /usr/local/bin/cloudflared
 print('setup done -- 次の cell 2 が一度だけ自動再起動します')"""
 
-    c2 = """# ---- 2) 依存を確定させる一度きりの自動再起動 ----
+    c2 = """# ---- 2) 依存の確定再起動 + Google Driveモデルキャッシュ (任意) ----
 # ★再起動で Run All は一旦止まります。再接続後もう一度【すべてのセルを実行】を。
 import os
 _sentinel = '/content/_sm_videolab_restarted'
@@ -69,7 +69,24 @@ if not os.path.exists(_sentinel):
     print('依存確定のため一度ランタイムを再起動します… 再接続後もう一度 Run All')
     os.kill(os.getpid(), 9)
 else:
-    print('再起動済み — cell 3 へ進みます')"""
+    print('再起動済み — cell 3 へ進みます')
+    # Driveキャッシュ: マウントできれば MyDrive/SpriteMill_models からモデルを
+    # 読み書きし、HuggingFaceのDL制限(429)を完全回避する。初回のみ認可の
+    # ポップアップに許可が必要(未認可なら黙ってスキップ=従来どおりHFからDL)。
+    # 一度どこかのセッションでDLに成功すると自動でDriveへ書き戻されるので、
+    # 以降のセッションはHFに触らず数分でモデルが揃う。
+    import threading
+    def _mount_drive():
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+            p = '/content/drive/MyDrive/SpriteMill_models'
+            os.makedirs(p, exist_ok=True)
+            os.environ['VIDEOLAB_DRIVE_CACHE'] = p
+            print('Driveモデルキャッシュ有効:', p)
+        except Exception as e:
+            print('Driveキャッシュなしで続行:', str(e)[:80])
+    threading.Thread(target=_mount_drive, daemon=True).start()"""
 
     c3 = "%%writefile videolab_server.py\n" + code
 

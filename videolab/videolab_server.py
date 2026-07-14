@@ -44,12 +44,12 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.8.6"   # 0.8.6: DL経路の多段フォールバック (Xet⇄従来CDN
-#         交互+curl直DL最終ライン。Colab→HF経路の窒息はトークンでも
-#         直らない=経路障害と確定したため経路自体を替える)。0.8.5: DL停滞
-#         の自動再接続+HFトークン対応。0.8.4: hf_transfer撤去 (無限ハング)
-#         +DL進捗ウォッチャ。0.8.3: ロード鼓動。0.8.2: 素のvace/anisoraを
-#         L4対応 (UMT5遅延+block offload)。latent_refine既定化の前提
+__version__ = "0.8.7"   # 0.8.7: Google Driveモデルキャッシュ (読み優先+
+#         自動書き戻し=HF不要化) + curl -f修正 (429エラーページを成功と
+#         誤認する実バグ) + ベース部品/LoRAも多段DL経路へ。0.8.6: DL経路の
+#         多段フォールバック (Xet⇄従来CDN+curl)。0.8.5: 停滞自動再接続+
+#         HFトークン。0.8.4: hf_transfer撤去+DLウォッチャ。0.8.3: ロード
+#         鼓動。0.8.2: L4対応 (UMT5遅延+block offload)。latent_refine既定
 # 0.7.5: 低RAM VM対策 (UMT5ジョブ毎解放+handoff先載せ順)
 # 0.7.4: handoffにblock offload (弱GPUで8方向まとめ維持・実験的)
 # 0.7.3: 既定量子化をQ4_0へ (16GB未満級上限方針・Q8はGUI撤廃)
@@ -268,17 +268,28 @@ def _run_with_stall_watch(cmd, env, log, tag, stall_secs=90) -> int:
         last = cur
 
 
-def _hf_download(repo: str, filename: str, log, attempts: int = 8,
-                 stall_secs: int = 90) -> str:
-    """モデルDLの多段フォールバック (v0.8.5-0.8.6)。
+def _drive_cache_dir() -> Path | None:
+    """Google Driveのモデルキャッシュ (v0.8.7)。ノートのDRIVE_CACHEセルが
+    マウント成功時に VIDEOLAB_DRIVE_CACHE を設定する。HFへ一切触らずに
+    毎セッション数分でモデルを積める恒久脱出路 (2026-07-14 HF側の
+    429拒否がIP/アカウント割当で解けなくなった際のお兄さま発案)。"""
+    p = os.environ.get("VIDEOLAB_DRIVE_CACHE", "").strip()
+    return Path(p) if p else None
 
-    実測 (2026-07-14): Colab VM→HF CDNの経路だけが「数GB流れて完全停止」
-    する (ローカル回線からは同一ファイルが全速=HF本体は健在、認証
-    トークンでも改善なし=権限でなく経路の問題)。対策は経路の切替:
-      試行1,3,5: hf_hub_download そのまま (Xetが入っていればXet経路)
-      試行2,4,6: HF_HUB_DISABLE_XET=1 (従来CDN経路へ強制)
-      試行7,8 : curl直DL (resolve URL・-C - resume・低速自動打ち切り)
-    いずれもディスク成長監視つきで、停滞したらkillして次へ。"""
+
+def _hf_download(repo: str, filename: str, log, attempts: int = 6,
+                 stall_secs: int = 90) -> str:
+    """モデルDLの多段フォールバック (v0.8.5-0.8.7)。
+
+    実測 (2026-07-14): Colab VM→HFが429で即拒否 (IP/無料アカウントの
+    ダウンロード割当を再試行の繰り返しで使い切り)。hf標準DLの「停止」の
+    正体は429の無言バックオフ。優先順:
+      0) Google Driveキャッシュにあればローカルへコピーして即返す
+      1,3,5) hf_hub_download (Xetが入っていればXet経路)
+      2,4) HF_HUB_DISABLE_XET=1 (従来CDN経路へ強制)
+      6) curl直DL (-f必須: エラーページを成功扱いした実バグの再発防止。
+         サイズ1GB未満も失敗扱い)
+    成功したらDriveキャッシュへ自動書き戻し (次セッションからHF不要)。"""
     from huggingface_hub import hf_hub_download
     try:
         return hf_hub_download(repo, filename, local_files_only=True)
@@ -287,18 +298,30 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 8,
         return hf_hub_download(repo, filename)
     except Exception:
         pass
+    dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dc = _drive_cache_dir()
+    dsrc = (dc / repo.replace("/", "--") / filename) if dc else None
+    if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
+        log(f"Driveキャッシュからコピー: {filename} "
+            f"({dsrc.stat().st_size / 2**30:.1f}GB・HF不要)")
+        shutil.copy2(dsrc, dst)
+        return str(dst)
+
+    def _ok(path: Path) -> bool:
+        return path.is_file() and path.stat().st_size > 2**30
+
+    got = None
     code = ("from huggingface_hub import hf_hub_download; "
             f"hf_hub_download({repo!r}, {filename!r})")
-    curl_dst = WORK_ROOT / "_dl" / repo.replace("/", "--") / filename
     for att in range(1, attempts + 1):
         env = dict(os.environ)
-        if att >= attempts - 1:
-            # curl直DL: hf経路が全滅したときの最終ライン。-C - で続きから、
-            # 30秒間 500KB/s を下回ったら自ら切断してリトライへ
-            curl_dst.parent.mkdir(parents=True, exist_ok=True)
+        if att >= attempts:
             url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-            cmd = ["curl", "-sSL", "-C", "-", "--speed-limit", "500000",
-                   "--speed-time", "30", "-o", str(curl_dst), url]
+            # -f: HTTPエラー時は失敗扱い (無いと429のエラーページを保存して
+            # 成功と誤認する — 2026-07-14実バグ)
+            cmd = ["curl", "-fsSL", "-C", "-", "--speed-limit", "500000",
+                   "--speed-time", "30", "-o", str(dst), url]
             tok = os.environ.get("HF_TOKEN", "")
             if tok:
                 cmd[1:1] = ["-H", f"Authorization: Bearer {tok}"]
@@ -314,15 +337,93 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 8,
         rc = _run_with_stall_watch(cmd, env, log, tag,
                                    stall_secs=stall_secs)
         if rc == 0:
-            if att >= attempts - 1:
-                log(f"curl直DL成功: {curl_dst.name}")
-                return str(curl_dst)
-            return hf_hub_download(repo, filename, local_files_only=True)
+            if att >= attempts:
+                if _ok(dst):
+                    got = str(dst)
+                    break
+                log("curl直DL: サイズ不足 (エラー応答の可能性) -> 失敗扱い")
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                try:
+                    got = hf_hub_download(repo, filename,
+                                          local_files_only=True)
+                    break
+                except Exception:
+                    pass
         time.sleep(min(60, 5 * att))
-    raise RuntimeError(
-        f"モデルDLが{attempts}回とも停滞しました: {repo}/{filename} — "
-        "Colab→HFの経路障害の可能性。ランタイムを一度終了して別のVM"
-        "(別リージョン)を引き直すと直ることがあります")
+    if not got:
+        raise RuntimeError(
+            f"モデルDLが{attempts}回とも失敗: {repo}/{filename} — HF側の"
+            "429拒否 (IP/アカウントのDL割当) の可能性。①ランタイムを終了して"
+            "別VMを引き直す ②DriveキャッシュにGGUFを置く (ノートの"
+            "DRIVE_CACHEセル参照) のどちらかで回避できます")
+    if dsrc is not None and not dsrc.is_file():
+        try:
+            log(f"Driveキャッシュへ書き戻し: {filename} (次セッションから"
+                "HF不要になります)")
+            dsrc.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dsrc.with_suffix(dsrc.suffix + ".part")
+            shutil.copy2(got, tmp)
+            tmp.rename(dsrc)
+        except OSError as e:
+            log(f"Drive書き戻しスキップ: {str(e)[:120]}")
+    return got
+
+
+def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
+    """ベース部品リポ(VAE/UMT5/config類)をsymlink無しのプレーンdirへ取得
+    (v0.8.7)。transformer重み(GGUF側で持つ)は除外して約12GBに抑える。
+    Driveキャッシュがあれば最優先でコピー、DL成功時は書き戻し。
+    from_pretrained/from_single_file(config=)にはこのdirを渡す。"""
+    import huggingface_hub as _hh
+    if not hasattr(_hh, "snapshot_download"):
+        # テストの偽huggingface_hub (hf_hub_downloadのみ): リポ名を素通し
+        # (from_pretrained側も偽なので実DLは起きない)
+        return repo
+    name = repo.replace("/", "--")
+    local = WORK_ROOT / "_snap" / name
+    marker = local / ".complete"
+    if marker.is_file():
+        return str(local)
+    dc = _drive_cache_dir()
+    dsrc = (dc / "_snap" / name) if dc else None
+    if dsrc is not None and (dsrc / ".complete").is_file():
+        log(f"Driveキャッシュからベース部品をコピー: {repo} (HF不要)")
+        shutil.copytree(dsrc, local, dirs_exist_ok=True)
+        return str(local)
+    ig = "['transformer/*.safetensors','transformer_2/*.safetensors','*.bin','*.md','.git*']"
+    code = ("from huggingface_hub import snapshot_download; "
+            f"snapshot_download({repo!r}, local_dir={str(local)!r}, "
+            f"ignore_patterns={ig})")
+    ok = False
+    for att in range(1, attempts + 1):
+        env = dict(os.environ)
+        if att % 2 == 0:
+            env["HF_HUB_DISABLE_XET"] = "1"
+        tag = f"ベース部品snapshot 試行{att}/{attempts}"
+        log(f"DL開始: {tag} ({repo})")
+        rc = _run_with_stall_watch([sys.executable, "-c", code], env, log,
+                                   tag)
+        if rc == 0:
+            ok = True
+            break
+        time.sleep(min(60, 5 * att))
+    if not ok:
+        raise RuntimeError(
+            f"ベース部品のDLが{attempts}回とも失敗: {repo} — HF側の429拒否の"
+            "可能性。①ランタイム終了→別VM ②Driveキャッシュ (ノートの"
+            "DRIVE_CACHEセル) で回避できます")
+    marker.touch()
+    if dsrc is not None and not (dsrc / ".complete").is_file():
+        try:
+            log(f"Driveキャッシュへベース部品を書き戻し: {repo}")
+            shutil.copytree(local, dsrc, dirs_exist_ok=True)
+        except OSError as e:
+            log(f"Drive書き戻しスキップ: {str(e)[:120]}")
+    return str(local)
 
 
 def _repo_cache_dir(repo: str) -> Path:
@@ -1210,13 +1311,16 @@ class AniSoraAdapter(_WanA14BBase):
             f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB'})")
         hi = _hf_download(self.gguf_repo, gguf_high, log)
         lo = _hf_download(self.gguf_repo, gguf_low, log)
+        # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策の
+        # 多段DLに乗せる。transformer重みは除外済みの約12GB)
+        snap = _snapshot_local(self.base_repo, log)
         log("transformer(High) 読み込み — configはWan2.2ベースを明示")
         t_hi = WanTransformer3DModel.from_single_file(
-            hi, quantization_config=qc, config=self.base_repo,
+            hi, quantization_config=qc, config=snap,
             subfolder="transformer", torch_dtype=torch.bfloat16)
         log("transformer_2(Low) 読み込み")
         t_lo = WanTransformer3DModel.from_single_file(
-            lo, quantization_config=qc, config=self.base_repo,
+            lo, quantization_config=qc, config=snap,
             subfolder="transformer_2", torch_dtype=torch.bfloat16)
         pipe_kwargs = {}
         self._te_lazy = _low_ram_vm()
@@ -1227,11 +1331,11 @@ class AniSoraAdapter(_WanA14BBase):
             # RAMスパイクでランタイムがOOM killされた)
             pipe_kwargs["text_encoder"] = None
             log("低RAM VM: UMT5はロードせずジョブ内で一時ロードします")
-        log(f"ベース部品 DL/読み込み: {self.base_repo} (VAE+UMT5 約12GB)")
+        log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
         self.pipe = WanImageToVideoPipeline.from_pretrained(
-            self.base_repo, transformer=t_hi, transformer_2=t_lo,
+            snap, transformer=t_hi, transformer_2=t_lo,
             torch_dtype=torch.bfloat16, **pipe_kwargs)
-        self._te_from = self.base_repo
+        self._te_from = snap
         # GPU常駐可否の判定用フットプリント(GB): High+Low GGUF常駐 +
         # bf16テキストエンコーダ(~6) + VAE(~0.5) + 生成アクティベーション(~4)
         fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
@@ -1800,13 +1904,15 @@ class VACEAdapter(_WanA14BBase):
                 f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB'})")
             hi = _hf_download(self.gguf_repo, gguf_high, log)
             lo = _hf_download(self.gguf_repo, gguf_low, log)
+            # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策)
+            snap = _snapshot_local(self.repo, log)
             log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
             t_hi = WanVACETransformer3DModel.from_single_file(
-                hi, quantization_config=qc, config=self.repo,
+                hi, quantization_config=qc, config=snap,
                 subfolder="transformer", torch_dtype=torch.bfloat16)
             log("transformer_2(LowNoise) 読み込み")
             t_lo = WanVACETransformer3DModel.from_single_file(
-                lo, quantization_config=qc, config=self.repo,
+                lo, quantization_config=qc, config=snap,
                 subfolder="transformer_2", torch_dtype=torch.bfloat16)
             if base == "anisora":
                 # AniSora V3.2のbase重みを移植 (High->HighNoise、
@@ -1834,14 +1940,16 @@ class VACEAdapter(_WanA14BBase):
             else:
                 log("vace_base=fun: AniSora移植なし (素のVACE-Fun。"
                     "steps30/cfg5.0を明示推奨)")
-            log(f"ベース部品 DL/読み込み: {self.repo} (VAE+UMT5 約12GB)")
+            log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
             self.pipe = WanVACEPipeline.from_pretrained(
-                self.repo, transformer=t_hi, transformer_2=t_lo,
+                snap, transformer=t_hi, transformer_2=t_lo,
                 torch_dtype=torch.bfloat16, **pipe_kwargs)
             # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
             fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
             margin = 10
-        self._te_from = self.repo
+            self._te_from = snap
+        if quant == "bf16":
+            self._te_from = self.repo
         if self._te_lazy:
             fp -= 6          # UMT5不在ぶん常駐判定を緩める
         if lora == "lightning":
@@ -1871,12 +1979,18 @@ class VACEAdapter(_WanA14BBase):
             except Exception:
                 pass
             try:
+                # LoRA本体も多段DL経路で先に取得 (v0.8.7: 429対策+Drive
+                # キャッシュ。1.2GB×2なのでサイズ検査は1GiB閾値を通る)
+                _hi_p = Path(_hf_download(
+                    rep, f"{fold}/high_noise_model.safetensors", log))
+                _lo_p = Path(_hf_download(
+                    rep, f"{fold}/low_noise_model.safetensors", log))
                 self.pipe.load_lora_weights(
-                    rep, adapter_name="lightning",
-                    weight_name=f"{fold}/high_noise_model.safetensors")
+                    str(_hi_p.parent), adapter_name="lightning",
+                    weight_name=_hi_p.name)
                 self.pipe.load_lora_weights(
-                    rep, adapter_name="lightning_2",
-                    weight_name=f"{fold}/low_noise_model.safetensors",
+                    str(_lo_p.parent), adapter_name="lightning_2",
+                    weight_name=_lo_p.name,
                     load_into_transformer_2=True)
                 self.pipe.set_adapters(["lightning", "lightning_2"],
                                        [1.0, 1.0])
@@ -2222,7 +2336,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         vname = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
                  f"{quant}.gguf")
         log(f"latent直結ロード: VACE High {quant}")
-        vp = hf_hub_download(self.gguf_repo, vname)
+        vp = _hf_download(self.gguf_repo, vname, log)
         vhigh = WanVACETransformer3DModel.from_single_file(
             vp, quantization_config=qc, config=self.repo,
             subfolder="transformer", torch_dtype=torch.bfloat16)
@@ -2231,7 +2345,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
         ah_name = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
         log(f"latent直結ロード: AniSora High移植ドナー {quant}")
-        ahp = hf_hub_download(self.anisora_gguf_repo, ah_name)
+        ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
         donor = WanTransformer3DModel.from_single_file(
             ahp, quantization_config=qc, config=self.base_repo,
             subfolder="transformer", torch_dtype=torch.bfloat16)
@@ -2241,7 +2355,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
 
         al_name = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         log(f"latent直結ロード: native AniSora Low {quant}")
-        alp = hf_hub_download(self.anisora_gguf_repo, al_name)
+        alp = _hf_download(self.anisora_gguf_repo, al_name, log)
         alow = WanTransformer3DModel.from_single_file(
             alp, quantization_config=qc, config=self.base_repo,
             subfolder="transformer_2", torch_dtype=torch.bfloat16)
