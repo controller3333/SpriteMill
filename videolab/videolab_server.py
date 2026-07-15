@@ -44,7 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.9"   # 0.9.9: T4級(bf16非対応/sm<80)対応 — Wan系アダプタの
+__version__ = "0.9.10"  # 0.9.10: 低RAM VMのblock offloadをディスク退避へ —
+#         T4(RAM51GB)はDiT2体のRAM常駐でロードピーク50GB到達→VMごと
+#         OOM killされた実障害の根治 (offload_to_disk_path、モデル別dir、
+#         旧diffusersへはTypeErrorフォールバック)。
+# 0.9.9: T4級(bf16非対応/sm<80)対応 — Wan系アダプタの
 #         bf16直書き19箇所を_pick_dtype()へ (compute capability厳密判定で
 #         fp16に自動フォールバック、VAEはfp32へ上げて数値安全)。
 #         無料T4でも生成可能に (速度はL4比3〜5倍遅・要実機検証)。
@@ -1296,14 +1300,35 @@ class _WanA14BBase(VideoAdapter):
         こちらが本線 (v0.7系で実GPU検証済み: 720x1296/49fピーク11.3GB)。
         適用に失敗したら従来経路へ戻す。"""
         import torch
+        kw = dict(onload_device=torch.device("cuda"),
+                  offload_device=torch.device("cpu"),
+                  offload_type="block_level",
+                  num_blocks_per_group=1,
+                  use_stream=True)
+        # RAMが少ないVM (T4=51GB級) では退避先をディスクへ。block offload
+        # はDiT2体(約17GB)をRAM常駐させるため、L4で33GBだったロードピーク
+        # が T4では 33+17≒50GB になりVMごとOOM killされる (2026-07-16
+        # 実障害「RAMに50GBくらい読み込んで落ちる」)。/tmpはローカルSSD
+        # なので転送は遅くなるが生存が最優先。旧diffusersは引数ごと
+        # フォールバック
+        _disk = None
+        if _low_ram_vm(60.0):
+            # モデルごとに別dir (同居させるとblocks.0等のファイル名が衝突)
+            _disk = str(WORK_ROOT / "_offload"
+                        / f"{abs(hash(label)) & 0xffffff:06x}")
+            kw["offload_to_disk_path"] = _disk
         try:
-            model.enable_group_offload(
-                onload_device=torch.device("cuda"),
-                offload_device=torch.device("cpu"),
-                offload_type="block_level",
-                num_blocks_per_group=1,
-                use_stream=True)
-            log(f"{label}: block offload適用 (重みCPU常駐+ブロック転送)")
+            try:
+                model.enable_group_offload(**kw)
+            except TypeError:
+                if "offload_to_disk_path" not in kw:
+                    raise
+                kw.pop("offload_to_disk_path")   # 旧diffusers非対応
+                _disk = None
+                model.enable_group_offload(**kw)
+            log(f"{label}: block offload適用 "
+                + (f"(重みディスク退避: {_disk} — 低RAM VM対策)" if _disk
+                   else "(重みCPU常駐+ブロック転送)"))
             return True
         except Exception as e:      # noqa: BLE001
             log(f"{label}: block offload不可 -> 従来経路へ ({str(e)[:120]})")
