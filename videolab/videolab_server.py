@@ -44,7 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.8"   # 0.9.8: latent固定 — 再加工(SDEdit)中に指定フレーム
+__version__ = "0.9.9"   # 0.9.9: T4級(bf16非対応/sm<80)対応 — Wan系アダプタの
+#         bf16直書き19箇所を_pick_dtype()へ (compute capability厳密判定で
+#         fp16に自動フォールバック、VAEはfp32へ上げて数値安全)。
+#         無料T4でも生成可能に (速度はL4比3〜5倍遅・要実機検証)。
+# 0.9.8: latent固定 — 再加工(SDEdit)中に指定フレーム
 #         のlatentスロットを毎step stage1へ描き戻す (extra.latent_pin_frames
 #         / latent_pin_release)。歩行周期の位相流れ (先頭=終端同位相の崩れ)
 #         を錨止めする (2026-07-15要望「中間フレームと最終フレームを固定化」)。
@@ -830,7 +834,19 @@ def _snap_frames(n: int) -> int:
 
 def _pick_dtype():
     import torch
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # bf16はAmpere(sm80)以上のネイティブ対応のみ採用。T4(Turing/sm75)は
+    # is_bf16_supported()がエミュレーション込みでTrueを返す版があり、
+    # bf16のまま走ると激遅/一部カーネル不発になる (2026-07-16「T4で
+    # 生成できる?」対応: fp16へ落とし、VAEは_finalize_pipeがfp32へ上げて
+    # 数値安全を取る。UMT5のfp16はT5系の桁あふれリスクがあるが16GB級に
+    # fp32は載らないためWan系コミュニティ実績に合わせて許容)
+    try:
+        if torch.cuda.get_device_capability()[0] >= 8:
+            return torch.bfloat16
+        return torch.float16
+    except Exception:
+        return (torch.bfloat16 if torch.cuda.is_bf16_supported()
+                else torch.float16)
 
 
 def _fit_image(img, w: int, h: int):
@@ -1319,7 +1335,7 @@ class _WanA14BBase(VideoAdapter):
         src = self._te_from or self.base_repo
         log("UMT5を一時ロード (低RAM運転: encode後に即解放・約30秒)")
         te = UMT5EncoderModel.from_pretrained(
-            src, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+            src, subfolder="text_encoder", torch_dtype=_pick_dtype())
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         pipe.text_encoder = te
         try:
@@ -1373,6 +1389,16 @@ class _WanA14BBase(VideoAdapter):
             log(f"scheduler: UniPC flow_shift={self.flow_shift}")
         except Exception as e:
             log(f"flow_shift設定スキップ: {e}")
+
+        if _pick_dtype() is torch.float16:
+            # bf16非対応GPU (T4級/sm<80): DiTはfp16運転、VAEだけfp32へ
+            # 上げてデコードのNaN/白飛びを防ぐ (重み約0.5GB→1GBで許容)
+            try:
+                if getattr(self.pipe, "vae", None) is not None:
+                    self.pipe.vae.to(torch.float32)
+                log("bf16非対応GPU: fp16運転 + VAE fp32 (T4級対応)")
+            except Exception as e:      # noqa: BLE001
+                log(f"VAE fp32化に失敗 (fp16のまま続行): {str(e)[:80]}")
 
         # ---- オフロード戦略の決定 (速度の要。2026-07-12 A100で3分問題) ----
         # cuda  = 全モデルをGPU常駐(オフロード無し=最速。A100等でVRAMに
@@ -1791,7 +1817,7 @@ class AniSoraAdapter(_WanA14BBase):
         quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
         gguf_high = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
         gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
-        qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+        qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
         log(f"GGUF DL: {self.gguf_repo} {quant} "
             f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB'})")
         hi = _hf_download(self.gguf_repo, gguf_high, log)
@@ -1802,11 +1828,11 @@ class AniSoraAdapter(_WanA14BBase):
         log("transformer(High) 読み込み — configはWan2.2ベースを明示")
         t_hi = WanTransformer3DModel.from_single_file(
             hi, quantization_config=qc, config=snap,
-            subfolder="transformer", torch_dtype=torch.bfloat16)
+            subfolder="transformer", torch_dtype=_pick_dtype())
         log("transformer_2(Low) 読み込み")
         t_lo = WanTransformer3DModel.from_single_file(
             lo, quantization_config=qc, config=snap,
-            subfolder="transformer_2", torch_dtype=torch.bfloat16)
+            subfolder="transformer_2", torch_dtype=_pick_dtype())
         pipe_kwargs = {}
         self._te_lazy = _low_ram_vm()
         if self._te_lazy:
@@ -1819,7 +1845,7 @@ class AniSoraAdapter(_WanA14BBase):
         log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
         self.pipe = WanImageToVideoPipeline.from_pretrained(
             snap, transformer=t_hi, transformer_2=t_lo,
-            torch_dtype=torch.bfloat16, **pipe_kwargs)
+            torch_dtype=_pick_dtype(), **pipe_kwargs)
         self._te_from = snap
         # GPU常駐可否の判定用フットプリント(GB): High+Low GGUF常駐 +
         # bf16テキストエンコーダ(~6) + VAE(~0.5) + 生成アクティベーション(~4)
@@ -2384,7 +2410,7 @@ class VACEAdapter(_WanA14BBase):
             # (AniSora移植はGGUF経路のみ。_resolve_wantがbase=funに固定)
             log(f"読み込み開始: {self.repo} (bf16・素のVACE-Fun・DL約70GB)")
             self.pipe = WanVACEPipeline.from_pretrained(
-                self.repo, torch_dtype=torch.bfloat16, **pipe_kwargs)
+                self.repo, torch_dtype=_pick_dtype(), **pipe_kwargs)
             fp, margin = 79, 12
         else:
             from diffusers import GGUFQuantizationConfig
@@ -2400,7 +2426,7 @@ class VACEAdapter(_WanA14BBase):
                          f"{quant}.gguf")
             gguf_low = (f"LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-"
                         f"{quant}.gguf")
-            qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+            qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
             log(f"GGUF DL: {self.gguf_repo} {quant} "
                 f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB'})")
             hi = _hf_download(self.gguf_repo, gguf_high, log)
@@ -2410,11 +2436,11 @@ class VACEAdapter(_WanA14BBase):
             log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
             t_hi = WanVACETransformer3DModel.from_single_file(
                 hi, quantization_config=qc, config=snap,
-                subfolder="transformer", torch_dtype=torch.bfloat16)
+                subfolder="transformer", torch_dtype=_pick_dtype())
             log("transformer_2(LowNoise) 読み込み")
             t_lo = WanVACETransformer3DModel.from_single_file(
                 lo, quantization_config=qc, config=snap,
-                subfolder="transformer_2", torch_dtype=torch.bfloat16)
+                subfolder="transformer_2", torch_dtype=_pick_dtype())
             if base == "anisora":
                 # AniSora V3.2のbase重みを移植 (High->HighNoise、
                 # Low->LowNoise のエキスパート対応)。ドナーはCPU上で
@@ -2433,7 +2459,7 @@ class VACEAdapter(_WanA14BBase):
                         "Wan2.2-I2Vベースを明示)")
                     donor = WanTransformer3DModel.from_single_file(
                         dp, quantization_config=qc, config=self.base_repo,
-                        subfolder=sub, torch_dtype=torch.bfloat16)
+                        subfolder=sub, torch_dtype=_pick_dtype())
                     _transplant_base_weights(tgt, donor, log, tag=tag,
                                              patch_mode=patch)
                     del donor
@@ -2444,7 +2470,7 @@ class VACEAdapter(_WanA14BBase):
             log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
             self.pipe = WanVACEPipeline.from_pretrained(
                 snap, transformer=t_hi, transformer_2=t_lo,
-                torch_dtype=torch.bfloat16, **pipe_kwargs)
+                torch_dtype=_pick_dtype(), **pipe_kwargs)
             # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
             fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
             margin = 10
@@ -2833,7 +2859,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         next_extra = getattr(self, "_next_extra", {})
         quant, _boundary = self._hybrid_want(next_extra)
         lora = self._hybrid_lora(next_extra)
-        qc = GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+        qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
         vname = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
                  f"{quant}.gguf")
         log(f"latent直結ロード: VACE High {quant}")
@@ -2844,7 +2870,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         vp = _hf_download(self.gguf_repo, vname, log)
         vhigh = WanVACETransformer3DModel.from_single_file(
             vp, quantization_config=qc, config=snap_vace,
-            subfolder="transformer", torch_dtype=torch.bfloat16)
+            subfolder="transformer", torch_dtype=_pick_dtype())
 
         # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
         # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
@@ -2853,7 +2879,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
         donor = WanTransformer3DModel.from_single_file(
             ahp, quantization_config=qc, config=snap_base,
-            subfolder="transformer", torch_dtype=torch.bfloat16)
+            subfolder="transformer", torch_dtype=_pick_dtype())
         _transplant_base_weights(vhigh, donor, log, tag="HybridHigh")
         del donor
         gc.collect()
@@ -2863,7 +2889,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         alp = _hf_download(self.anisora_gguf_repo, al_name, log)
         alow = WanTransformer3DModel.from_single_file(
             alp, quantization_config=qc, config=snap_base,
-            subfolder="transformer_2", torch_dtype=torch.bfloat16)
+            subfolder="transformer_2", torch_dtype=_pick_dtype())
 
         # 低RAM VM (L4=53GB) ではUMT5(約11GB)をロード段階から持たない:
         # ロードピーク=モデル一式+移植ドナー+UMT5≈48GBが天井を叩き、
@@ -2872,7 +2898,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         # 遅延ロード→encode後に解放 (v0.7.5の解放/再ロード機構を流用)
         _lowram = _low_ram_vm()
         pipe_kwargs = dict(transformer=vhigh, transformer_2=None,
-                           torch_dtype=torch.bfloat16)
+                           torch_dtype=_pick_dtype())
         if _lowram:
             pipe_kwargs["text_encoder"] = None
             log(f"共通VAE読み込み (UMT5はジョブ毎に遅延ロード=低RAM運転): "
@@ -2927,7 +2953,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             snap_base, transformer=None, transformer_2=alow,
             vae=self.pipe.vae, text_encoder=self.pipe.text_encoder,
             tokenizer=self.pipe.tokenizer, scheduler=sched,
-            torch_dtype=torch.bfloat16)
+            torch_dtype=_pick_dtype())
         # load_lora_weights/from_pretrainedが内部で置いたdeviceに依存しない。
         # condition encode前はDiT 2体を必ずCPUへ戻し、VAE/UMT5用の空きを作る。
         for module in (vhigh, alow, self.pipe.vae, self.pipe.text_encoder):
@@ -3028,7 +3054,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 log("UMT5を再ロード (低RAM運転・約30秒)")
                 pipe.text_encoder = UMT5EncoderModel.from_pretrained(
                     getattr(self, "_te_from", None) or self.repo,
-                    subfolder="text_encoder", torch_dtype=torch.bfloat16)
+                    subfolder="text_encoder", torch_dtype=_pick_dtype())
                 self.ani_pipe.text_encoder = pipe.text_encoder
             self._move(pipe.text_encoder, device, log, "UMT5")
             prompt_embeds, negative_embeds = pipe.encode_prompt(
@@ -3286,7 +3312,7 @@ class Wan22A14BAdapter(_WanA14BBase):
         from diffusers import WanImageToVideoPipeline
         log(f"読み込み開始: {self.base_repo} (DL約126GB・初回は20分前後)")
         self.pipe = WanImageToVideoPipeline.from_pretrained(
-            self.base_repo, torch_dtype=torch.bfloat16)
+            self.base_repo, torch_dtype=_pick_dtype())
         self._finalize_pipe(log)
         self.loaded = True
 
