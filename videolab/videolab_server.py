@@ -44,7 +44,11 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.10"  # 0.9.10: 低RAM VMのblock offloadをディスク退避へ —
+__version__ = "0.9.11"  # 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
+#         ではDiTを1体ロードするごとに即ディスク退避 (2体+18GBの同時保持を
+#         排除。anisoraはLoRA非搭載で安全、vaceはLightning適用があるため
+#         従来順)。UMT5遅延ロードにlow_cpu_mem_usage (二重確保の排除)。
+# 0.9.10: 低RAM VMのblock offloadをディスク退避へ —
 #         T4(RAM51GB)はDiT2体のRAM常駐でロードピーク50GB到達→VMごと
 #         OOM killされた実障害の根治 (offload_to_disk_path、モデル別dir、
 #         旧diffusersへはTypeErrorフォールバック)。
@@ -1359,8 +1363,15 @@ class _WanA14BBase(VideoAdapter):
         pipe = self.pipe
         src = self._te_from or self.base_repo
         log("UMT5を一時ロード (低RAM運転: encode後に即解放・約30秒)")
-        te = UMT5EncoderModel.from_pretrained(
-            src, subfolder="text_encoder", torch_dtype=_pick_dtype())
+        try:
+            # low_cpu_mem_usage: 初期化+読込の二重確保を避けRAM山を半減
+            # (T4=51GB VMのanisora段RAM黄色対策の一部 2026-07-16)
+            te = UMT5EncoderModel.from_pretrained(
+                src, subfolder="text_encoder", torch_dtype=_pick_dtype(),
+                low_cpu_mem_usage=True)
+        except TypeError:
+            te = UMT5EncoderModel.from_pretrained(
+                src, subfolder="text_encoder", torch_dtype=_pick_dtype())
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         pipe.text_encoder = te
         try:
@@ -1456,7 +1467,8 @@ class _WanA14BBase(VideoAdapter):
             ok = True
             for name in ("transformer", "transformer_2"):
                 m = getattr(self.pipe, name, None)
-                if m is not None:
+                if m is not None and not self._group_offloaded(m):
+                    # 早期退避済み (低RAM VMのロード順対策) はスキップ
                     ok = self._try_group_offload(m, log, name) and ok
             if ok:
                 # DiT以外の小物 (VAE等) はGPUへ。text_encoderは遅延運転
@@ -1850,14 +1862,24 @@ class AniSoraAdapter(_WanA14BBase):
         # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策の
         # 多段DLに乗せる。transformer重みは除外済みの約12GB)
         snap = _snapshot_local(self.base_repo, log)
+        # 低RAM VM×block退避では「1体ロードするごとに即ディスク退避」:
+        # 2体(約18GB)をRAMへ積んでからまとめて退避すると、その瞬間の山が
+        # T4(51GB)の残りRAMに刺さる (2026-07-16実障害: anisora切替段で
+        # メモリ黄色→VM死。anisoraはLoRAを載せないため早期退避が安全 —
+        # vaceはLightning適用が後segueするため従来順のまま)
+        _early_off = (offload == "block" and _low_ram_vm(60.0))
         log("transformer(High) 読み込み — configはWan2.2ベースを明示")
         t_hi = WanTransformer3DModel.from_single_file(
             hi, quantization_config=qc, config=snap,
             subfolder="transformer", torch_dtype=_pick_dtype())
+        if _early_off:
+            self._try_group_offload(t_hi, log, "transformer(早期退避)")
         log("transformer_2(Low) 読み込み")
         t_lo = WanTransformer3DModel.from_single_file(
             lo, quantization_config=qc, config=snap,
             subfolder="transformer_2", torch_dtype=_pick_dtype())
+        if _early_off:
+            self._try_group_offload(t_lo, log, "transformer_2(早期退避)")
         pipe_kwargs = {}
         self._te_lazy = _low_ram_vm()
         if self._te_lazy:
