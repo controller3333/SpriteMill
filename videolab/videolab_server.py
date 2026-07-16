@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.12"  # 0.9.12: OOM/フリーズしない保証+quant開通 (P0-P2)
+__version__ = "0.9.13"  # 0.9.13: 保証機構のレビュー12件修正 (詳細はcommit)
+# 0.9.12: OOM/フリーズしない保証+quant開通 (P0-P2)
 # 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
 #         ではDiTを1体ロードするごとに即ディスク退避 (2体+18GBの同時保持を
 #         排除。anisoraはLoRA非搭載で安全、vaceはLightning適用があるため
@@ -388,6 +389,21 @@ def _hf_file_missing(repo: str, filename: str):
         return None
 
 
+def _anisora_high_quant(quant: str) -> str:
+    """AniSora High側のGGUF棚在庫はQ4_0/Q8_0のみ (2026-07-16 HF tree API
+    実測の静的知識)。下位quant指定時はHighだけQ4_0へ代替する。
+
+    v0.9.13: 当初はfile_existsで動的判定していたが、Drive固定運転や429で
+    HF APIが死んでいる環境では判定不能=代替が無言不発になり、存在しない
+    High-Q3_K_S.ggufを追う袋小路DLループに落ちた (レビュー指摘)。棚在庫は
+    既知の静的事実なのでコードに焼く。上流に下位quantのHighが追加されたら
+    VIDEOLAB_ANISORA_HIGH_QUANT で差し替えられる。"""
+    if quant in ("Q4_0", "Q8_0"):
+        return quant
+    return (os.environ.get("VIDEOLAB_ANISORA_HIGH_QUANT", "Q4_0").strip()
+            or "Q4_0")
+
+
 def _act_estimate_gb(w: int, h: int, n: int) -> float:
     """生成活性化のピークVRAM見積もり (GB)。plan_canvasと同一式。"""
     lat = (max(2, int(n)) - 1) // 4 + 2      # +1=VACE参照タイムスロット
@@ -420,8 +436,9 @@ def _admit_vram(w: int, h: int, n: int, log, resident_extra_gb: float = 0.0,
     if downgrade is not None:
         log(f"⚠ VRAM不足見込み (必要≈{need:.1f}GB > 空き{free:.1f}GB) "
             "-> 省メモリ構成へ自動降格します (低速・確実)")
+        _ok = False
         try:
-            downgrade()
+            _ok = bool(downgrade())
         except Exception as e:      # noqa: BLE001
             log(f"自動降格に失敗 (そのまま判定続行): {str(e)[:120]}")
         try:
@@ -429,9 +446,11 @@ def _admit_vram(w: int, h: int, n: int, log, resident_extra_gb: float = 0.0,
             free = torch.cuda.mem_get_info()[0] / 2**30
         except Exception:
             return
-        need = act + ACT_SAFETY_GB      # 降格後は重みがVRAM外
+        # 降格が実際に成功したときだけ「重みはVRAM外」前提へ切り替える。
+        # 失敗時に前提を切り替えると偽PASS→生成中OOMになる (レビュー指摘)
+        need = act + ACT_SAFETY_GB + (0.5 if _ok else resident_extra_gb)
         if free >= need:
-            log(f"VRAM admission[{tag}]: 降格後OK "
+            log(f"VRAM admission[{tag}]: {'降格後' if _ok else '再判定'}OK "
                 f"(必要≈{need:.1f}GB / 空き{free:.1f}GB)")
             return
     import math as _math
@@ -1502,14 +1521,26 @@ class _WanA14BBase(VideoAdapter):
                        if mode in ("cuda", "model") else None),
             tag=tag or self.id)
 
-    def _downgrade_to_block(self, log):
+    def _downgrade_to_block(self, log) -> bool:
         """常駐/モデルオフロード構成をblock offloadへ組み替える (P0-3の
-        自動降格)。DiTをCPUへ落としてからgroup offloadフックを付ける。
-        失敗しても例外は投げない (admission側が再判定する)。"""
+        自動降格)。成功したらTrue。失敗時はモードを変えずFalse (admission
+        側が元の常駐余地で再判定する — 無条件block化は偽PASS→生成中OOM
+        の温床、レビュー指摘で修正 v0.9.13)。
+
+        注意: 降格は片道 (このセッションの以後のジョブもblock速度)。戻す
+        には extra.offload を明示して積み替える。plan_canvasが先に寸法を
+        身の丈へ落とすため、ここへ来るのは想定外サイズのジョブだけ。"""
         pipe = self.pipe
         if pipe is None:
-            return
+            return False
+        # model_cpu_offload由来のaccelerateフックはgroup offloadと競合する
+        # (近年版diffusersは適用拒否・旧版は.to禁止例外) — 先に剥がす
+        try:
+            pipe.remove_all_hooks()
+        except Exception:
+            pass
         seen = set()
+        ok = True
         for name in ("transformer", "transformer_2"):
             m = getattr(pipe, name, None)
             if m is None or id(m) in seen:      # liteモードはHigh=Lowの別名
@@ -1521,13 +1552,36 @@ class _WanA14BBase(VideoAdapter):
                 m.to("cpu")
             except Exception:
                 pass
-            self._try_group_offload(m, log, f"{name}(自動降格)")
+            if not self._try_group_offload(m, log, f"{name}(自動降格)"):
+                ok = False
+                try:
+                    m.to("cuda")     # CPU取り残し=device不一致連鎖を防ぐ
+                except Exception:
+                    pass
+        if not ok:
+            log("自動降格に失敗 — 現構成のまま再判定します")
+            _free_cuda(log)
+            return False
+        # フック剥がしでCPUに残った非DiT部品 (VAE/UMT5等) をGPUへ
+        # (_finalize_pipeのblock分岐と同じ配置)
+        try:
+            import torch as _t
+            for cname, comp in pipe.components.items():
+                if cname in ("transformer", "transformer_2"):
+                    continue
+                if isinstance(comp, _t.nn.Module):
+                    comp.to("cuda")
+        except Exception:
+            pass
         try:
             pipe.vae.enable_tiling()
         except Exception:
             pass
         _free_cuda(log)
         self._offload_mode = "block"
+        log("自動降格完了: 以後のジョブもblock運転になります "
+            "(戻すには offload を明示指定して積み替え)")
+        return True
 
     @staticmethod
     def _try_group_offload(model, log, label) -> bool:
@@ -1697,6 +1751,16 @@ class _WanA14BBase(VideoAdapter):
             # GGUF×sequential offloadはdiffusers既知バグ (quant_type喪失の
             # KeyError) -> block offloadへ振替 (v0.8.2)
             log("GGUF量子化はsequential offload不可 -> block offloadへ振替")
+            mode = "block"
+        _t_hi = getattr(self.pipe, "transformer", None)
+        if (_t_hi is not None
+                and _t_hi is getattr(self.pipe, "transformer_2", None)
+                and mode in ("model", "seq")):
+            # Low単体(lite)の別名構成: model/seq offloadは同一DiTを2スロット
+            # 登録し、フック連鎖が自分自身を指して毎stepフルDiTのCPU↔GPU
+            # 往復になる (レビュー指摘 v0.9.13) — blockへ振替
+            log("Low単体(別名)構成はmodel/seq offloadと相性が悪い -> "
+                "block offloadへ振替")
             mode = "block"
 
         if mode == "block":
@@ -2063,9 +2127,16 @@ class AniSoraAdapter(_WanA14BBase):
         # 既定Q4_0 (2026-07-13方針: VRAM16GB未満級を上限に。Q8はGUI選択肢
         # からも撤廃済みで、明示指定されたときだけ受理する)。v0.9.12で
         # Q3_K_S等の下位quantも受理 (棚在庫はLow側のみ完備 — High側は
-        # Q4_0/Q8_0だけなので _ensure_loaded_impl がHighを自動代替する)
-        q = _norm_quant((extra or {}).get("quant")
-                        or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0"))
+        # Q4_0/Q8_0だけなので _ensure_loaded_impl がHighを自動代替する)。
+        # bf16はVACE専用の逃げ道設定が共通quantとしてstage2へ転送されて
+        # くる正規ルートがある (エンジンは同じ値を両stageへ渡す) — GGUF
+        # 専用の本アダプタでは従来どおりQ4_0で受ける (v0.9.13レビュー指摘:
+        # ValueError化するとlatent_refine本線がキャンバス工程ごと失敗する)
+        _qraw = ((extra or {}).get("quant")
+                 or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0"))
+        if str(_qraw).strip().lower() == "bf16":
+            _qraw = "Q4_0"
+        q = _norm_quant(_qraw)
         # 既定は "" = auto (VRAMを見てGPU常駐 or model_cpu_offloadを選ぶ)。
         # "seq" のみ明示指定 (12GB級の省メモリモード)。
         off = str((extra or {}).get("offload")
@@ -2108,17 +2179,14 @@ class AniSoraAdapter(_WanA14BBase):
         from huggingface_hub import hf_hub_download
         quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
         lite = self._lite_wanted(getattr(self, "_next_extra", {}))
-        # High側の棚在庫はQ4_0/Q8_0のみ (2026-07-16 HF tree API実測)。
-        # 下位quant指定時はHighだけQ4_0で代替する (混載ペア。Highは序盤
-        # 数stepの構図担当なので品質影響は小さい)。在庫が確認できない
-        # 環境 (Drive固定・オフライン) では要求どおり試して404に任せる
-        hq = quant
-        gguf_high = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
-        if not lite and quant not in ("Q4_0", "Q8_0") \
-                and _hf_file_missing(self.gguf_repo, gguf_high):
-            hq = "Q4_0"
-            gguf_high = f"High/Index-Anisora-V3.2-High-{hq}.gguf"
-            log(f"High側に{quant}の在庫が無いためHighのみQ4_0で代替します "
+        # High側の棚在庫はQ4_0/Q8_0のみ — 静的規則で代替 (混載ペア。Highは
+        # 序盤数stepの構図担当なので品質影響は小さい)。動的なfile_exists
+        # 判定はオフライン/Drive固定で不発になり袋小路DLに落ちる
+        # (v0.9.13レビュー指摘) — 詳細は _anisora_high_quant
+        hq = _anisora_high_quant(quant)
+        gguf_high = f"High/Index-Anisora-V3.2-High-{hq}.gguf"
+        if not lite and hq != quant:
+            log(f"High側は{quant}の棚在庫が無いため{hq}で代替します "
                 "(Low側は指定どおり)")
         gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
@@ -2147,8 +2215,10 @@ class AniSoraAdapter(_WanA14BBase):
         # ゲートしない
         gg = _gguf_gb(*(p for p in (hi, lo) if p))
         if gg >= 1.0:
+            # ベース部品のRAM実装は VAE+tokenizer≈2.5GB (スナップショット
+            # 12GBはUMT5込みのディスクサイズ — UMT5は別項で計上)
             _peak = ((max(_gguf_gb(hi), _gguf_gb(lo)) if _early_off else gg)
-                     + 12 + (0 if self._te_lazy else 11) + 6)
+                     + 2.5 + (0 if self._te_lazy else 11) + 6)
             _ram_gate(log, _peak, f"AniSora {quant} 読み込み")
         t_hi = None
         if hi is not None:
@@ -2808,8 +2878,9 @@ class VACEAdapter(_WanA14BBase):
             _vgg = _gguf_gb(hi, lo)
             if _vgg >= 1.0:
                 _donor = 16.0 if quant == "Q8_0" else 9.3
+                # ベース部品のRAM実装はVAE等≈2.5GB (UMT5は別項)
                 _ram_gate(log, _vgg + (_donor if base == "anisora" else 0)
-                          + 12 + (0 if self._te_lazy else 11) + 6,
+                          + 2.5 + (0 if self._te_lazy else 11) + 6,
                           f"VACE {quant} 読み込み")
             log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
             t_hi = WanVACETransformer3DModel.from_single_file(
@@ -2830,17 +2901,14 @@ class VACEAdapter(_WanA14BBase):
                         log(f"AniSora移植[{tag}]: スキップ "
                             f"(vace_experts={experts})")
                         continue
-                    dq = quant
+                    # AniSora High側の棚在庫はQ4_0/Q8_0のみ — 静的規則で
+                    # 代替 (_anisora_high_quant参照、v0.9.13)
+                    dq = (_anisora_high_quant(quant) if tag == "High"
+                          else quant)
                     fname = f"{tag}/Index-Anisora-V3.2-{tag}-{dq}.gguf"
-                    # AniSora High側の棚在庫はQ4_0/Q8_0のみ — 下位quant時は
-                    # HighドナーだけQ4_0で代替 (2026-07-16 HF実測)
-                    if (tag == "High" and dq not in ("Q4_0", "Q8_0")
-                            and _hf_file_missing(self.anisora_gguf_repo,
-                                                 fname)):
-                        dq = "Q4_0"
-                        fname = f"{tag}/Index-Anisora-V3.2-{tag}-{dq}.gguf"
-                        log(f"AniSora移植[High]: {quant}の在庫が無いため"
-                            "Q4_0ドナーで代替します")
+                    if dq != quant:
+                        log(f"AniSora移植[High]: {quant}の棚在庫が無いため"
+                            f"{dq}ドナーで代替します")
                     log(f"AniSora GGUF DL: {self.anisora_gguf_repo} {fname}")
                     dp = _hf_download(self.anisora_gguf_repo, fname, log)
                     log(f"AniSora {tag} 読み込み (移植ドナー・config="
@@ -3221,8 +3289,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
     @staticmethod
     def _hybrid_want(extra: dict) -> tuple:
         e = extra or {}
-        q = _norm_quant(e.get("quant")
-                        or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
+        _qraw = (e.get("quant")
+                 or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
+        if str(_qraw).strip().lower() == "bf16":
+            _qraw = "Q4_0"     # bf16はGGUF経路に無い — 従来どおりQ4_0で受ける
+        q = _norm_quant(_qraw)
         try:
             boundary = float(e.get("hybrid_boundary")
                              or os.environ.get("VIDEOLAB_HYBRID_BOUNDARY",
@@ -3265,29 +3336,29 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         snap_vace = _snapshot_local(self.repo, log)
         snap_base = _snapshot_local(self.base_repo, log)
         vp = _hf_download(self.gguf_repo, vname, log)
-        vhigh = WanVACETransformer3DModel.from_single_file(
-            vp, quantization_config=qc, config=snap_vace,
-            subfolder="transformer", torch_dtype=_pick_dtype())
-
-        # ロード前RAMゲート (P0-2): VACE High + ドナー + AniSora Low の
-        # 同時常駐がロードピーク (実測48GB級@Q4)。VACEサイズ+推定で判定
+        # ロード前RAMゲート (P0-2): vhighロード「前」に判定する (ロード後に
+        # 判定するとvhigh分を空きRAMから二重計上して過大要求になり、L4では
+        # Q4_0でも無条件エラーだった — v0.9.13レビュー指摘)。ピークは
+        # 「vhigh + ドナー1体」(移植はParameterスワップでネット増ゼロ、
+        # del donor後にalowをロードするため同時常駐は常に2体まで)
         _vgg1 = _gguf_gb(vp)
         if _vgg1 >= 1.0:
             _dn = 16.0 if quant == "Q8_0" else 9.3
-            _ram_gate(log, _vgg1 + _dn * 2 + 12
+            # ベース部品のRAM実装はVAE等≈2.5GB (UMT5は別項)
+            _ram_gate(log, _vgg1 + _dn + 2.5
                       + (0 if _low_ram_vm() else 11) + 6,
                       f"latent直結 {quant} 読み込み")
+        vhigh = WanVACETransformer3DModel.from_single_file(
+            vp, quantization_config=qc, config=snap_vace,
+            subfolder="transformer", torch_dtype=_pick_dtype())
         # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
         # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
-        ah_name = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
-        aq = quant
-        if aq not in ("Q4_0", "Q8_0") \
-                and _hf_file_missing(self.anisora_gguf_repo, ah_name):
-            # AniSora High側の棚在庫はQ4_0/Q8_0のみ (2026-07-16 HF実測)
-            aq = "Q4_0"
-            ah_name = f"High/Index-Anisora-V3.2-High-{aq}.gguf"
-            log(f"AniSora High移植ドナー: {quant}の在庫が無いため"
-                "Q4_0で代替します")
+        # High側の棚在庫はQ4_0/Q8_0のみ — 静的規則で代替 (v0.9.13)
+        aq = _anisora_high_quant(quant)
+        ah_name = f"High/Index-Anisora-V3.2-High-{aq}.gguf"
+        if aq != quant:
+            log(f"AniSora High移植ドナー: {quant}の棚在庫が無いため"
+                f"{aq}で代替します")
         log(f"latent直結ロード: AniSora High移植ドナー {aq}")
         ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
         donor = WanTransformer3DModel.from_single_file(
@@ -3827,19 +3898,24 @@ class JobCancelled(Exception):
 
 
 def worker_loop():
-    global CURRENT_MODEL
+    global CURRENT_MODEL, _WORKER_STALLED
     while True:
         jid = WORK_Q.get()
+        _WORKER_STALLED = False        # popできた=workerは生きている (P1)
         j = JOBS.get(jid)
         if not j or j.get("_cancel"):
             if j:
                 j["status"] = "cancelled"
+                j["finished"] = j.get("finished") or time.time()
+                j.pop("_req", None)    # 画像/骨格b64のRAM残留を防ぐ
             continue
         # 孤児検知: キュー待ちの間にクライアントが消えたジョブは始めない
         if (j.get("_watch_poll")
                 and time.time() - j.get("_last_poll", 0) > ORPHAN_SEC):
             j["status"] = "cancelled"
             j["detail"] = "クライアント切断により自動中止 (ポーリング途絶)"
+            j["finished"] = j.get("finished") or time.time()
+            j.pop("_req", None)
             print(f"[{jid}] 孤児ジョブを自動中止", flush=True)
             continue
 
@@ -3912,7 +3988,7 @@ def worker_loop():
                 # 成長ゼロが続くときは停滞を明示 — 「固まった?」の判別材料
                 _done = threading.Event()
 
-                def _dl_watch(_a=adapter):
+                def _dl_watch(_a=adapter, _j=j):
                     # v0.8.6: リポキャッシュdirでなくディスクusedを見る
                     # (Xet経路はチャンクを別キャッシュへ書くため)
                     last = -1.0
@@ -3924,6 +4000,12 @@ def worker_loop():
                         if last < 0:
                             last = cur
                             continue
+                        if cur - last > 0.005:
+                            # 低速でも進んでいる限り鼓動を打つ (v0.9.13:
+                            # 1〜2.5MB/s帯の健全DLがログ閾値0.05GB/20sに
+                            # 届かず、watchdogが健全ロードを打ち切る回廊が
+                            # あった — レビュー指摘)
+                            _j["_beat"] = time.time()
                         if cur - last > 0.05:
                             log(f"DL/読込 進行中: +{cur - last:.1f}GB/20s")
                             still = 0
@@ -3942,8 +4024,10 @@ def worker_loop():
             CURRENT_MODEL = j["model"]
 
             # モデル読み込み中はキャンセルを検知できないため、ここで再判定
-            # (読み込みブロック中に中止されたジョブの生成を始めない)
-            if j.get("_cancel"):
+            # (読み込みブロック中に中止されたジョブの生成を始めない)。
+            # watchdogがerror化済みのジョブも同様 — 黙ってrunning/doneへ
+            # 上書きするとクライアントの再投入と二重生成になる (v0.9.13)
+            if j.get("_cancel") or j.get("status") == "error":
                 raise JobCancelled()
 
             j["status"] = "running"
@@ -3952,13 +4036,21 @@ def worker_loop():
             workdir = WORK_ROOT / jid
             workdir.mkdir(parents=True, exist_ok=True)
             out = adapter.generate(j["_req"], workdir, log, progress)
-            j["path"] = str(out)
-            j["status"] = "done"
-            j["progress"] = 1.0
-            log(f"完了: {out}")
+            if j.get("status") == "error":
+                # 生成中にwatchdogが打ち切り裁定済み — 結果は保存するが
+                # 裁定は覆さない (クライアントは既にerrorを見ている)
+                j["path"] = str(out)
+                log(f"watchdog打ち切り済みジョブが完走: 成果物={out} "
+                    "(statusはerrorのまま)")
+            else:
+                j["path"] = str(out)
+                j["status"] = "done"
+                j["progress"] = 1.0
+                log(f"完了: {out}")
         except JobCancelled:
-            j["status"] = "cancelled"
-            j["detail"] = "ユーザーによりキャンセル"
+            if j.get("status") != "error":     # watchdog裁定は上書きしない
+                j["status"] = "cancelled"
+                j["detail"] = "ユーザーによりキャンセル"
             # 中断で放置された中間テンソルが次のジョブをOOMさせないように
             _free_cuda(log)
         except Exception as e:
@@ -3980,6 +4072,9 @@ def worker_loop():
                 if (_req0 is not None
                         and (_req0.extra or {}).get("retry_on_oom")
                         and not j.get("_oom_retried")
+                        and not j.get("_cancel")   # キャンセル済みは再試行
+                        #                            しない (競合での_req
+                        #                            永久残留防止 v0.9.13)
                         and str((_req0.extra or {}).get("offload") or "")
                         != "block"):
                     j["_oom_retried"] = True
@@ -3991,6 +4086,7 @@ def worker_loop():
                     _free_cuda(log)
                     j["status"] = "queued"
                     j["progress"] = 0.0
+                    j["finished"] = None   # watchdog等の終了刻印をクリア
                     j["detail"] = "OOM -> block offloadで自動再試行"
                     j["_requeue"] = True
                     print(f"[{jid}] OOM -> block offloadで自動再試行",
@@ -4016,15 +4112,23 @@ def worker_loop():
                 j.pop("_req", None)
 
 
+_WORKER_STALLED = False    # watchdogがrunning/loadingを打ち切った=worker
+#                            スレッドがハングしている疑い (popで解除)
+
+
 def _watchdog_scan(now: float | None = None) -> list:
     """生成watchdog (P1) の1スキャン: running/loading ジョブの鼓動が
     VIDEOLAB_STALL_MIN分 (既定15) 途絶えていたらstalled扱いにする。
     処理したジョブidのリストを返す (テスト用)。
 
-    ハングしたworkerスレッドはPythonからkillできないため、ジョブを
-    error化してクライアントの永久待ちを解き、VIDEOLAB_WATCHDOG_EXIT=1
-    のときはプロセスごと自沈する (Colab自動運転の張り直しと対にすると
-    「無応答のまま課金」の根治になる)。"""
+    ハングしたworkerスレッドはPythonからkillできない。ジョブをerror化して
+    クライアントの永久待ちを解き、以後のスキャンでは「workerが死んでいる
+    疑い」フラグを立てて後続のqueuedジョブも即error化する (キューの
+    消費者が消えているのに永久にqueuedのまま=飢餓の再発防止、v0.9.13
+    レビュー指摘)。VIDEOLAB_WATCHDOG_EXIT=1 のときは runtime.unassign で
+    VMごと解放して自沈する (Colabでは課金も止まる — 素のos._exitは
+    カーネルだけ死んで課金が続く、レビュー指摘で修正)。"""
+    global _WORKER_STALLED
     try:
         stall_min = float(os.environ.get("VIDEOLAB_STALL_MIN", "15") or 15)
     except ValueError:
@@ -4046,12 +4150,29 @@ def _watchdog_scan(now: float | None = None) -> list:
                        "(生成ハング疑い。Colabランタイムの張り直しを推奨)")
         j["finished"] = now
         hit.append(j["id"])
+        _WORKER_STALLED = True
         print(f"[{j['id']}] WATCHDOG: {int(age // 60)}分無応答 -> stalled",
               flush=True)
+    if _WORKER_STALLED:
+        # workerスレッドがハング中の疑い: queuedのジョブは誰にも実行され
+        # ない — 永久待ちにせず明示エラーで返す (workerが復活してpopしたら
+        # フラグは解除され、新規ジョブは通常どおり動く)
+        for j in list(JOBS.values()):
+            if j.get("status") != "queued":
+                continue
+            j["status"] = "error"
+            j["detail"] = ("watchdog: workerが停止している疑いのため実行"
+                           "できません (Colabランタイムを張り直して再投入"
+                           "してください)")
+            j["finished"] = now
+            j.pop("_req", None)
+            hit.append(j["id"])
+            print(f"[{j['id']}] WATCHDOG: worker停止疑いのため実行不能",
+                  flush=True)
     if hit and os.environ.get("VIDEOLAB_WATCHDOG_EXIT") == "1":
         print("[videolab] VIDEOLAB_WATCHDOG_EXIT=1: ハング検知のため"
-              "プロセスを自沈します (張り直しで復旧)", flush=True)
-        os._exit(1)
+              "ランタイムを解放して自沈します (Colab=課金停止)", flush=True)
+        _shutdown_runtime(delay=0.5)
     return hit
 
 
@@ -4145,7 +4266,7 @@ def build_app(token: str | None):
         # 遅い」を区別できる。admission係数の公開はクライアントの
         # plan_canvasと見積もり式を単一ソース化するため (P0-3)
         job = None
-        for _j in JOBS.values():
+        for _j in list(JOBS.values()):   # 並行submitとの競合防止 (v0.9.13)
             if _j.get("status") in ("running", "loading"):
                 _b = _j.get("_beat") or _j.get("started") or _j.get("created")
                 job = {"id": _j["id"], "status": _j["status"],
@@ -4160,6 +4281,7 @@ def build_app(token: str | None):
                 "auth": bool(token), "queued": WORK_Q.qsize(),
                 "current_model": CURRENT_MODEL, "gpu": gpu, "disk": disk,
                 "drive": drv, "libs": libs, "job": job, "ram": ram,
+                "worker_stalled": _WORKER_STALLED,
                 "admission": {"act_gb_per_lat_frame_720x1296": ACT_GB_PER_LAT,
                               "safety_gb": ACT_SAFETY_GB}}
 
