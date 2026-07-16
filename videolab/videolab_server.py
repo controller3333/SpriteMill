@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.11"  # 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
+__version__ = "0.9.12"  # 0.9.12: OOM/フリーズしない保証+quant開通 (P0-P2)
+# 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
 #         ではDiTを1体ロードするごとに即ディスク退避 (2体+18GBの同時保持を
 #         排除。anisoraはLoRA非搭載で安全、vaceはLightning適用があるため
 #         従来順)。UMT5遅延ロードにlow_cpu_mem_usage (二重確保の排除)。
@@ -172,13 +173,25 @@ def find_ffmpeg() -> str | None:
 
 
 def encode_mp4(ffmpeg: str, frames_dir: Path, fps: int, dest: Path) -> None:
-    """連番PNG -> H.264 mp4(ブラウザ再生互換の yuv420p)。"""
+    """連番PNG -> H.264 mp4(ブラウザ再生互換の yuv420p)。
+
+    timeout必須 (P1): ffmpegの無限ハングは単一workerの全キューを永久停止
+    させる (「フリーズしない保証」の穴の一つ、2026-07-16調査)。81f級の
+    エンコードは数十秒なので既定15分は十分すぎる余白。"""
     cmd = [ffmpeg, "-y", "-framerate", str(fps),
            "-i", str(frames_dir / "%05d.png"),
            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
            "-movflags", "+faststart", str(dest)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        to = int(os.environ.get("VIDEOLAB_FFMPEG_TIMEOUT", "900") or 900)
+    except ValueError:
+        to = 900
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=to)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffmpegが{to}秒でタイムアウトしました "
+                           "(ハング検知 — VIDEOLAB_FFMPEG_TIMEOUTで調整可)")
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {r.stderr[-800:]}")
 
@@ -280,6 +293,157 @@ def _disk_used_gb() -> float:
         return shutil.disk_usage(str(Path.home())).used / 2**30
     except Exception:
         return -1.0
+
+
+# ---------------------------------------------------------------- 保証機構
+# 「OOM・フリーズしない保証」(2026-07-16調査に基づくv0.9.12):
+# クライアントのplan_canvasは最適寸法の設計、サーバ側は拒否/降格の最終
+# 防衛線という役割分担。係数は/healthで公開して単一ソース化する。
+ACT_GB_PER_LAT = 0.85     # 活性化GB/latentフレーム @720x1296 (A100実測、
+#                           クライアントplan_canvasと同一係数)
+ACT_SAFETY_GB = 1.5       # CUDAコンテキスト・断片化の口銭 (同上)
+
+
+def _avail_ram_gb() -> float:
+    """空きシステムRAM (GB)。測れなければ -1。"""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 2**30
+    except Exception:
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemAvailable"):
+                        return int(line.split()[1]) * 1024 / 2**30
+        except Exception:
+            pass
+        return -1.0
+
+
+def _gguf_gb(*paths) -> float:
+    """GGUFファイル群の実サイズ合計 (GB)。読めないものは0扱い。"""
+    total = 0.0
+    for p in paths:
+        try:
+            total += os.path.getsize(str(p)) / 2**30
+        except Exception:
+            pass
+    return total
+
+
+def _ram_gate(log, need_gb: float, what: str) -> None:
+    """ロード前RAMゲート (P0-2): RAM OOM=VM killを実行前の明示エラーへ。
+
+    RAM側OOMはカーネルのOOM killでプロセスごと消え、クライアントには
+    「無応答のまま課金」として見える (2026-07-13/16に実障害5件)。
+    ロード開始前に空きRAMと見積もりを突き合わせ、不足なら対処法つきで
+    ジョブエラーにする。VIDEOLAB_RAM_GATE=off で無効。"""
+    if os.environ.get("VIDEOLAB_RAM_GATE", "on").strip().lower() in (
+            "off", "0", "false", "no"):
+        return
+    if need_gb <= 0:
+        return
+    avail = _avail_ram_gb()
+    if avail < 0:
+        return                      # 測れない環境ではゲートしない
+    if avail >= need_gb:
+        log(f"RAMゲート[{what}]: 必要≈{need_gb:.0f}GB / 空き{avail:.0f}GB OK")
+        return
+    raise RuntimeError(
+        f"システムRAM不足の見込みのため{what}を中止しました "
+        f"(必要≈{need_gb:.0f}GB > 空き{avail:.0f}GB)。このまま進むと"
+        "VMごとOOM killされ「無応答のまま課金」になります。対処: "
+        "①quantを下げる (例 Q3_K_S) ②高RAM VM/上位GPUを引き直す "
+        "③リファイン専用ならLow専用ロード (latent_from指定で自動) "
+        "④どうしても試すなら VIDEOLAB_RAM_GATE=off")
+
+
+def _norm_quant(q, default: str = "Q4_0", allow_bf16: bool = False) -> str:
+    """量子化指定の正規化+検証 (P2: quantラダー開通)。
+
+    旧実装は未知値を黙ってQ4_0へ矯正しており、Q3_K_S等の下位quantを
+    渡しても「エラーすら出ずQ4_0で走る」偽成功だった (2026-07-16調査)。
+    GGUF命名 (Q4_0/Q8_0/Q3_K_S/Q5_K_M...) に合う値だけ通し、合わないものは
+    明示エラー。在庫の有無はHF側の404が教えてくれる (_hf_preflightで前倒し)。"""
+    s = str(q or default).strip()
+    if allow_bf16 and s.lower() == "bf16":
+        return "bf16"
+    import re as _re
+    sn = s.upper().replace("-", "_")
+    if _re.fullmatch(r"Q\d(_\d|_K(_[SML])?)", sn):
+        return sn
+    raise ValueError(
+        f"未知の量子化指定: {q!r} (例: Q4_0 / Q8_0 / Q3_K_S / Q5_K_M"
+        + (" / bf16" if allow_bf16 else "") + ")")
+
+
+def _hf_file_missing(repo: str, filename: str):
+    """HFリポにファイルが無いことが確定したらTrue。判定不能はNone。
+    (オフライン/Drive固定運転/テストの偽hubでは None -> 従来どおり
+    ダウンロード側に任せる)"""
+    try:
+        from huggingface_hub import file_exists
+        return not bool(file_exists(repo, filename))
+    except Exception:
+        return None
+
+
+def _act_estimate_gb(w: int, h: int, n: int) -> float:
+    """生成活性化のピークVRAM見積もり (GB)。plan_canvasと同一式。"""
+    lat = (max(2, int(n)) - 1) // 4 + 2      # +1=VACE参照タイムスロット
+    return ACT_GB_PER_LAT * lat * (float(w) * float(h)) / (720.0 * 1296.0)
+
+
+def _admit_vram(w: int, h: int, n: int, log, resident_extra_gb: float = 0.0,
+                downgrade=None, tag: str = "") -> None:
+    """生成直前VRAMゲート (P0-3): 空きVRAMと活性化見積もりを突き合わせ、
+    不足なら downgrade() (block offloadへの組み替え等) を1回試し、それでも
+    不足なら数十分燃やす前に明示エラーで返す。GPUの無い環境 (テスト等) は
+    何もしない。VIDEOLAB_ADMIT=off で無効。"""
+    if os.environ.get("VIDEOLAB_ADMIT", "on").strip().lower() in (
+            "off", "0", "false", "no"):
+        return
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        free = torch.cuda.mem_get_info()[0] / 2**30
+    except Exception:
+        return
+    act = _act_estimate_gb(w, h, n)
+    need = act + resident_extra_gb + ACT_SAFETY_GB
+    if free >= need:
+        log(f"VRAM admission[{tag}]: 必要≈{need:.1f}GB "
+            f"(活性化{act:.1f}+常駐余地{resident_extra_gb:.1f}) / "
+            f"空き{free:.1f}GB OK")
+        return
+    if downgrade is not None:
+        log(f"⚠ VRAM不足見込み (必要≈{need:.1f}GB > 空き{free:.1f}GB) "
+            "-> 省メモリ構成へ自動降格します (低速・確実)")
+        try:
+            downgrade()
+        except Exception as e:      # noqa: BLE001
+            log(f"自動降格に失敗 (そのまま判定続行): {str(e)[:120]}")
+        try:
+            import torch
+            free = torch.cuda.mem_get_info()[0] / 2**30
+        except Exception:
+            return
+        need = act + ACT_SAFETY_GB      # 降格後は重みがVRAM外
+        if free >= need:
+            log(f"VRAM admission[{tag}]: 降格後OK "
+                f"(必要≈{need:.1f}GB / 空き{free:.1f}GB)")
+            return
+    import math as _math
+    scale = max(0.05, (free - ACT_SAFETY_GB - resident_extra_gb)
+                / max(0.05, act))
+    sw = max(96, int(w * _math.sqrt(scale)) // 16 * 16)
+    sh = max(96, int(h * _math.sqrt(scale)) // 16 * 16)
+    raise RuntimeError(
+        f"VRAM不足の見込みのため生成前に中止しました "
+        f"(必要≈{need:.1f}GB > 空き{free:.1f}GB, {w}x{h}/{n}f)。"
+        f"対処: ①解像度を下げる (目安 {sw}x{sh} 以下) ②フレームを減らす "
+        "(49→33) ③extra.offload=block ④VIDEOLAB_ADMIT=off (非推奨)")
 
 
 def _run_with_stall_watch(cmd, env, log, tag, stall_secs=90) -> int:
@@ -636,20 +800,25 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
 
 def _drive_manifest() -> list:
     """Drive固定運転が要求する全部品 (Q4_0既定構成、v0.8.9)。
-    リポ名はアダプタ定数から導出してドリフトを防ぐ。"""
+    リポ名はアダプタ定数から導出してドリフトを防ぐ。
+    v0.9.12: quantをVIDEOLAB_DRIVE_QUANTで差し替え可能に (Q3_K_S運用等。
+    AniSora High側の棚在庫はQ4_0/Q8_0のみなのでHighだけ別ノブ)。"""
     va = ADAPTERS.get("vace")
     an = ADAPTERS.get("anisora")
     rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
                          "lightx2v/Wan2.2-Lightning")
     fold = os.environ.get("VIDEOLAB_VACE_LORA_DIR",
                           "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
+    dq = os.environ.get("VIDEOLAB_DRIVE_QUANT", "Q4_0").strip() or "Q4_0"
+    hq = (os.environ.get("VIDEOLAB_DRIVE_QUANT_HIGH", "").strip()
+          or (dq if dq in ("Q4_0", "Q8_0") else "Q4_0"))
     return [
         ("file", va.gguf_repo,
-         "HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-Q4_0.gguf"),
+         f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-{dq}.gguf"),
         ("file", va.gguf_repo,
-         "LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-Q4_0.gguf"),
-        ("file", an.gguf_repo, "High/Index-Anisora-V3.2-High-Q4_0.gguf"),
-        ("file", an.gguf_repo, "Low/Index-Anisora-V3.2-Low-Q4_0.gguf"),
+         f"LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-{dq}.gguf"),
+        ("file", an.gguf_repo, f"High/Index-Anisora-V3.2-High-{hq}.gguf"),
+        ("file", an.gguf_repo, f"Low/Index-Anisora-V3.2-Low-{dq}.gguf"),
         ("file", rep, f"{fold}/high_noise_model.safetensors"),
         ("file", rep, f"{fold}/low_noise_model.safetensors"),
         ("snap", va.repo, None),
@@ -1288,10 +1457,77 @@ class _WanA14BBase(VideoAdapter):
         self.pipe = None
         self._te_lazy = False    # 低RAM VM: UMT5を持たずにロードしたか
         self._te_from = None     # UMT5遅延ロード元リポ
+        self._offload_mode = ""  # _finalize_pipeが確定した実効モード
+        self._dit_gb = 0.0       # DiT1体の実サイズ (admission用)
 
     def unload(self, log):
         self.pipe = None
         self.loaded = False
+
+    def ensure_loaded(self, log):
+        """ロード失敗時の部分pipe残留を根絶する共通ガード (P0-1)。
+
+        途中まで構築されたpipe (DiT数GB) が残ったまま次のジョブが再ロード
+        すると二重常駐になり、RAM OOM=VM killに至る (2026-07-16調査で
+        現存経路と確認: LoRA適用失敗・DL途中エラー→リトライの型)。"""
+        try:
+            self._ensure_loaded_impl(log)
+        except Exception:
+            try:
+                self.unload(log)
+            except Exception:
+                pass
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            _free_cuda(log)
+            raise
+
+    def _ensure_loaded_impl(self, log):
+        raise NotImplementedError
+
+    def _admit(self, w: int, h: int, n: int, log, tag: str = "") -> None:
+        """生成直前VRAMゲート (P0-3) のアダプタ向け窓口。実効オフロード
+        モードから常駐余地と降格手段を組み立てて _admit_vram へ渡す。"""
+        mode = getattr(self, "_offload_mode", "")
+        _admit_vram(
+            w, h, n, log,
+            resident_extra_gb=((getattr(self, "_dit_gb", 0.0) or 9.3)
+                               if mode == "model"
+                               else (0.5 if mode in ("block", "seq")
+                                     else 0.0)),
+            downgrade=((lambda: self._downgrade_to_block(log))
+                       if mode in ("cuda", "model") else None),
+            tag=tag or self.id)
+
+    def _downgrade_to_block(self, log):
+        """常駐/モデルオフロード構成をblock offloadへ組み替える (P0-3の
+        自動降格)。DiTをCPUへ落としてからgroup offloadフックを付ける。
+        失敗しても例外は投げない (admission側が再判定する)。"""
+        pipe = self.pipe
+        if pipe is None:
+            return
+        seen = set()
+        for name in ("transformer", "transformer_2"):
+            m = getattr(pipe, name, None)
+            if m is None or id(m) in seen:      # liteモードはHigh=Lowの別名
+                continue
+            seen.add(id(m))
+            if self._group_offloaded(m):
+                continue
+            try:
+                m.to("cpu")
+            except Exception:
+                pass
+            self._try_group_offload(m, log, f"{name}(自動降格)")
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+        _free_cuda(log)
+        self._offload_mode = "block"
 
     @staticmethod
     def _try_group_offload(model, log, label) -> bool:
@@ -1484,6 +1720,7 @@ class _WanA14BBase(VideoAdapter):
                     pass
                 log("block offload: VRAM使用=活性化ぶんのみ "
                     "(重み転送のぶん低速・16GB未満級GPU向け)")
+                self._offload_mode = "block"
                 return self._log_attn_backend(log)
             mode = "model"   # 適用不可 -> 従来経路へ
 
@@ -1498,6 +1735,7 @@ class _WanA14BBase(VideoAdapter):
                     except Exception as e:
                         log(f"VAEタイリング設定スキップ: {e}")
                 # (静止画encodeのみのモデルは常駐時タイリング不要=デコード最速)
+                self._offload_mode = "cuda"
                 return self._log_attn_backend(log)
             except Exception as e:   # OOM等 -> オフロードへ退避
                 log(f"GPU常駐に失敗({str(e)[:120]}) -> model_cpu_offloadへ")
@@ -1508,6 +1746,7 @@ class _WanA14BBase(VideoAdapter):
         else:
             self.pipe.enable_model_cpu_offload()
             log("enable_model_cpu_offload")
+        self._offload_mode = mode
         try:
             self.pipe.vae.enable_tiling()
         except Exception:
@@ -1576,6 +1815,7 @@ class _WanA14BBase(VideoAdapter):
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
+        self._admit(w, h, n, log)          # 生成直前VRAMゲート (P0-3)
         img = _fit_image(req.images[0], w, h)
         kw = dict(image=img,
                   width=w, height=h, num_frames=n,
@@ -1821,11 +2061,11 @@ class AniSoraAdapter(_WanA14BBase):
         extra {"quant": "Q4_0", "offload": "seq"} で指定できる(共通設定、
         2026-07-12要望: A100ばかり使えないのでL4はQ4_0で運用したい)。"""
         # 既定Q4_0 (2026-07-13方針: VRAM16GB未満級を上限に。Q8はGUI選択肢
-        # からも撤廃済みで、明示指定されたときだけ受理する)
-        q = str((extra or {}).get("quant")
-                or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0"))
-        if q not in ("Q4_0", "Q8_0"):     # High側はQ4_0/Q8_0のみ存在
-            q = "Q4_0"
+        # からも撤廃済みで、明示指定されたときだけ受理する)。v0.9.12で
+        # Q3_K_S等の下位quantも受理 (棚在庫はLow側のみ完備 — High側は
+        # Q4_0/Q8_0だけなので _ensure_loaded_impl がHighを自動代替する)
+        q = _norm_quant((extra or {}).get("quant")
+                        or os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0"))
         # 既定は "" = auto (VRAMを見てGPU常駐 or model_cpu_offloadを選ぶ)。
         # "seq" のみ明示指定 (12GB級の省メモリモード)。
         off = str((extra or {}).get("offload")
@@ -1845,35 +2085,79 @@ class AniSoraAdapter(_WanA14BBase):
             off = ""
         return q, off
 
-    def ensure_loaded(self, log):
+    @staticmethod
+    def _lite_wanted(extra: dict) -> bool:
+        """リファイン専用ジョブ (latent_from / refine_frames_b64) はLow体
+        だけで完結する: σ<boundary(0.9)の尻尾は全stepがtransformer_2(Low)
+        へルーティングされ、Highは一度も呼ばれない (2026-07-16調査で
+        コード裏取り済み — 従来はロードだけして丸ごとCPU退避していた)。
+        Highを積まないことで RAM/DL 約9GB (Q4) を節約し、Low側にしか
+        棚在庫が無いQ3_K_S等も完全に使える。VIDEOLAB_ANISORA_LITE=off
+        で従来動作 (常にHigh込み) へ戻せる。"""
+        if os.environ.get("VIDEOLAB_ANISORA_LITE", "on").strip().lower() in (
+                "off", "0", "false", "no"):
+            return False
+        e = extra or {}
+        return bool(e.get("latent_from") or e.get("refine_frames_b64"))
+
+    def _ensure_loaded_impl(self, log):
         _require_deps(log)
         import torch
         from diffusers import (GGUFQuantizationConfig, WanImageToVideoPipeline,
                                WanTransformer3DModel)
         from huggingface_hub import hf_hub_download
         quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
+        lite = self._lite_wanted(getattr(self, "_next_extra", {}))
+        # High側の棚在庫はQ4_0/Q8_0のみ (2026-07-16 HF tree API実測)。
+        # 下位quant指定時はHighだけQ4_0で代替する (混載ペア。Highは序盤
+        # 数stepの構図担当なので品質影響は小さい)。在庫が確認できない
+        # 環境 (Drive固定・オフライン) では要求どおり試して404に任せる
+        hq = quant
         gguf_high = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
+        if not lite and quant not in ("Q4_0", "Q8_0") \
+                and _hf_file_missing(self.gguf_repo, gguf_high):
+            hq = "Q4_0"
+            gguf_high = f"High/Index-Anisora-V3.2-High-{hq}.gguf"
+            log(f"High側に{quant}の在庫が無いためHighのみQ4_0で代替します "
+                "(Low側は指定どおり)")
         gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
-        log(f"GGUF DL: {self.gguf_repo} {quant} "
-            f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB'})")
-        hi = _hf_download(self.gguf_repo, gguf_high, log)
+        if lite:
+            log(f"リファイン専用ロード: Low単体 {quant} (High省略で"
+                "RAM/DL約9GB節約。VIDEOLAB_ANISORA_LITE=offで従来動作)")
+            hi = None
+        else:
+            log(f"GGUF DL: {self.gguf_repo} {quant} "
+                f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB前後'})")
+            hi = _hf_download(self.gguf_repo, gguf_high, log)
         lo = _hf_download(self.gguf_repo, gguf_low, log)
         # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策の
         # 多段DLに乗せる。transformer重みは除外済みの約12GB)
         snap = _snapshot_local(self.base_repo, log)
+        self._te_lazy = _low_ram_vm()
         # 低RAM VM×block退避では「1体ロードするごとに即ディスク退避」:
         # 2体(約18GB)をRAMへ積んでからまとめて退避すると、その瞬間の山が
         # T4(51GB)の残りRAMに刺さる (2026-07-16実障害: anisora切替段で
         # メモリ黄色→VM死。anisoraはLoRAを載せないため早期退避が安全 —
         # vaceはLightning適用が後segueするため従来順のまま)
         _early_off = (offload == "block" and _low_ram_vm(60.0))
-        log("transformer(High) 読み込み — configはWan2.2ベースを明示")
-        t_hi = WanTransformer3DModel.from_single_file(
-            hi, quantization_config=qc, config=snap,
-            subfolder="transformer", torch_dtype=_pick_dtype())
-        if _early_off:
-            self._try_group_offload(t_hi, log, "transformer(早期退避)")
+        # ロード前RAMゲート (P0-2): GGUF実サイズからロードピークを見積もり、
+        # VM killになる前に明示エラーで止める。早期ディスク退避時は同時
+        # 常駐が1体ぶんに減る。サイズが取れない環境 (テスト/Drive未DL) は
+        # ゲートしない
+        gg = _gguf_gb(*(p for p in (hi, lo) if p))
+        if gg >= 1.0:
+            _peak = ((max(_gguf_gb(hi), _gguf_gb(lo)) if _early_off else gg)
+                     + 12 + (0 if self._te_lazy else 11) + 6)
+            _ram_gate(log, _peak, f"AniSora {quant} 読み込み")
+        t_hi = None
+        if hi is not None:
+            log("transformer(High) 読み込み — configはWan2.2ベースを明示")
+            t_hi = WanTransformer3DModel.from_single_file(
+                hi, quantization_config=qc, config=snap,
+                subfolder="transformer", torch_dtype=_pick_dtype())
+            if _early_off:
+                self._try_group_offload(t_hi, log, "transformer(早期退避)")
         log("transformer_2(Low) 読み込み")
         t_lo = WanTransformer3DModel.from_single_file(
             lo, quantization_config=qc, config=snap,
@@ -1881,7 +2165,6 @@ class AniSoraAdapter(_WanA14BBase):
         if _early_off:
             self._try_group_offload(t_lo, log, "transformer_2(早期退避)")
         pipe_kwargs = {}
-        self._te_lazy = _low_ram_vm()
         if self._te_lazy:
             # v0.8.2: 低RAM VM (L4=53GB) ではUMT5(11GB)を持たずにロードし、
             # ジョブ内で一時ロード→即解放する (handoff v0.7.6と同じ対策。
@@ -1890,27 +2173,47 @@ class AniSoraAdapter(_WanA14BBase):
             pipe_kwargs["text_encoder"] = None
             log("低RAM VM: UMT5はロードせずジョブ内で一時ロードします")
         log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
+        # liteモードはtransformerにもLowを渡す (同一オブジェクトの別名)。
+        # None渡しはWanImageToVideoPipeline.__call__内の属性参照で壊れる
+        # 可能性があるため、実体共有=追加メモリゼロの別名が安全
         self.pipe = WanImageToVideoPipeline.from_pretrained(
-            snap, transformer=t_hi, transformer_2=t_lo,
+            snap, transformer=(t_hi if t_hi is not None else t_lo),
+            transformer_2=t_lo,
             torch_dtype=_pick_dtype(), **pipe_kwargs)
         self._te_from = snap
-        # GPU常駐可否の判定用フットプリント(GB): High+Low GGUF常駐 +
+        # GPU常駐可否の判定用フットプリント(GB): GGUF実サイズ +
         # bf16テキストエンコーダ(~6) + VAE(~0.5) + 生成アクティベーション(~4)
-        fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
-        if self._te_lazy:
-            fp -= 6          # UMT5不在ぶん常駐判定を緩める
+        # サイズが取れない環境では従来の固定表へフォールバック
+        if gg >= 1.0:
+            fp = gg + (0 if self._te_lazy else 6) + 4.5
+            self._dit_gb = max(_gguf_gb(hi), _gguf_gb(lo))
+        else:
+            fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
+            if lite:
+                fp -= 9
+            if self._te_lazy:
+                fp -= 6          # UMT5不在ぶん常駐判定を緩める
+            self._dit_gb = {"Q8_0": 16.0}.get(quant, 9.3)
         self._finalize_pipe(log, offload=offload, footprint_gb=fp, gguf=True)
         self.loaded_quant, self.loaded_offload = quant, offload
+        self.loaded_lite = lite
         self.loaded = True
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         # 量子化/オフロード指定がロード時と違う場合は積み替え (共通設定を
-        # ジョブ単位で反映するため。切替は数分かかるので必要時のみ)
+        # ジョブ単位で反映するため。切替は数分かかるので必要時のみ)。
+        # Low単体(lite)ロード中に通常i2vジョブが来たらHigh込みへ積み替え
+        # (逆=High込みでリファインはそのまま賄える)
         want = self._resolve_want(req.extra)
-        if self.loaded and want != (getattr(self, "loaded_quant", None),
-                                    getattr(self, "loaded_offload", None)):
-            log(f"設定変更 {self.loaded_quant}/{self.loaded_offload} -> "
-                f"{want[0]}/{want[1]}: モデルを積み替えます")
+        lite = self._lite_wanted(req.extra)
+        if self.loaded and (
+                want != (getattr(self, "loaded_quant", None),
+                         getattr(self, "loaded_offload", None))
+                or (getattr(self, "loaded_lite", False) and not lite)):
+            log(f"設定変更 {self.loaded_quant}/{self.loaded_offload}"
+                f"{'/Low単体' if getattr(self, 'loaded_lite', False) else ''}"
+                f" -> {want[0]}/{want[1]}{'' if lite else '/High込み'}: "
+                "モデルを積み替えます")
             self.unload(log)
             _free_cuda(log)
         if not self.loaded:
@@ -1981,7 +2284,11 @@ class AniSoraAdapter(_WanA14BBase):
         # encodeスパイク9-12GBで39.5GBの天井に激突した) ----
         moved_back = []
         hi_t = getattr(pipe, "transformer", None)
-        if (hi_t is not None and _dev_of(hi_t) == "cuda"
+        if (hi_t is not None
+                and hi_t is not getattr(pipe, "transformer_2", None)
+                # ↑Low単体(lite)ロードではtransformer=transformer_2の別名。
+                #  退避するとLow本体まで消える (v0.9.12)
+                and _dev_of(hi_t) == "cuda"
                 and not self._group_offloaded(hi_t)):
             # block offload時は重みが既にCPU側 (.to()はdiffusersが拒否)
             log("リファイン: High側transformerをCPUへ退避 (尻尾では不使用)")
@@ -2014,6 +2321,9 @@ class AniSoraAdapter(_WanA14BBase):
                 pass
 
         _vram("encode前")
+        # 生成直前VRAMゲート (P0-3): High退避後の空きで判定し、不足なら
+        # block offloadへ自動降格 -> それでも足りなければ実行前に明示エラー
+        self._admit(w, h, n, log, tag="refine")
         if lat_from:
             # VAEを一切通さないlatent直読み: decode→encode往復の劣化と
             # 一括encodeのVRAMスパイクが両方消える
@@ -2023,8 +2333,12 @@ class AniSoraAdapter(_WanA14BBase):
                     f"latent_from={lat_from}: latent.pt がありません "
                     "(extra.emit_latent付きのvaceジョブIDを指定)")
             with torch.no_grad():
-                x0 = torch.load(lp, map_location="cpu").to(
-                    dev, torch.float32)
+                try:
+                    x0 = torch.load(lp, map_location="cpu",
+                                    weights_only=True)
+                except TypeError:                    # 旧torch
+                    x0 = torch.load(lp, map_location="cpu")
+                x0 = x0.to(dev, torch.float32)
             t_expect = (n - 1) // 4 + 1
             if x0.shape[2] != t_expect:
                 raise RuntimeError(
@@ -2381,11 +2695,12 @@ class VACEAdapter(_WanA14BBase):
         おっきいほうが使われます」対応 — 従来vaceはbf16固定だった)。
         戻り値 = (quant, offload, base, experts, patch)。"""
         e = extra or {}
-        # 既定Q4_0 (2026-07-13方針: 16GB未満級を上限に。Q8/bf16は明示時のみ)
-        q = str(e.get("quant")
-                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
-        if q not in ("Q4_0", "Q8_0", "bf16"):
-            q = "Q4_0"
+        # 既定Q4_0 (2026-07-13方針: 16GB未満級を上限に。Q8/bf16は明示時のみ)。
+        # v0.9.12でQ3_K_S等の下位quantも受理 (VACE-FunはHigh/Low対称で
+        # Q3_K_S〜Q8_0の棚在庫あり。Q2_Kは不在=プリフライトが即エラー)
+        q = _norm_quant(e.get("quant")
+                        or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"),
+                        allow_bf16=True)
         off = str(e.get("offload")
                   or os.environ.get("VIDEOLAB_OFFLOAD", "")).lower()
         # "model"(=model_cpu_offload) も受理する: エンジンは大判の
@@ -2431,7 +2746,7 @@ class VACEAdapter(_WanA14BBase):
             lora = ""
         return q, off, base, experts, patch, lora
 
-    def ensure_loaded(self, log):
+    def _ensure_loaded_impl(self, log):
         _require_deps(log)
         import gc
         import torch
@@ -2473,13 +2788,29 @@ class VACEAdapter(_WanA14BBase):
                          f"{quant}.gguf")
             gguf_low = (f"LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-"
                         f"{quant}.gguf")
+            # 在庫プリフライト (P2): 棚に無いquant (Q2_K等) は多段DLの
+            # 数分のリトライを燃やす前に即エラーで知らせる
+            if quant not in ("Q4_0", "Q8_0") \
+                    and _hf_file_missing(self.gguf_repo, gguf_high):
+                raise RuntimeError(
+                    f"{self.gguf_repo} に {quant} の在庫がありません "
+                    "(棚在庫: Q3_K_S/Q3_K_M/Q4_0/Q4_K_S/Q4_K_M/Q5_K_S/"
+                    "Q5_0/Q5_K_M/Q6_K/Q8_0)")
             qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
             log(f"GGUF DL: {self.gguf_repo} {quant} "
-                f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB'})")
+                f"(High+Low 各{'15.5GB' if quant == 'Q8_0' else '8.5GB前後'})")
             hi = _hf_download(self.gguf_repo, gguf_high, log)
             lo = _hf_download(self.gguf_repo, gguf_low, log)
             # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策)
             snap = _snapshot_local(self.repo, log)
+            # ロード前RAMゲート (P0-2): VACE2体 + (移植時) ドナー1体分の
+            # 同時常駐がロードピーク。サイズ不明 (テスト等) はゲートしない
+            _vgg = _gguf_gb(hi, lo)
+            if _vgg >= 1.0:
+                _donor = 16.0 if quant == "Q8_0" else 9.3
+                _ram_gate(log, _vgg + (_donor if base == "anisora" else 0)
+                          + 12 + (0 if self._te_lazy else 11) + 6,
+                          f"VACE {quant} 読み込み")
             log("transformer(HighNoise) 読み込み — configはVACEベースを明示")
             t_hi = WanVACETransformer3DModel.from_single_file(
                 hi, quantization_config=qc, config=snap,
@@ -2499,7 +2830,17 @@ class VACEAdapter(_WanA14BBase):
                         log(f"AniSora移植[{tag}]: スキップ "
                             f"(vace_experts={experts})")
                         continue
-                    fname = f"{tag}/Index-Anisora-V3.2-{tag}-{quant}.gguf"
+                    dq = quant
+                    fname = f"{tag}/Index-Anisora-V3.2-{tag}-{dq}.gguf"
+                    # AniSora High側の棚在庫はQ4_0/Q8_0のみ — 下位quant時は
+                    # HighドナーだけQ4_0で代替 (2026-07-16 HF実測)
+                    if (tag == "High" and dq not in ("Q4_0", "Q8_0")
+                            and _hf_file_missing(self.anisora_gguf_repo,
+                                                 fname)):
+                        dq = "Q4_0"
+                        fname = f"{tag}/Index-Anisora-V3.2-{tag}-{dq}.gguf"
+                        log(f"AniSora移植[High]: {quant}の在庫が無いため"
+                            "Q4_0ドナーで代替します")
                     log(f"AniSora GGUF DL: {self.anisora_gguf_repo} {fname}")
                     dp = _hf_download(self.anisora_gguf_repo, fname, log)
                     log(f"AniSora {tag} 読み込み (移植ドナー・config="
@@ -2518,14 +2859,24 @@ class VACEAdapter(_WanA14BBase):
             self.pipe = WanVACEPipeline.from_pretrained(
                 snap, transformer=t_hi, transformer_2=t_lo,
                 torch_dtype=_pick_dtype(), **pipe_kwargs)
-            # GGUF常駐 + UMT5(~6.7GB) + VAE + 81f骨格制御の活性化(~9GB)
-            fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
+            # GGUF常駐 + UMT5(~6.7GB) + VAE。サイズが取れない環境 (テスト
+            # /Drive未DL) は従来の固定表へフォールバック (81f骨格制御の
+            # 活性化~9GBはmarginが受け持つ)
+            if _vgg >= 1.0:
+                fp = _vgg + (0 if self._te_lazy else 6.7) + 1.0
+                self._dit_gb = max(_gguf_gb(hi), _gguf_gb(lo))
+            else:
+                fp = {"Q4_0": 27, "Q8_0": 42}.get(quant, 42)
+                if self._te_lazy:
+                    fp -= 6      # UMT5不在ぶん常駐判定を緩める
+                self._dit_gb = {"Q8_0": 15.5}.get(quant, 10.3)
             margin = 10
             self._te_from = snap
         if quant == "bf16":
             self._te_from = self.repo
-        if self._te_lazy:
-            fp -= 6          # UMT5不在ぶん常駐判定を緩める
+            self._dit_gb = 29.0
+            if self._te_lazy:
+                fp -= 6          # UMT5不在ぶん常駐判定を緩める
         if lora == "lightning":
             # Lightning 4step蒸留LoRA (T2V-A14B用がVACE-Funに適合。
             # cfg=1で回すためCFGパスも消え、14step/cfg5比で約7倍速)。
@@ -2604,6 +2955,7 @@ class VACEAdapter(_WanA14BBase):
         h = _snap(req.height, 16, 240)
         n = max(5, ((int(req.num_frames) - 1) // 4) * 4 + 1)     # 4k+1
         steps = int(req.steps)
+        self._admit(w, h, n, log)          # 生成直前VRAMゲート (P0-3)
         if want[2] == "fun" and steps <= 12 and want[5] != "lightning":
             # 非蒸留の素のVACE-Funに蒸留レシピは「保証つきの泥」
             # (Lightning LoRA装着時は蒸留済みなので低stepが正解)
@@ -2869,10 +3221,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
     @staticmethod
     def _hybrid_want(extra: dict) -> tuple:
         e = extra or {}
-        q = str(e.get("quant")
-                or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
-        if q not in ("Q4_0", "Q8_0"):
-            q = "Q4_0"
+        q = _norm_quant(e.get("quant")
+                        or os.environ.get("VIDEOLAB_VACE_QUANT", "Q4_0"))
         try:
             boundary = float(e.get("hybrid_boundary")
                              or os.environ.get("VIDEOLAB_HYBRID_BOUNDARY",
@@ -2890,7 +3240,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         value = value.strip().lower()
         return "off" if value in ("off", "none", "0", "false") else "lightning"
 
-    def ensure_loaded(self, log):
+    def _ensure_loaded_impl(self, log):
         """必要なexpertだけロードする (VACE High + native AniSora Low)。"""
         _require_deps(log)
         import gc
@@ -2919,10 +3269,26 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             vp, quantization_config=qc, config=snap_vace,
             subfolder="transformer", torch_dtype=_pick_dtype())
 
+        # ロード前RAMゲート (P0-2): VACE High + ドナー + AniSora Low の
+        # 同時常駐がロードピーク (実測48GB級@Q4)。VACEサイズ+推定で判定
+        _vgg1 = _gguf_gb(vp)
+        if _vgg1 >= 1.0:
+            _dn = 16.0 if quant == "Q8_0" else 9.3
+            _ram_gate(log, _vgg1 + _dn * 2 + 12
+                      + (0 if _low_ram_vm() else 11) + 6,
+                      f"latent直結 {quant} 読み込み")
         # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
         # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
         ah_name = f"High/Index-Anisora-V3.2-High-{quant}.gguf"
-        log(f"latent直結ロード: AniSora High移植ドナー {quant}")
+        aq = quant
+        if aq not in ("Q4_0", "Q8_0") \
+                and _hf_file_missing(self.anisora_gguf_repo, ah_name):
+            # AniSora High側の棚在庫はQ4_0/Q8_0のみ (2026-07-16 HF実測)
+            aq = "Q4_0"
+            ah_name = f"High/Index-Anisora-V3.2-High-{aq}.gguf"
+            log(f"AniSora High移植ドナー: {quant}の在庫が無いため"
+                "Q4_0で代替します")
+        log(f"latent直結ロード: AniSora High移植ドナー {aq}")
         ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
         donor = WanTransformer3DModel.from_single_file(
             ahp, quantization_config=qc, config=snap_base,
@@ -2937,6 +3303,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         alow = WanTransformer3DModel.from_single_file(
             alp, quantization_config=qc, config=snap_base,
             subfolder="transformer_2", torch_dtype=_pick_dtype())
+        self._dit_gb = max(_gguf_gb(vp), _gguf_gb(alp)) or 9.3
 
         # 低RAM VM (L4=53GB) ではUMT5(約11GB)をロード段階から持たない:
         # ロードピーク=モデル一式+移植ドナー+UMT5≈48GBが天井を叩き、
@@ -3067,6 +3434,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         n = max(9, ((int(req.num_frames) - 1) // 8) * 8 + 1)
         steps = max(4, int(req.steps))
         guidance = float(req.guidance)
+        # 生成直前VRAMゲート (P0-3)。handoffは自前でDiTを1体ずつswapする
+        # ため常駐余地=DiT1体。降格レバーは無い (extra.offload=blockが既存)
+        _admit_vram(w, h, n, log,
+                    resident_extra_gb=getattr(self, "_dit_gb", 0.0) or 9.3,
+                    tag="handoff")
 
         pf = list(req.extra.get("pose_frames_b64") or [])
         if pf:
@@ -3353,7 +3725,7 @@ class Wan22A14BAdapter(_WanA14BBase):
         super().__init__()
         self._lora_state = None      # 直近に適用した (lightning, walk, weight)
 
-    def ensure_loaded(self, log):
+    def _ensure_loaded_impl(self, log):
         _require_deps(log)
         import torch
         from diffusers import WanImageToVideoPipeline
@@ -3474,6 +3846,7 @@ def worker_loop():
         def log(msg, _j=j):
             line = f"[{time.strftime('%H:%M:%S')}] {msg}"
             _j["log"].append(line)
+            _j["_beat"] = time.time()      # watchdog用の鼓動 (P1)
             print(f"[{_j['id']}] {msg}", flush=True)
             # ロード鼓動 (v0.8.3): モデルDL/読み込み中はログ1行ごとに
             # 進捗を+1%刻む (上限10%)。「ゲージが全く動かない」不安の解消
@@ -3486,6 +3859,7 @@ def worker_loop():
 
         def progress(p, _j=j):
             _j["progress"] = round(float(p), 4)
+            _j["_beat"] = time.time()      # watchdog用の鼓動 (P1)
             if _j.get("_cancel"):
                 raise JobCancelled()
             if (_j.get("_watch_poll") and time.time() - _j.get("_last_poll", 0)
@@ -3588,15 +3962,106 @@ def worker_loop():
             # 中断で放置された中間テンソルが次のジョブをOOMさせないように
             _free_cuda(log)
         except Exception as e:
-            j["status"] = "error"
-            j["detail"] = str(e)[:600]
-            j["log"].append(traceback.format_exc()[-1500:])
-            print(f"[{jid}] ERROR: {e}", flush=True)
-            # OOM等の失敗断片を回収してから次のジョブへ
-            _free_cuda(log)
+            # OOM専用ハンドラ (P2-6): 断片回収+降格提案つきの定型detail。
+            # extra.retry_on_oom 指定時は block offload で1回だけ自動再試行
+            _oom = False
+            try:
+                import torch
+                _oom = isinstance(e, torch.cuda.OutOfMemoryError)
+            except Exception:
+                pass
+            if _oom:
+                _p = j.get("params") or {}
+                _adv = (f"VRAM不足 (OOM): {_p.get('width')}x"
+                        f"{_p.get('height')}/{_p.get('num_frames')}f。"
+                        "対処: 解像度/フレームを下げる・extra.offload=block"
+                        "・quantを下げる (Q3_K_S等)")
+                _req0 = j.get("_req")
+                if (_req0 is not None
+                        and (_req0.extra or {}).get("retry_on_oom")
+                        and not j.get("_oom_retried")
+                        and str((_req0.extra or {}).get("offload") or "")
+                        != "block"):
+                    j["_oom_retried"] = True
+                    _req0.extra["offload"] = "block"
+                    try:
+                        adapter.unload(log)
+                    except Exception:
+                        pass
+                    _free_cuda(log)
+                    j["status"] = "queued"
+                    j["progress"] = 0.0
+                    j["detail"] = "OOM -> block offloadで自動再試行"
+                    j["_requeue"] = True
+                    print(f"[{jid}] OOM -> block offloadで自動再試行",
+                          flush=True)
+                else:
+                    j["status"] = "error"
+                    j["detail"] = _adv + f" ({str(e)[:200]})"
+                    j["log"].append(traceback.format_exc()[-1500:])
+                    print(f"[{jid}] ERROR(OOM): {e}", flush=True)
+                    _free_cuda(log)
+            else:
+                j["status"] = "error"
+                j["detail"] = str(e)[:600]
+                j["log"].append(traceback.format_exc()[-1500:])
+                print(f"[{jid}] ERROR: {e}", flush=True)
+                # OOM等の失敗断片を回収してから次のジョブへ
+                _free_cuda(log)
         finally:
-            j["finished"] = time.time()
-            j.pop("_req", None)
+            if j.pop("_requeue", False):
+                WORK_Q.put(jid)            # 再試行: _reqを温存したまま再投入
+            else:
+                j["finished"] = time.time()
+                j.pop("_req", None)
+
+
+def _watchdog_scan(now: float | None = None) -> list:
+    """生成watchdog (P1) の1スキャン: running/loading ジョブの鼓動が
+    VIDEOLAB_STALL_MIN分 (既定15) 途絶えていたらstalled扱いにする。
+    処理したジョブidのリストを返す (テスト用)。
+
+    ハングしたworkerスレッドはPythonからkillできないため、ジョブを
+    error化してクライアントの永久待ちを解き、VIDEOLAB_WATCHDOG_EXIT=1
+    のときはプロセスごと自沈する (Colab自動運転の張り直しと対にすると
+    「無応答のまま課金」の根治になる)。"""
+    try:
+        stall_min = float(os.environ.get("VIDEOLAB_STALL_MIN", "15") or 15)
+    except ValueError:
+        stall_min = 15.0
+    if stall_min <= 0:
+        return []
+    now = now or time.time()
+    hit = []
+    for j in list(JOBS.values()):
+        if j.get("status") not in ("running", "loading"):
+            continue
+        beat = (j.get("_beat") or j.get("started")
+                or j.get("created") or now)
+        age = now - float(beat)
+        if age < stall_min * 60:
+            continue
+        j["status"] = "error"
+        j["detail"] = (f"watchdog: {int(age // 60)}分間無応答のため中止 "
+                       "(生成ハング疑い。Colabランタイムの張り直しを推奨)")
+        j["finished"] = now
+        hit.append(j["id"])
+        print(f"[{j['id']}] WATCHDOG: {int(age // 60)}分無応答 -> stalled",
+              flush=True)
+    if hit and os.environ.get("VIDEOLAB_WATCHDOG_EXIT") == "1":
+        print("[videolab] VIDEOLAB_WATCHDOG_EXIT=1: ハング検知のため"
+              "プロセスを自沈します (張り直しで復旧)", flush=True)
+        os._exit(1)
+    return hit
+
+
+def _watchdog_loop():
+    while True:
+        time.sleep(60)
+        try:
+            _watchdog_scan()
+        except Exception:
+            pass
 
 
 def _shutdown_runtime(delay: float = 2.0) -> None:
@@ -3676,10 +4141,27 @@ def build_app(token: str | None):
                 drv["ready"] = bool(drive_cache_ready()[0])
             except Exception:
                 pass
+        # 実行中ジョブの鼓動 (P1): クライアントが「生成ハング」と「単に
+        # 遅い」を区別できる。admission係数の公開はクライアントの
+        # plan_canvasと見積もり式を単一ソース化するため (P0-3)
+        job = None
+        for _j in JOBS.values():
+            if _j.get("status") in ("running", "loading"):
+                _b = _j.get("_beat") or _j.get("started") or _j.get("created")
+                job = {"id": _j["id"], "status": _j["status"],
+                       "beat_age_sec": round(time.time() - float(_b or
+                                                                 time.time()))}
+                break
+        ram = None
+        _avail = _avail_ram_gb()
+        if _avail >= 0:
+            ram = {"available_gb": round(_avail, 1)}
         return {"ok": True, "app": "SpriteMill VideoLab", "version": __version__,
                 "auth": bool(token), "queued": WORK_Q.qsize(),
                 "current_model": CURRENT_MODEL, "gpu": gpu, "disk": disk,
-                "drive": drv, "libs": libs}
+                "drive": drv, "libs": libs, "job": job, "ram": ram,
+                "admission": {"act_gb_per_lat_frame_720x1296": ACT_GB_PER_LAT,
+                              "safety_gb": ACT_SAFETY_GB}}
 
     @app.get("/api/models")
     def models(request: Request):
@@ -4083,6 +4565,7 @@ def start_server(host: str, port: int, token: str | None):
     app = build_app(token)
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     return server
