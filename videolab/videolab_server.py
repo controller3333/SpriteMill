@@ -44,7 +44,8 @@ from pathlib import Path
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.13"  # 0.9.13: 保証機構のレビュー12件修正 (詳細はcommit)
+__version__ = "0.9.14"  # 0.9.14: ディスク退避キャッシュのquant切替取り違え根治
+# 0.9.13: 保証機構のレビュー12件修正 (詳細はcommit)
 # 0.9.12: OOM/フリーズしない保証+quant開通 (P0-P2)
 # 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
 #         ではDiTを1体ロードするごとに即ディスク退避 (2体+18GBの同時保持を
@@ -1610,6 +1611,23 @@ class _WanA14BBase(VideoAdapter):
             # モデルごとに別dir (同居させるとblocks.0等のファイル名が衝突)
             _disk = str(WORK_ROOT / "_offload"
                         / f"{abs(hash(label)) & 0xffffff:06x}")
+            # ★既存dirは必ず消してから使う (v0.9.14): diffusersのディスク
+            # 退避は group_*.safetensors が存在すると書き込みをスキップし
+            # 「前回ロードしたモデルのバイト列」を無言で読む (group_
+            # offloading.py の既存ファイル早期スキップ)。同一プロセスで
+            # quantを切り替えると前quantの重みを掴む — 2026-07-17実障害:
+            # Q4_0→Q3_K_S切替でQ3_KラベルのままQ4_0バイト(5120x5120=
+            # 14,745,600B)を復元し「shape [134050,110] invalid」で確定
+            # クラッシュ。サイズが偶然同じ組合せなら無言の重み化けになる
+            # ため、退避ファイルはロード毎に作り直す (書き直しコストは
+            # 数十秒・正しさ優先)。旧プロセスの残骸dirも同時に掃除される
+            try:
+                if os.path.isdir(_disk):
+                    shutil.rmtree(_disk, ignore_errors=True)
+                    log(f"{label}: 前回モデルのディスク退避キャッシュを削除 "
+                        "(quant切替の取り違え防止)")
+            except Exception:
+                pass
             kw["offload_to_disk_path"] = _disk
         try:
             try:
