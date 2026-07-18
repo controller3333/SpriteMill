@@ -29,6 +29,7 @@ import io
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import subprocess
@@ -38,13 +39,15 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.9.14"  # 0.9.14: ディスク退避キャッシュのquant切替取り違え根治
+__version__ = "0.10.0"  # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
+# 0.9.14: ディスク退避キャッシュのquant切替取り違え根治
 # 0.9.13: 保証機構のレビュー12件修正 (詳細はcommit)
 # 0.9.12: OOM/フリーズしない保証+quant開通 (P0-P2)
 # 0.9.11: T4のanisora切替段RAM山対策 — 低RAM VM×block
@@ -4221,10 +4224,689 @@ def _shutdown_runtime(delay: float = 2.0) -> None:
         os._exit(0)
 
 
+# ------------------------------------------------- 工房モード (walk_pack)
+# お友だち(非技術者)がブラウザだけで キャラパック選択 → 歩行生成 →
+# プレビュー → ドット絵化 → まとめてDL まで完結するための機能群 (v0.10.0)。
+#
+# ・キャラパック: 母艦アプリが /api/packs/upload でzipを置く。展開先は
+#   packs/<pack_id>/01_generation/split_centered/*.png の形にする —
+#   pose_video の landmarks 探索が「ref画像パスの親の親/landmarks.json」
+#   なので、ラウンドディレクトリ互換のこの構造に置くだけで landmarks が
+#   自動で効く。
+# ・walk_pack: compass_vace._run_layout の latent_refine 分岐のサーバ内部
+#   移植。pipeline.py には依存しない (エンジンは engine_pack/ から import)。
+# ・v1の省略事項 (実装コスト裁定): build_T_sheet_from_mp4 のフルQC
+#   (向き検査つきコマ探索・頭サイズ整合・idle中心整列・ゲート群) は使わず、
+#   walk_layout の決定的なフレーム配分から簡易シート ({char}T/LT.png) を
+#   組む。inspect_walk_mp4 / make_walk_preview 本体も呼ばない
+#   (preview.webp は make_walk_preview 相当の 2x4 グリッドを内製)。
+#   T規格の厳密な品質が要る場合は out/ の方向別mp4を母艦側の正規
+#   ビルダーへ通すこと。
+
+# engine_pack: サーバ隣接のエンジン同梱ディレクトリ (Colabへはサーバと
+# 一緒に配布)。無ければ walk_pack API は 503 を返す (パックの置き場と
+# 一覧・サムネは PIL だけで動くので生かす)
+ENGINE_PACK_DIR = Path(os.environ.get("VIDEOLAB_ENGINE_PACK", "")
+                       or (HERE / "engine_pack"))
+_ENGINE_MODS: dict | None = None
+_ENGINE_ERR: str | None = None
+
+
+def _engine() -> dict:
+    """engine_pack のモジュール束をロードして返す (失敗は RuntimeError)。"""
+    global _ENGINE_MODS, _ENGINE_ERR
+    if _ENGINE_MODS is not None:
+        return _ENGINE_MODS
+    if not ENGINE_PACK_DIR.is_dir():
+        # 未配備はキャッシュしない (後から配備すれば再起動なしで有効化)
+        raise RuntimeError(f"engine_pack未配備 ({ENGINE_PACK_DIR})")
+    if _ENGINE_ERR is not None:
+        raise RuntimeError(_ENGINE_ERR)
+    if str(ENGINE_PACK_DIR) not in sys.path:
+        sys.path.insert(0, str(ENGINE_PACK_DIR))
+    try:
+        import importlib
+        mods = {name: importlib.import_module(name)
+                for name in ("pose_video", "canvas_walk", "compass_vace",
+                             "color_anchor", "pixelize_sheet")}
+    except Exception as e:              # noqa: BLE001
+        _ENGINE_ERR = f"engine_packのimportに失敗: {e}"
+        raise RuntimeError(_ENGINE_ERR) from e
+    _ENGINE_MODS = mods
+    return mods
+
+
+def packs_root() -> Path:
+    """キャラパック置き場 (PACKS_DIR 相当)。
+
+    優先: VIDEOLAB_PACKS 明示 > Driveマウント時はモデルキャッシュ
+    (MyDrive/SpriteMill_models) の隣 = MyDrive/SpriteMill_packs
+    (セッションが死んでもパックが消えない) > ローカルは WORK_ROOT の隣。"""
+    p = os.environ.get("VIDEOLAB_PACKS", "").strip()
+    if p:
+        return Path(p)
+    dc = _drive_cache_dir()
+    if dc is not None:
+        return dc.parent / "SpriteMill_packs"
+    return WORK_ROOT.parent / "videolab_packs"
+
+
+# walk_pack の生成規格 (compass_vace の 4x2 半球キャンバスと同一)
+WALKPACK_NF = 57                 # 直立6+歩行2周期+末尾静止8 (walk_layout)
+WALKPACK_W, WALKPACK_H = 480, 864   # 2x2 x セル240x432
+WALKPACK_FPS = 16
+_WALKPACK_LOCK = threading.Lock()   # 直列化 (SM_LEG_SCALE等のenvを守る)
+_WP_DIRS = ("front", "left", "right", "back",
+            "front_left", "front_right", "back_left", "back_right")
+_WP_DIRS_LONG = sorted(_WP_DIRS, key=len, reverse=True)
+_WP_PID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# ファイル名は Unicode 語文字を許可 (本番コーパスは日本語キャラ名:
+# 真ロップ_01_front_centered.png 等。ASCII限定だと8方向PNGが黙って
+# スキップされ全アップロードが400になる 2026-07-18スモーク実測)。
+# パス安全性は basename化+resolve封じ込めが担うため、ここでは
+# 先頭ドット・パス区切り・制御文字だけ弾けばよい
+_WP_FNAME_RE = re.compile(r"^[\w][\w.@ \-]{0,120}$", re.UNICODE)
+# make_walk_preview.py と同じ 2x4 プレビュー格子 (direction -> (col, row))
+_WP_PREVIEW_GRID = {"front": (0, 0), "left": (0, 1), "right": (0, 2),
+                    "back": (0, 3), "front_left": (1, 0),
+                    "front_right": (1, 1), "back_left": (1, 2),
+                    "back_right": (1, 3)}
+# build_T_sheet_from_mp4.py と同じ T配置 (direction -> (row, block先頭col))
+_WP_SHEET_PLACE = {"front": (0, 0), "left": (1, 0), "right": (2, 0),
+                   "back": (3, 0), "front_left": (0, 6),
+                   "front_right": (1, 6), "back_left": (2, 6),
+                   "back_right": (3, 6)}
+_WP_MP4_RE = re.compile(
+    r"^(?P<char>.+)_(?P<idx>\d{2})_(?P<dir>[a-z_]+)_walkT\.mp4$")
+
+
+def _wp_print(msg: str) -> None:
+    """コンソールのコードページ非依存print (ログ出力でジョブを殺さない)。"""
+    try:
+        print(msg, flush=True)
+    except Exception:                     # noqa: BLE001
+        try:
+            print(msg.encode("ascii", "replace").decode(), flush=True)
+        except Exception:                 # noqa: BLE001
+            pass
+
+
+def _pack_meta(pack: Path) -> dict:
+    try:
+        m = json.loads((pack / "meta.json").read_text(encoding="utf-8"))
+        return m if isinstance(m, dict) else {}
+    except Exception:                     # noqa: BLE001
+        return {}
+
+
+def _pack_refs_dir(pack: Path) -> tuple:
+    """パック内の split_centered から (char名, 方向->立ち絵Path) を取る。"""
+    src = pack / "01_generation" / "split_centered"
+    refs: dict = {}
+    char = None
+    if src.is_dir():
+        for p in sorted(src.glob("*_centered.png")):
+            stem = p.stem[: -len("_centered")]
+            for d in _WP_DIRS_LONG:
+                if stem.endswith("_" + d):
+                    refs[d] = p
+                    char = char or stem[: -(len(d) + 1)]
+                    break
+    return (char or "char"), refs
+
+
+def _pack_extract(pid: str, raw: bytes) -> int:
+    """zipバイト列をパック構造へ展開する (既存同名は置換)。
+
+    パストラバーサル対策は二重: ①メンバー名はbasenameだけを使い、置き先は
+    種別ごとの固定ディレクトリに限定 ②書き込み直前に resolve() でパック
+    ディレクトリ内であることを検証。"""
+    pack = (packs_root() / pid)
+    root = packs_root()
+    root.mkdir(parents=True, exist_ok=True)
+    if pack.exists():
+        shutil.rmtree(pack)
+    sc = pack / "01_generation" / "split_centered"
+    sc.mkdir(parents=True)
+    count = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        total = sum(i.file_size for i in zf.infolist())
+        if total > 500 * 2**20:
+            raise ValueError("zipの展開後サイズが大きすぎます (>500MB)")
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = PurePosixPath(info.filename.replace("\\", "/")).name
+            if not name or not _WP_FNAME_RE.match(name):
+                continue
+            if name == "meta.json":
+                dest = pack / "meta.json"
+            elif name == "landmarks.json":
+                dest = pack / "01_generation" / "landmarks.json"
+            elif name.lower().endswith(".png"):
+                dest = sc / name
+            else:
+                continue        # 想定外の拡張子は置かない
+            rd = dest.resolve()
+            if not str(rd).startswith(str(pack.resolve()) + os.sep):
+                raise ValueError(f"不正な展開先: {info.filename}")
+            with zf.open(info) as f:
+                data = f.read(120 * 2**20 + 1)
+            if len(data) > 120 * 2**20:
+                raise ValueError(f"ファイルが大きすぎます: {name}")
+            dest.write_bytes(data)
+            count += 1
+    char, refs = _pack_refs_dir(pack)
+    missing = [d for d in _WP_DIRS if d not in refs]
+    if missing:
+        shutil.rmtree(pack, ignore_errors=True)
+        raise ValueError(f"8方向PNGが不足しています: {missing} "
+                         "(*_<方向>_centered.png を8枚入れてください)")
+    meta_p = pack / "meta.json"
+    meta = _pack_meta(pack)
+    meta.setdefault("name", pid)
+    meta.setdefault("char_id", char if char != "char" else pid)
+    meta.setdefault("leg_scale", 1.0)
+    meta.setdefault("cell_w", 64)
+    meta.setdefault("cell_h", 128)
+    meta["created"] = time.time()
+    meta_p.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                      encoding="utf-8")
+    return count
+
+
+def _wp_offload() -> str:
+    """L4級 (VRAM<30GB) は両ステージ block offload — compass_vace の
+    latent_refine 分岐と同じ裁定 (素GGUFはseq不可・常駐は22.5GB超)。"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory / 2**30
+            if 0 < total < 30:
+                return "block"
+    except Exception:                     # noqa: BLE001
+        pass
+    return ""
+
+
+def _wp_prompt(eng: dict, refs: dict, layout, nf: int) -> str:
+    """CANVAS_PROMPT + NO_WIND + (スカート/末尾静止節) + 方向明文。
+
+    顔正面化/体ヨー追従の発動判定は compass_vace._run_layout と同じく
+    pose_video._adapted_yaw / _adapted_body_yaw を quiet=True の探針で
+    呼んで文面を骨格の宣言と一致させる (体ヨー追従はエンジン既定=off)。"""
+    from PIL import Image
+    pv = eng["pose_video"]
+    cw = eng["canvas_walk"]
+    cv = eng["compass_vace"]
+    prompt = cw.CANVAS_PROMPT + cv.NO_WIND
+    idle_n, cyc, period, tail = pv.walk_layout(nf)
+    try:
+        fr = refs.get("front")
+        if fr is not None and pv.skirt_hem_y(Image.open(fr),
+                                             240, 432) is not None:
+            prompt += (" The character wears a long skirt that stays "
+                       "completely opaque: the legs never show through the "
+                       "fabric, no slit ever opens in it, and only the feet "
+                       "appear below the hem while walking.")
+    except Exception:                     # noqa: BLE001
+        pass
+    if tail:
+        prompt += (" At the very end of the video every figure stops "
+                   "walking and stands perfectly still in the same "
+                   "relaxed upright standing pose as the first frames, "
+                   "arms hanging naturally at the sides.")
+    ff_diag = db_diag = False
+    try:
+        fig = pv.Figure(head_frac=pv.head_frac_for_leg_scale(
+            pv._leg_scale_env()))
+        fim = None
+        if refs.get("front") is not None:
+            fim = Image.open(refs["front"])
+            fig = pv._fit_figure_to_char(fig, fim)
+        present = [x for x in layout[2] if x]
+        for d in ("front_left", "front_right"):
+            if d not in refs or d not in present:
+                continue
+            rim = Image.open(refs[d])
+            if pv._adapted_yaw(d, rim, fig, front_ref=fim,
+                               face_front="auto", quiet=True) == 0.0:
+                ff_diag = True
+            if pv._adapted_body_yaw(d, rim, fig, front_ref=fim,
+                                    mode="off", quiet=True) \
+                    != float(pv.DIR_YAW[d]):
+                db_diag = True
+    except Exception:                     # noqa: BLE001
+        ff_diag = db_diag = False        # 探針失敗時は従来文面
+    return prompt + cv._direction_text(layout, face_front_diag=ff_diag,
+                                       body_follow_diag=db_diag)
+
+
+def _wp_wait(j: dict, sub: str, lo: float, hi: float) -> dict:
+    """内部ジョブの完了待ち: ログ転写・進捗写像・キャンセル伝播。"""
+    seen = 0
+    while True:
+        sj = JOBS.get(sub)
+        if sj is None:
+            raise RuntimeError(f"内部ジョブが見つかりません: {sub}")
+        for line in (sj.get("log") or [])[seen:]:
+            j["log"].append(f"  ┃ {line}")
+        seen = len(sj.get("log") or [])
+        try:
+            p = float(sj.get("progress") or 0.0)
+        except (TypeError, ValueError):
+            p = 0.0
+        j["progress"] = round(lo + (hi - lo) * max(0.0, min(1.0, p)), 4)
+        j["_beat"] = time.time()
+        st = sj.get("status")
+        if st == "done":
+            return sj
+        if st in ("error", "cancelled"):
+            raise RuntimeError(
+                f"内部ジョブ({sj.get('model')}){st}: "
+                f"{str(sj.get('detail') or '')[:300]}")
+        if j.get("_cancel"):
+            sj["_cancel"] = True
+            raise JobCancelled()
+        time.sleep(2)
+
+
+def _wp_split(eng: dict, ffmpeg: str, cvid: Path, layout, refs: dict,
+              char: str, out: Path, idle_n: int, gait_end, log) -> None:
+    """キャンバスmp4を方向別セルへ。color_anchor があれば
+    分割+カラーアンカー+拡大の単一パス、失敗時は素のcrop分割
+    (canvas_walk.split_canvas_video の簡易移植) へ後退。"""
+    cv = eng["compass_vace"]
+    idx_of = eng["canvas_walk"].IDX
+    cols, rows = layout[0], layout[1]
+    cw, ch = WALKPACK_W // cols, WALKPACK_H // rows
+    jobs = []
+    for i, d in enumerate(layout[2]):
+        if d is None:
+            continue
+        jobs.append({"crop": ((i % cols) * cw, (i // cols) * ch, cw, ch),
+                     "ref": refs[d],
+                     "dest": out / f"{char}_{idx_of[d]:02d}_{d}_walkT.mp4",
+                     "size": cv._auto_size(refs[d])})
+    try:
+        eng["color_anchor"].split_anchor_scale(
+            ffmpeg, cvid, jobs, fps=WALKPACK_FPS,
+            idle_n=idle_n, gait_end=gait_end)
+        log(f"  分割+カラーアンカー+拡大を単一パスで実行 ({len(jobs)}セル)")
+        return
+    except Exception as e:                # noqa: BLE001
+        log(f"  ⚠ カラーアンカー分割に失敗 — 素の分割へ後退: {str(e)[:200]}")
+    for job in jobs:
+        x, y, w, h = job["crop"]
+        r = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(cvid),
+             "-filter:v", f"crop={w}:{h}:{x}:{y}", "-an",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             str(job["dest"])],
+            capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg分割失敗: {r.stderr[-300:]}")
+
+
+def _wp_key(im, thr: int = 70):
+    """マゼンタ背景 -> 透過 (build_T_sheet の素朴キー版: min(R,B)-G>=thr)。
+    連結成分キーイング (bg_magenta_mask) は使わない簡易版。"""
+    import numpy as np
+    from PIL import Image
+    a = np.asarray(im.convert("RGB"), dtype=np.int16)
+    bg = (np.minimum(a[..., 0], a[..., 2]) - a[..., 1]) >= thr
+    alpha = np.where(bg, 0, 255).astype(np.uint8)
+    out = im.convert("RGBA")
+    out.putalpha(Image.fromarray(alpha, "L"))
+    return out
+
+
+def _wp_dir_mp4s(out: Path) -> tuple:
+    """out/ の方向別mp4を発見して (char名, 方向->Path) を返す。"""
+    char = None
+    mp4s: dict = {}
+    for p in sorted(out.glob("*_walkT.mp4")):
+        m = _WP_MP4_RE.match(p.name)
+        if not m or m.group("dir") not in _WP_DIRS:
+            continue
+        mp4s[m.group("dir")] = p
+        char = char or m.group("char")
+    return (char or "char"), mp4s
+
+
+def _wp_collect_cells(eng: dict, ffmpeg: str, out: Path,
+                      nf: int = WALKPACK_NF) -> tuple:
+    """方向別mp4から idle+walk1..5 のキー済みRGBAセルを取る。
+
+    コマ位置は walk_layout の決定的な配分から選ぶ (build_T_sheet の
+    コマ探索QCの簡易代替): idle=末尾静止 (nf-2)、walk1..5=最初の歩行
+    1周期を等分。戻り値 (char, {dir: [idle, w1..w5] (フル解像度RGBA)})。"""
+    from PIL import Image
+    pv = eng["pose_video"]
+    idle_n, cyc, period, tail = pv.walk_layout(nf)
+    idle_idx = (nf - 2) if tail else 0
+    walk_idx = [idle_n + int(round(period * k / 5.0)) for k in range(5)]
+    order = [idle_idx] + walk_idx
+    char, mp4s = _wp_dir_mp4s(out)
+    missing = [d for d in _WP_DIRS if d not in mp4s]
+    if missing:
+        raise RuntimeError(f"方向別mp4が不足しています: {missing}")
+    cells: dict = {}
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        for d in _WP_DIRS:
+            sub = tmp / d
+            sub.mkdir()
+            r = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp4s[d]),
+                 str(sub / "f_%05d.png")],
+                capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError(f"フレーム抽出失敗[{d}]: "
+                                   f"{r.stderr[-200:]}")
+            avail = sorted(sub.glob("f_*.png"))
+            if not avail:
+                raise RuntimeError(f"フレームが空です: {mp4s[d].name}")
+            got = []
+            for i in order:
+                p = sub / f"f_{i + 1:05d}.png"
+                im = Image.open(p if p.is_file() else avail[-1])
+                got.append(_wp_key(im.convert("RGB")))
+            cells[d] = got
+    return char, cells
+
+
+def _wp_write_preview(out: Path, tcells: dict, cell_w: int, cell_h: int,
+                      scale: int = 2) -> None:
+    """make_walk_preview 相当の 2x4 全方向ループwebp (walk1..5)。"""
+    from PIL import Image
+    cw, ch = cell_w * scale, cell_h * scale
+    frames = []
+    for k in range(1, 6):
+        cv = Image.new("RGBA", (cw * 2, ch * 4), (0, 0, 0, 0))
+        for d, (col, row) in _WP_PREVIEW_GRID.items():
+            cl = tcells.get(d)
+            if not cl or len(cl) <= k:
+                continue
+            cv.alpha_composite(cl[k].resize((cw, ch), Image.NEAREST),
+                               (col * cw, row * ch))
+        frames.append(cv)
+    frames[0].save(out / "preview.webp", save_all=True,
+                   append_images=frames[1:], duration=140, loop=0,
+                   disposal=2)
+
+
+def _wp_assemble(eng: dict, ffmpeg: str, out: Path, meta: dict, log) -> list:
+    """簡易シート ({char}T/LT.png) + preview.webp を out/ に組む。
+
+    ★v1簡易版 (省略事項): build_T_sheet_from_mp4 のフルビルダー
+    (向き検査つきコマ探索・方向別スケール整合・idle中心整列・各種ゲート)
+    は移植していない。スケールは全コマ共通のグローバル縮尺 (セルに収まる
+    最大)、アンカーは下端中央固定、キーイングは素朴なマゼンタしきい値。"""
+    from PIL import Image
+    char, cells = _wp_collect_cells(eng, ffmpeg, out)
+    cell_w = max(16, int(meta.get("cell_w") or 64))
+    cell_h = max(16, int(meta.get("cell_h") or 128))
+    ltf = 5                                  # LT = T の5倍 (T規格と同じ比)
+    ltw, lth = cell_w * ltf, cell_h * ltf
+    boxes = []
+    for d in _WP_DIRS:
+        for im in cells[d]:
+            bb = im.getchannel("A").getbbox()
+            if bb is None:
+                raise RuntimeError(
+                    f"キーイング結果が空です ({d}) — マゼンタ背景でない?")
+            boxes.append(bb)
+    scale = min(min((ltw * 0.94) / max(1, bb[2] - bb[0]),
+                    (lth * 0.96) / max(1, bb[3] - bb[1])) for bb in boxes)
+    sheet = Image.new("RGBA", (ltw * 12, lth * 4), (0, 0, 0, 0))
+    tcells: dict = {}
+    for d, (row, block) in _WP_SHEET_PLACE.items():
+        tl = []
+        for k, im in enumerate(cells[d]):
+            bb = im.getchannel("A").getbbox()
+            crop = im.crop(bb)
+            nw = max(1, round(crop.width * scale))
+            nh = max(1, round(crop.height * scale))
+            crop = crop.resize((nw, nh), Image.LANCZOS)
+            cell = Image.new("RGBA", (ltw, lth), (0, 0, 0, 0))
+            cell.alpha_composite(
+                crop, ((ltw - nw) // 2,
+                       max(0, lth - round(lth * 0.02) - nh)))
+            sheet.alpha_composite(cell, ((block + k) * ltw, row * lth))
+            tl.append(cell.resize((cell_w, cell_h), Image.LANCZOS))
+        tcells[d] = tl
+    sheet.save(out / f"{char}LT.png")
+    sheet.resize((cell_w * 12, cell_h * 4),
+                 Image.LANCZOS).save(out / f"{char}T.png")
+    _wp_write_preview(out, tcells, cell_w, cell_h)
+    log(f"シート/プレビュー: {char}T.png / {char}LT.png / preview.webp "
+        "(簡易版 — T規格フルQCなし)")
+    return [f"{char}T.png", f"{char}LT.png", "preview.webp"]
+
+
+def _wp_regen_preview(pid: str) -> list:
+    """preview.webp (と簡易シート) を out/ の方向別mp4から再生成 (同期)。"""
+    eng = _engine()
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpegが見つかりません")
+    pack = packs_root() / pid
+    out = pack / "out"
+    if not out.is_dir():
+        raise RuntimeError("生成結果がまだありません — 先に歩行生成を"
+                           "実行してください")
+    return _wp_assemble(eng, ffmpeg, out, _pack_meta(pack),
+                        lambda m: _wp_print(f"[walkpack:{pid}] {m}"))
+
+
+def _wp_pixelize(pid: str, colors: int = 24) -> list:
+    """簡易シート ({char}LT.png) をドット絵化 (pixelize_sheet の
+    dither経路: Floyd-Steinberg減色+黒系1ドット縁取り)。同期・数秒。"""
+    from PIL import Image
+    eng = _engine()
+    pz = eng["pixelize_sheet"]
+    pack = packs_root() / pid
+    out = pack / "out"
+    lt = next(iter(sorted(out.glob("*LT.png"))), None) \
+        if out.is_dir() else None
+    if lt is None:
+        raise RuntimeError("シート(*LT.png)がまだありません — 先に歩行生成"
+                           "を実行してください")
+    char = lt.name[: -len("LT.png")]
+    cell_h = max(16, int(_pack_meta(pack).get("cell_h") or 128))
+    src = Image.open(lt)
+    factor = max(1, src.height // (cell_h * 4))
+    colors = max(8, min(64, int(colors)))
+    idx, mask, pal = pz.pixelize_dither(src, colors, factor)
+    pz.outline_pass(idx, mask, pal)
+    img = pz.to_image(idx, mask, pal)
+    img.save(out / f"{char}T_pixel.png")
+    img.resize((img.width * 2, img.height * 2),
+               Image.NEAREST).save(out / f"{char}T_pixel@2x.png")
+    return [f"{char}T_pixel.png", f"{char}T_pixel@2x.png"]
+
+
+def _wp_kind(name: str) -> str:
+    if name == "preview.webp":
+        return "preview"
+    if "_pixel" in name:
+        return "pixel"
+    if name.endswith("T.png"):           # {char}T.png / {char}LT.png
+        return "sheet"
+    if name.endswith(".mp4"):
+        return "mp4"
+    return "other"
+
+
+def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
+    """walk_pack 本体: 半球2キャンバス x (VACE 4step -> AniSora latent再加工)
+    -> セル分割 -> 簡易シート/プレビュー。compass_vace._run_layout の
+    latent_refine 分岐のサーバ内部版 (submit_job で自サーバの実ジョブを
+    投入し、このオーケストレーションスレッドが完了をポーリングする)。"""
+    eng = _engine()
+    pv = eng["pose_video"]
+    cw = eng["canvas_walk"]
+    cv = eng["compass_vace"]
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpegが見つかりません")
+    pack = packs_root() / pid
+    char, refs = _pack_refs_dir(pack)
+    missing = [d for d in _WP_DIRS if d not in refs]
+    if missing:
+        raise RuntimeError(f"パックに8方向PNGが不足: {missing}")
+    char = str(meta.get("char_id") or char)
+    out = pack / "out"
+    if out.is_dir():
+        shutil.rmtree(out)               # 再生成は一式作り直し
+    out.mkdir(parents=True)
+    nf, w, h = WALKPACK_NF, WALKPACK_W, WALKPACK_H
+    idle_n, cyc, period, tail = pv.walk_layout(nf)
+    gait_end = idle_n + int(round(cyc * period))
+    pins = cv._lr_pin_frames(nf, "on")
+    offload = _wp_offload()
+    if offload:
+        log(f"VRAM<30GBのため両ステージを{offload} offload運転にします")
+    # 進捗スパン: F4 (0.02-0.45) -> B4 (0.50-0.88) -> 組み立て (0.90-)
+    spans = {"F4": (0.02, 0.24, 0.24, 0.45), "B4": (0.50, 0.70, 0.70, 0.88)}
+    for tag, layout in (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)):
+        if j.get("_cancel"):
+            raise JobCancelled()
+        s1lo, s1hi, s2lo, s2hi = spans[tag]
+        j["detail"] = f"[{tag}] 骨格グリッド生成"
+        log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
+            f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
+        frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+        canvas = cv.compose_reference(refs, w, h, layout)
+        prompt = _wp_prompt(eng, refs, layout, nf)
+        extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
+                  "conditioning_scale": 1.0, "motion_score": 3.0,
+                  "vace_base": "fun", "vace_lora": "lightning",
+                  "emit_latent": 1}
+        if offload:
+            extra1["offload"] = offload
+        j["detail"] = f"[{tag}] 生成1/2: VACEフル骨格"
+        log(f"[{tag}] 生成1/2: VACEフル骨格制御 steps=4 cfg=1.0 "
+            "(latent直出し)")
+        _wm1 = "mock" if j.get("_wp_mock") else "vace"
+        jid1 = submit_job(_wm1, GenRequest(
+            mode="i2v", prompt=prompt, images=[canvas],
+            width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+            steps=4, seed=42, guidance=1.0, extra=extra1))
+        _wp_wait(j, jid1, s1lo, s1hi)
+        extra2 = {"latent_from": jid1, "refine_strength": 0.45,
+                  "refine_cond_still": True, "motion_score": 3.0}
+        if pins:
+            extra2["latent_pin_frames"] = pins
+        if offload:
+            extra2["offload"] = offload
+        j["detail"] = f"[{tag}] 生成2/2: AniSora latent再加工"
+        log(f"[{tag}] 生成2/2: AniSora latent再加工 σ=0.45 steps=24 "
+            f"(latent固定 {pins})")
+        _wm2 = "mock" if j.get("_wp_mock") else "anisora"
+        jid2 = submit_job(_wm2, GenRequest(
+            mode="i2v", prompt=prompt, images=[canvas],
+            width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+            steps=24, seed=42, guidance=1.0, extra=extra2))
+        sj2 = _wp_wait(j, jid2, s2lo, s2hi)
+        cvid = out / f"canvas_{tag}.mp4"
+        shutil.copy2(sj2["path"], cvid)
+        j["detail"] = f"[{tag}] セル分割"
+        _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                  idle_n, gait_end if tail else None, log)
+    j["progress"] = 0.9
+    j["_beat"] = time.time()
+    j["detail"] = "シート/プレビュー組み立て"
+    try:
+        _wp_assemble(eng, ffmpeg, out, meta, log)
+    except Exception as e:                # noqa: BLE001
+        # 必須成果物 (方向別mp4 8本 + canvas mp4) は揃っているので続行
+        log(f"⚠ シート/プレビュー組み立てに失敗 (方向別mp4は利用可能): "
+            f"{str(e)[:300]}")
+    j["path"] = str(out)
+    j["detail"] = ""
+
+
+def _walkpack_thread(jid: str, pid: str) -> None:
+    j = JOBS.get(jid)
+    if j is None:
+        return
+
+    def log(msg):
+        j["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        j["_beat"] = time.time()
+        _wp_print(f"[{jid}] {msg}")
+
+    prev_ls = os.environ.get("SM_LEG_SCALE")
+    try:
+        with _WALKPACK_LOCK:
+            if j.get("_cancel"):
+                raise JobCancelled()
+            j["status"] = "running"
+            j["started"] = time.time()
+            meta = _pack_meta(packs_root() / pid)
+            try:
+                ls = float(meta.get("leg_scale") or 1.0)
+            except (TypeError, ValueError):
+                ls = 1.0
+            os.environ["SM_LEG_SCALE"] = str(ls)
+            _walkpack_run(j, pid, meta, log)
+            j["status"] = "done"
+            j["progress"] = 1.0
+            log("walk_pack 完了")
+    except JobCancelled:
+        j["status"] = "cancelled"
+        j["detail"] = "ユーザーによりキャンセル"
+    except Exception as e:                # noqa: BLE001
+        j["status"] = "error"
+        j["detail"] = str(e)[:600]
+        j["log"].append(traceback.format_exc()[-1500:])
+        _wp_print(f"[{jid}] ERROR: {e}")
+    finally:
+        if prev_ls is None:
+            os.environ.pop("SM_LEG_SCALE", None)
+        else:
+            os.environ["SM_LEG_SCALE"] = prev_ls
+        j["finished"] = time.time()
+
+
+def submit_walkpack(pid: str, mock: bool = False) -> str:
+    """疑似ジョブ (model=walkpack) を登録してオーケストレーション
+    スレッドを起動する。既存workerキューには入れない (実生成は内部の
+    submit_job が通常経路で流れる)。同一パックの進行中ジョブがあれば
+    それを返す (二重投入防止)。"""
+    with _LOCK:
+        for jid0 in reversed(JOB_ORDER):
+            j0 = JOBS.get(jid0)
+            if (j0 and j0.get("model") == "walkpack"
+                    and j0.get("pack") == pid
+                    and j0.get("status") in ("queued", "running")):
+                return jid0
+        jid = uuid.uuid4().hex[:12]
+        JOBS[jid] = {
+            "id": jid, "status": "queued", "model": "walkpack",
+            "mode": "walkpack", "pack": pid,
+            "prompt": f"walk_pack: {pid}", "progress": 0.0,
+            "detail": "工房キュー待ち", "created": time.time(),
+            "started": None, "finished": None, "path": None, "log": [],
+            "_wp_mock": bool(mock),
+            "params": {"width": WALKPACK_W, "height": WALKPACK_H,
+                       "num_frames": WALKPACK_NF, "fps": WALKPACK_FPS,
+                       "steps": 4, "seed": 42, "guidance": 1.0,
+                       "images": 8},
+            "_cancel": False,
+        }
+        JOB_ORDER.append(jid)
+    threading.Thread(target=_walkpack_thread, args=(jid, pid),
+                     daemon=True).start()
+    return jid
+
+
 # ---------------------------------------------------------------- FastAPI
 def build_app(token: str | None):
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse
+    from fastapi.responses import FileResponse, HTMLResponse, Response
 
     app = FastAPI(title="SpriteMill VideoLab", version=__version__)
 
@@ -4239,6 +4921,11 @@ def build_app(token: str | None):
 
     @app.get("/", response_class=HTMLResponse)
     def index():
+        # v0.10.0: トップはお友だち用の工房ページ。旧UIは /advanced へ
+        return KOBO_HTML
+
+    @app.get("/advanced", response_class=HTMLResponse)
+    def advanced():
         return INDEX_HTML
 
     @app.get("/health")
@@ -4413,6 +5100,206 @@ def build_app(token: str | None):
         if j["status"] == "queued":
             j["status"] = "cancelled"
         return {"ok": True}
+
+    # ---- 工房モード: キャラパック + walk_pack (v0.10.0) ----
+    def _require_pid(pid: str) -> Path:
+        if not _WP_PID_RE.match(pid or ""):
+            raise HTTPException(400, "pack_idが不正です (英数と._-のみ)")
+        return packs_root() / pid
+
+    @app.post("/api/packs/upload")
+    async def packs_upload(request: Request):
+        """母艦アプリがキャラパックzipを置く。既存同名は置換。"""
+        _auth(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "JSONボディが必要です")
+        pid = str(body.get("pack_id") or "").strip()
+        _require_pid(pid)
+        # 生成中のパックを置換するとrmtreeで実行中ジョブが壊れる
+        for j0 in list(JOBS.values()):
+            if (j0.get("model") == "walkpack" and j0.get("pack") == pid
+                    and j0.get("status") in ("queued", "running")):
+                raise HTTPException(
+                    409, "このパックは歩行生成の実行中です — 完了/中止後に"
+                         "アップロードしてください")
+        try:
+            raw = base64.b64decode(str(body.get("zip_b64") or ""))
+        except Exception:
+            raise HTTPException(400, "zip_b64をデコードできません")
+        if not raw:
+            raise HTTPException(400, "zip_b64が空です")
+        if len(raw) > 300 * 2**20:
+            raise HTTPException(400, "zipが大きすぎます (>300MB)")
+        try:
+            n = _pack_extract(pid, raw)
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "zipとして読めません")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True, "pack_id": pid, "files": n}
+
+    @app.get("/api/packs")
+    def packs_list(request: Request):
+        _auth(request)
+        items = []
+        root = packs_root()
+        if root.is_dir():
+            for pd in sorted(root.iterdir()):
+                if not pd.is_dir() or not _WP_PID_RE.match(pd.name):
+                    continue
+                _, refs = _pack_refs_dir(pd)
+                if not refs:
+                    continue
+                meta = _pack_meta(pd)
+                try:
+                    created = float(meta.get("created") or 0) \
+                        or pd.stat().st_mtime
+                except (TypeError, ValueError, OSError):
+                    created = 0.0
+                items.append({
+                    "pack_id": pd.name,
+                    "name": str(meta.get("name") or pd.name),
+                    "has_landmarks": (pd / "01_generation"
+                                      / "landmarks.json").is_file(),
+                    "created": created})
+        items.sort(key=lambda x: x["created"], reverse=True)
+        return items
+
+    @app.get("/api/packs/{pid}/thumb.png")
+    def pack_thumb(pid: str, request: Request):
+        _auth(request)
+        pack = _require_pid(pid)
+        _, refs = _pack_refs_dir(pack)
+        fr = refs.get("front") or next(iter(refs.values()), None)
+        if fr is None:
+            raise HTTPException(404, "unknown pack")
+        from PIL import Image
+        im = Image.open(fr).convert("RGBA")
+        th = 200
+        tw = max(1, round(im.width * th / im.height))
+        im = im.resize((tw, th), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
+
+    @app.post("/api/walkpack/{pid}")
+    async def walkpack_start(pid: str, request: Request):
+        """歩行生成ジョブ投入 (疑似ジョブ model=walkpack を返す)。
+
+        body {"mock": true} でモックアダプタ経路 (テスト用)。GPUの無い
+        サーバでは mock 以外を拒否する — 拒否しないと「ボタン1つで
+        20GB級モデルのDLがCPUマシンに始まる」事故になる (2026-07-18
+        ローカルスモークで実発生、部分DL10GBを掃除した実害)。"""
+        _auth(request)
+        pack = _require_pid(pid)
+        try:
+            _engine()
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        if not pack.is_dir():
+            raise HTTPException(404, "unknown pack")
+        try:
+            body = await request.json()
+        except Exception:                 # noqa: BLE001
+            body = {}
+        mock = bool((body or {}).get("mock"))
+        if not mock:
+            has_gpu = False
+            try:
+                import torch
+                has_gpu = torch.cuda.is_available()
+            except Exception:             # noqa: BLE001
+                has_gpu = False
+            if not has_gpu:
+                raise HTTPException(
+                    503, "GPUがありません — 歩行生成はGPUサーバ (Colab等) "
+                         "で実行してください (テストは {\"mock\": true})")
+        _, refs = _pack_refs_dir(pack)
+        missing = [d for d in _WP_DIRS if d not in refs]
+        if missing:
+            raise HTTPException(400, f"8方向PNGが不足しています: {missing}")
+        return {"job": submit_walkpack(pid, mock=mock)}
+
+    @app.get("/api/walkpack/{pid}/files")
+    def walkpack_files(pid: str, request: Request):
+        _auth(request)
+        pack = _require_pid(pid)
+        out = pack / "out"
+        files = []
+        if out.is_dir():
+            for p in sorted(out.iterdir()):
+                if not p.is_file():
+                    continue
+                k = _wp_kind(p.name)
+                if k != "other":
+                    files.append({"name": p.name, "kind": k})
+        order = {"preview": 0, "mp4": 1, "sheet": 2, "pixel": 3}
+        files.sort(key=lambda f: (order.get(f["kind"], 9), f["name"]))
+        return files
+
+    @app.get("/api/walkpack/{pid}/file/{name}")
+    def walkpack_file(pid: str, name: str, request: Request):
+        _auth(request)
+        pack = _require_pid(pid)
+        if not _WP_FNAME_RE.match(name or "") or ".." in name:
+            raise HTTPException(400, "不正なファイル名です")
+        out = pack / "out"
+        p = out / name
+        # out/ 直下のみ (名前検証+resolveで親ディレクトリ一致を確認)
+        if not p.is_file() or p.resolve().parent != out.resolve():
+            raise HTTPException(404, "not found")
+        mt = {".mp4": "video/mp4", ".webp": "image/webp",
+              ".png": "image/png"}.get(p.suffix.lower(),
+                                       "application/octet-stream")
+        return FileResponse(str(p), media_type=mt, filename=name)
+
+    @app.post("/api/walkpack/{pid}/pixelize")
+    async def walkpack_pixelize(pid: str, request: Request):
+        """シートのドット絵化 (同期・数秒)。body.target="preview" なら
+        preview.webp (と簡易シート) の再生成。"""
+        _auth(request)
+        _require_pid(pid)
+        try:
+            _engine()
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        target = str(body.get("target") or "pixel")
+        try:
+            if target == "preview":
+                files = _wp_regen_preview(pid)
+            else:
+                try:
+                    colors = int(body.get("colors", 24))
+                except (TypeError, ValueError):
+                    colors = 24
+                files = _wp_pixelize(pid, colors=colors)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        return {"ok": True, "files": files}
+
+    @app.get("/api/walkpack/{pid}/download")
+    def walkpack_download(pid: str, request: Request):
+        _auth(request)
+        pack = _require_pid(pid)
+        out = pack / "out"
+        names = [p for p in sorted(out.iterdir())
+                 if p.is_file()] if out.is_dir() else []
+        if not names:
+            raise HTTPException(404, "生成結果がまだありません")
+        WORK_ROOT.mkdir(parents=True, exist_ok=True)
+        dest = WORK_ROOT / f"walkpack_{pid}.zip"
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in names:
+                zf.write(p, p.name)
+        return FileResponse(str(dest), media_type="application/zip",
+                            filename=f"{pid}_walkpack.zip")
 
     return app
 
@@ -4695,6 +5582,264 @@ function showDetail(j){$('detail').style.display='block';$('dId').textContent=j.
 
 setMode('i2v');refreshHealth();refreshModels();
 setInterval(refreshHealth,10000);setInterval(refreshJobs,2000);refreshJobs();
+</script></body></html>
+"""
+
+
+# ---------------------------------------------------- webUI (工房モード)
+# トップ `/` のお友だち用ページ。低レベル操作 (モデル・解像度・プロンプト)
+# は一切置かない。トークンの扱いは INDEX_HTML と同じ (?token= /
+# localStorage vl_token を共有)。
+KOBO_HTML = r"""<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpriteMill 工房</title>
+<style>
+:root{--bg:#1c1c1c;--panel:#252526;--panel2:#2d2d30;--fg:#e8e8e8;--dim:#9a9a9a;
+--accent:#57a6ff;--ok:#57d38c;--err:#ff6b6b;--warn:#ffc857;--border:#3c3c3c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font-family:"Segoe UI","Yu Gothic UI",Meiryo,sans-serif;font-size:15px}
+header{display:flex;align-items:center;gap:12px;padding:12px 18px;
+background:var(--panel);border-bottom:1px solid var(--border)}
+header h1{font-size:18px;margin:0}
+header .badge{font-size:12px;color:var(--dim)}
+header a{margin-left:auto;font-size:12px;color:var(--dim);text-decoration:none}
+header a:hover{color:var(--accent)}
+main{max-width:1060px;margin:0 auto;padding:14px}
+.card{background:var(--panel);border:1px solid var(--border);
+border-radius:10px;padding:16px;margin-bottom:14px}
+.card h2{font-size:14px;margin:0 0 12px;color:var(--accent);
+letter-spacing:.05em}
+.card h3{font-size:13px;margin:14px 0 8px;color:var(--dim)}
+input{width:100%;background:var(--panel2);color:var(--fg);
+border:1px solid var(--border);border-radius:6px;padding:7px 9px;font-size:13px}
+button{background:var(--accent);color:#0b1320;border:0;border-radius:8px;
+padding:10px 18px;font-size:15px;font-weight:600;cursor:pointer}
+button:hover{filter:brightness(1.1)}
+button.sec{background:var(--panel2);color:var(--fg);
+border:1px solid var(--border);font-weight:400;font-size:13px;padding:8px 12px}
+button:disabled{opacity:.5;cursor:default}
+.hint{font-size:12.5px;color:var(--dim);margin-top:8px;line-height:1.6}
+#packs{display:flex;flex-wrap:wrap;gap:12px}
+.pack{width:150px;background:var(--panel2);border:1px solid var(--border);
+border-radius:10px;padding:10px;text-align:center;cursor:pointer}
+.pack:hover{border-color:var(--accent)}
+.pack.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.pack img{height:120px;max-width:100%;object-fit:contain;display:block;
+margin:0 auto 8px;image-rendering:auto;background:#161616;border-radius:6px}
+.pack .nm{font-size:13px;font-weight:600;overflow:hidden;
+text-overflow:ellipsis;white-space:nowrap}
+.bar{height:10px;background:#171717;border-radius:5px;margin:10px 0 6px;
+overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--accent);width:0%;
+transition:width .5s}
+.st{font-weight:600}.st.queued{color:var(--dim)}.st.running{color:var(--accent)}
+.st.done{color:var(--ok)}.st.error{color:var(--err)}.st.cancelled{color:var(--dim)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:760px){.cols{grid-template-columns:1fr}}
+#prev,#pix{max-width:100%;background:
+repeating-conic-gradient(#202020 0 25%,#2a2a2a 0 50%) 0 0/24px 24px;
+border:1px solid var(--border);border-radius:8px;display:block}
+#dvid{width:100%;max-height:430px;background:#000;border-radius:8px;
+margin-top:8px}
+select{background:var(--panel2);color:var(--fg);border:1px solid var(--border);
+border-radius:6px;padding:7px 9px;font-size:13.5px;width:100%}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;
+align-items:center}
+#tokrow{display:none}
+a{color:var(--accent)}
+</style></head><body>
+<header>
+  <h1>🎨 SpriteMill 工房</h1>
+  <span class="badge">キャラを選んで、歩くスプライトを作ろう</span>
+  <a href="/advanced">上級者向け画面</a>
+</header>
+<main>
+  <div class="card" id="tokrow">
+    <h2>あいことば (トークン)</h2>
+    <input id="token" placeholder="共有された TOKEN をここに貼り付けてください">
+    <div class="hint">リンクに ?token=… が付いていれば自動で入ります。</div>
+  </div>
+  <div class="card">
+    <h2>1. キャラをえらぶ</h2>
+    <div id="packs"><div class="hint">読み込み中…</div></div>
+  </div>
+  <div class="card" id="work" style="display:none">
+    <h2>2. 歩かせる — <span id="wname"></span></h2>
+    <div id="startrow">
+      <button id="btngo">▶ 歩行スプライトを生成する</button>
+      <span class="hint">生成には数分〜十数分かかります (そのまま待っていてOK)</span>
+    </div>
+    <div id="prog" style="display:none">
+      <div><span class="st" id="ptst"></span> <span id="ptxt" class="hint"></span></div>
+      <div class="bar"><i id="pbar"></i></div>
+      <button class="sec" id="btncancel">中止する</button>
+    </div>
+    <div id="perr" class="hint" style="display:none;color:var(--err)"></div>
+    <div id="result" style="display:none">
+      <div class="cols">
+        <div>
+          <h3>歩きプレビュー (全方向)</h3>
+          <img id="prev" alt="preview">
+        </div>
+        <div>
+          <h3>方向ごとのムービー</h3>
+          <select id="dirsel"></select>
+          <video id="dvid" controls loop autoplay muted playsinline></video>
+        </div>
+      </div>
+      <div id="pixwrap" style="display:none">
+        <h3>ドット絵シート</h3>
+        <img id="pix" alt="pixel art">
+      </div>
+      <div class="actions">
+        <button id="btnpix">🟦 ドット絵にする</button>
+        <button id="btnwebp" class="sec">🔄 WEBPを作り直す</button>
+        <a id="dl" download><button class="sec">⬇ まとめてダウンロード</button></a>
+        <span class="hint" id="msg"></span>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+let TOKEN='',SEL=null,SELNAME='',JOB=null,LASTFILES='',BUSY=false;
+const qs=new URLSearchParams(location.search);
+if(qs.get('token')){TOKEN=qs.get('token');localStorage.setItem('vl_token',TOKEN);}
+else TOKEN=localStorage.getItem('vl_token')||'';
+$('token').value=TOKEN;
+$('token').addEventListener('input',e=>{TOKEN=e.target.value.trim();
+  localStorage.setItem('vl_token',TOKEN);loadPacks();});
+const tokq=()=>TOKEN?('?token='+encodeURIComponent(TOKEN)):'';
+function api(path,opt={}){opt.headers=Object.assign({},opt.headers,
+  TOKEN?{'Authorization':'Bearer '+TOKEN}:{});
+  return fetch(path,opt).then(r=>{
+    if(r.status===401)throw new Error('あいことば(トークン)が違います');
+    if(!r.ok)return r.json().catch(()=>({})).then(b=>{
+      throw new Error(b.detail||('HTTP '+r.status));});
+    return r.json();});}
+
+const DIRJP={front:'まえ',back:'うしろ',left:'ひだり',right:'みぎ',
+  front_left:'ひだりナナメまえ',front_right:'みぎナナメまえ',
+  back_left:'ひだりナナメうしろ',back_right:'みぎナナメうしろ'};
+const DIRORD=['front','front_left','front_right','left','right',
+  'back_left','back_right','back'];
+const STJP={queued:'じゅんび中…',running:'生成中…',done:'できあがり!',
+  error:'エラー',cancelled:'中止しました'};
+
+async function checkAuth(){
+  try{const h=await fetch('/health').then(r=>r.json());
+    $('tokrow').style.display=h.auth?'block':'none';}catch(e){}}
+
+// ---- パック一覧 ----
+async function loadPacks(){
+  let ps;try{ps=await api('/api/packs');}
+  catch(e){$('packs').innerHTML='<div class="hint">⚠ '+e.message+'</div>';return;}
+  const box=$('packs');box.innerHTML='';
+  if(!ps.length){box.innerHTML=
+    '<div class="hint">キャラパックがまだありません。配布側のアプリからアップロードしてもらってください。</div>';return;}
+  for(const p of ps){
+    const d=document.createElement('div');
+    d.className='pack'+(p.pack_id===SEL?' sel':'');
+    d.innerHTML=`<img src="/api/packs/${encodeURIComponent(p.pack_id)}/thumb.png${tokq()}" alt="">
+      <div class="nm">${p.name}</div>`;
+    d.addEventListener('click',()=>select(p.pack_id,p.name));
+    box.appendChild(d);}}
+
+function select(pid,name){SEL=pid;SELNAME=name;JOB=null;LASTFILES='';
+  $('work').style.display='block';$('wname').textContent=name;
+  $('result').style.display='none';$('prog').style.display='none';
+  $('perr').style.display='none';$('startrow').style.display='block';
+  $('msg').textContent='';
+  document.querySelectorAll('.pack').forEach(el=>el.classList.remove('sel'));
+  loadPacks();loadFiles();poll();}
+
+// ---- 生成 ----
+$('btngo').addEventListener('click',async()=>{
+  if(!SEL)return;$('btngo').disabled=true;$('perr').style.display='none';
+  try{const r=await api('/api/walkpack/'+encodeURIComponent(SEL),{method:'POST'});
+    JOB=r.job;$('startrow').style.display='none';$('prog').style.display='block';}
+  catch(e){$('perr').textContent='⚠ '+e.message;$('perr').style.display='block';}
+  finally{$('btngo').disabled=false;}});
+$('btncancel').addEventListener('click',()=>{
+  if(JOB)api('/api/cancel/'+JOB,{method:'POST'}).catch(()=>{});});
+
+// ---- 進捗ポーリング ----
+async function poll(){
+  if(!SEL)return;
+  let data;try{data=await api('/api/jobs');}catch(e){return;}
+  const j=(data.jobs||[]).find(x=>x.model==='walkpack'&&x.pack===SEL&&
+    (JOB?x.id===JOB:true));
+  if(!j)return;
+  if(['queued','running'].includes(j.status)){
+    JOB=j.id;$('startrow').style.display='none';
+    $('prog').style.display='block';
+    $('ptst').className='st '+j.status;
+    $('ptst').textContent=STJP[j.status]||j.status;
+    $('ptxt').textContent=j.detail||'';
+    $('pbar').style.width=Math.round((j.progress||0)*100)+'%';
+  }else if(JOB&&j.id===JOB){
+    $('prog').style.display='none';$('startrow').style.display='block';
+    if(j.status==='done'){JOB=null;loadFiles(true);}
+    else if(j.status==='error'){JOB=null;
+      $('perr').textContent='⚠ 生成に失敗しました: '+(j.detail||'');
+      $('perr').style.display='block';}
+    else{JOB=null;}
+  }}
+setInterval(poll,2000);
+
+// ---- 結果 ----
+async function loadFiles(bust){
+  if(!SEL)return;
+  let fs;try{fs=await api('/api/walkpack/'+encodeURIComponent(SEL)+'/files');}
+  catch(e){return;}
+  const key=fs.map(f=>f.name).join(',');
+  if(!bust&&key===LASTFILES)return;LASTFILES=key;
+  if(!fs.length){$('result').style.display='none';return;}
+  const cb=bust?('&t='+Date.now()):'';
+  const url=n=>'/api/walkpack/'+encodeURIComponent(SEL)+'/file/'+
+    encodeURIComponent(n)+tokq()+(tokq()?cb:(bust?('?t='+Date.now()):''));
+  $('result').style.display='block';
+  const prev=fs.find(f=>f.kind==='preview');
+  $('prev').style.display=prev?'block':'none';
+  if(prev)$('prev').src=url(prev.name);
+  const mp4s=fs.filter(f=>f.kind==='mp4'&&!f.name.startsWith('canvas_'));
+  const sel=$('dirsel');const cur=sel.value;sel.innerHTML='';
+  const byDir={};
+  for(const f of mp4s){const m=f.name.match(/_\d\d_([a-z_]+)_walkT\.mp4$/);
+    if(m)byDir[m[1]]=f.name;}
+  for(const d of DIRORD){if(!byDir[d])continue;
+    const o=document.createElement('option');
+    o.value=byDir[d];o.textContent=DIRJP[d]||d;sel.appendChild(o);}
+  if([...sel.options].some(o=>o.value===cur))sel.value=cur;
+  if(sel.options.length){$('dvid').src=url(sel.value);
+    $('dvid').parentElement.style.display='block';}
+  const pix=fs.find(f=>f.name.endsWith('_pixel@2x.png'))||
+            fs.find(f=>f.kind==='pixel');
+  $('pixwrap').style.display=pix?'block':'none';
+  if(pix)$('pix').src=url(pix.name);
+  $('dl').href='/api/walkpack/'+encodeURIComponent(SEL)+'/download'+tokq();}
+$('dirsel').addEventListener('change',()=>{
+  $('dvid').src='/api/walkpack/'+encodeURIComponent(SEL)+'/file/'+
+    encodeURIComponent($('dirsel').value)+tokq();});
+
+async function post2(target,label){
+  if(!SEL||BUSY)return;BUSY=true;$('msg').textContent=label+'中…';
+  $('btnpix').disabled=$('btnwebp').disabled=true;
+  try{await api('/api/walkpack/'+encodeURIComponent(SEL)+'/pixelize',
+    {method:'POST',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({target})});
+    $('msg').textContent=label+'ができました!';loadFiles(true);}
+  catch(e){$('msg').textContent='⚠ '+e.message;}
+  finally{BUSY=false;$('btnpix').disabled=$('btnwebp').disabled=false;}}
+$('btnpix').addEventListener('click',()=>post2('pixel','ドット絵'));
+$('btnwebp').addEventListener('click',()=>post2('preview','WEBP'));
+
+checkAuth();loadPacks();
+setInterval(checkAuth,15000);
 </script></body></html>
 """
 
