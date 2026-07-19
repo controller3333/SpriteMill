@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.6"  # 0.10.6: 飛行の骨格条件を直立+上下ボブ列へ差し替え (0.10.5のノブ+文面だけでは歩行骨格に引っ張られて浮遊しない実障害)
+__version__ = "0.10.7"  # 0.10.7: 検証用中間保全 (stage1/2キャンバス動画+プロンプト+参照をdebug/へ・保持12件) — 段階特定用 (2026-07-19「右向きだけ劣化」調査)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5213,7 +5213,20 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             mode="i2v", prompt=prompt, images=[canvas],
             width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
             steps=4, seed=seed, guidance=1.0, extra=extra1))
-        _wp_wait(j, jid1, s1lo, s1hi)
+        sj1 = _wp_wait(j, jid1, s1lo, s1hi)
+        try:
+            # ★検証用の中間保全 (2026-07-19ユーザー提案「結果のみだと
+            # どの段階で劣化したか特定が難しい」): stage1(VACE)動画・
+            # プロンプト・参照キャンバスを out/ へ残す。stage2の
+            # canvas_{tag}.mp4 と対にすると、劣化がVACE段かAniSora再加工段
+            # かを後から画で切り分けられる。完了時に debug/ へ写す
+            _p1 = (sj1 or {}).get("path")
+            if _p1 and Path(_p1).is_file():
+                shutil.copy2(_p1, out / f"canvas_{tag}_stage1.mp4")
+            (out / f"prompt_{tag}.txt").write_text(prompt, encoding="utf-8")
+            canvas.save(out / f"refcanvas_{tag}.png")
+        except Exception as e:                # noqa: BLE001
+            log(f"[{tag}] 中間保全に失敗 (無視して続行): {str(e)[:80]}")
         extra2 = {"latent_from": jid1,
                   "refine_strength": float(
                       os.environ.get("SM_VACE_LR_REFINE", "").strip()
@@ -5512,6 +5525,47 @@ def _gcs_delete(name: str) -> None:
 GCS_KEEP_OUTPUTS = 100   # 生成物の保持件数 (容量圧迫回避)。超過分は古い順に削除
 
 
+def _gcs_debug_keep() -> int:
+    """検証用中間成果物 (debug/) の保持件数。0で無効。"""
+    try:
+        return int(os.environ.get("VIDEOLAB_DEBUG_KEEP", "12"))
+    except ValueError:
+        return 12
+
+
+def _gcs_debug_upload(rid: str, out) -> None:
+    """中間成果物 (stage1/2キャンバス動画・プロンプト・参照キャンバス) を
+    gs://.../debug/<epoch>_<rid>/ へ写す (2026-07-19ユーザー提案)。配布物
+    ではないのでギャラリー/manifestには載せない。保持は新しい順に
+    VIDEOLAB_DEBUG_KEEP件 (既定12)。失敗しても本流は止めない。"""
+    keep = _gcs_debug_keep()
+    if keep <= 0 or not _gcs_active():
+        return
+    try:
+        pre = f"debug/{int(time.time())}_{rid}/"
+        n = 0
+        for p in sorted(Path(out).iterdir()):
+            if not p.is_file():
+                continue
+            if not (p.name.startswith(("canvas_", "prompt_", "refcanvas_"))):
+                continue
+            _gcs_write(pre + p.name, p.read_bytes(),
+                       _GCS_CT.get(p.suffix.lower(),
+                                   "application/octet-stream"))
+            n += 1
+        _wp_print(f"[GCS] 検証用中間 {n}件を {pre} へ保全")
+        # 保持を超えた古いdebugセットを削除 (プレフィクスはepoch付きで
+        # 名前順=時系列)
+        seen = sorted({name.split("/", 2)[1]
+                       for name in _gcs_list("debug/")
+                       if name.count("/") >= 2})
+        for stale in seen[:-keep] if len(seen) > keep else []:
+            for name in _gcs_list(f"debug/{stale}/"):
+                _gcs_delete(name)
+    except Exception as e:                    # noqa: BLE001
+        _wp_print(f"[GCS] 中間保全アップロード失敗 (無視): {str(e)[:120]}")
+
+
 def _gcs_prune_outputs(keep: int = GCS_KEEP_OUTPUTS) -> None:
     """終端状態の生成物を最新keep件だけ残し、古いものを消す。
 
@@ -5674,6 +5728,10 @@ def _gcs_process_one(req: dict, wait: bool = True):
     # 読み直してから done を書く (作り直しの黙殺防止)
     _gcs_req_finish(req, "done")
     _LAST_GCS_WORK[0] = time.time()
+    try:                                      # 検証用中間の保全 (rmtree前)
+        _gcs_debug_upload(rid, packs_root() / pid / "out")
+    except Exception:                         # noqa: BLE001
+        pass
     # 完成したら途中成果物(生mp4を含むローカルパック一式)を削除して
     # VMディスクを解放する (容量圧迫の防止)。配布物はGCSにあるので安全。
     try:
