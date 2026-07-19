@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.5"  # 0.10.5: walkpackのbody_plan=flying対応 (ホバー文面+脚振り最小/上下動強のノブ差し替え。従来は浮遊キャラも歩いていた)
+__version__ = "0.10.6"  # 0.10.6: 飛行の骨格条件を直立+上下ボブ列へ差し替え (0.10.5のノブ+文面だけでは歩行骨格に引っ張られて浮遊しない実障害)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4459,6 +4459,34 @@ def _wp_plan_env_restore(saved) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = old
+
+
+def _wp_flying_frames(frames, idle_n: int, gait_end: int, canvas_h: int):
+    """飛行用poseフレーム列: 先頭の直立骨格を全フレームに使い、歩行窓だけ
+    上下ボブ (sin・2往復) を与える。ノブで脚振りを最小化しても、歩行骨格を
+    条件に渡す限りVACEはステップを描く (2026-07-19ユーザー報告「ポーズ画像に
+    引っ張られて浮遊しない」— 条件付けはプロンプトより強い)。だから条件
+    そのものをホバーにする: 脚は全フレーム直立のまま、全身が上下に浮き沈み
+    し、羽ばたき等のディテールは文面とAniSora再加工に任せる。末尾静止窓は
+    ボブも止めて直立コマ選出のアンカーを保つ。"""
+    import math
+    from PIL import Image
+    base = frames[0]
+    amp = max(2, round(canvas_h * 0.012))
+    win = max(1, gait_end - idle_n + 1)
+    out = []
+    for k in range(len(frames)):
+        if k < idle_n or k > gait_end:
+            out.append(base)
+            continue
+        dy = round(amp * math.sin(2 * math.pi * 2.0 * (k - idle_n) / win))
+        if not dy:
+            out.append(base)
+            continue
+        im = Image.new(base.mode, base.size, 0)
+        im.paste(base, (0, dy))
+        out.append(im)
+    return out
 _WALKPACK_LOCK = threading.Lock()   # 直列化 (SM_LEG_SCALE等のenvを守る)
 _WP_DIRS = ("front", "left", "right", "back",
             "front_left", "front_right", "back_left", "back_right")
@@ -5165,6 +5193,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
             f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
         frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+        if plan == "flying":
+            # 歩行骨格は条件に出さない (上の _wp_flying_frames 参照)
+            frames = _wp_flying_frames(frames, idle_n, gait_end, h)
+            log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
         canvas = cv.compose_reference(refs, w, h, layout)
         prompt = _wp_prompt(eng, refs, layout, nf, plan=plan)
         extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
