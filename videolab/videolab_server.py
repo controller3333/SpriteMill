@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.2"  # 0.10.2: GCE作業員モード — GCSから依頼を拾い歩行生成→outputs書き戻し、アイドル自己停止 (課金の守り)
+__version__ = "0.10.3"  # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
 # 0.9.14: ディスク退避キャッシュのquant切替取り違え根治
@@ -527,6 +527,36 @@ _HF_STALLED = False   # このセッションでHF先行チャレンジが停滞
 #                       (一度死んだHFは部品ごとに再挑戦しない — 30秒/部品
 #                       の無駄待ちを1セッション1回に抑える v0.9.6)
 
+_MIN_CACHE_BYTES = 2**30   # キャッシュ採用の下限 (429エラーページ・中断
+#                            コピーを「完備」と誤認しないための粗いふるい)
+
+
+def _cache_size_ok(p: Path, log, label: str, expect: int = 0) -> bool:
+    """キャッシュファイルのサイズゲート。**落ちたら必ず声を出す** (v0.10.3)。
+
+    2026-07-19監査: 旧コードはこのゲートを無言のフォールスルーで書いて
+    いたため、下限に届かないキャッシュがあると「ネットワーク不要」の
+    はずの運転が黙ってHF実DLへ落ちていた (ログにも残らない)。原因が
+    キャッシュ側にあることを必ずログに出す。
+
+    expect (Drive原本のサイズ等・分かる場合) を渡せば実サイズ照合を
+    優先する — 1GiB固定はLightning LoRA(約1.2GB)のように余裕が200MB
+    しかない部品には粗すぎる。"""
+    if not p.is_file():
+        return False
+    sz = p.stat().st_size
+    if expect > 0 and sz != expect:
+        log(f"⚠ キャッシュ {label} がサイズ不一致 ({sz / 2**20:.0f}MB /"
+            f" 期待 {expect / 2**20:.0f}MB) — 使いません")
+        return False
+    if sz <= _MIN_CACHE_BYTES:
+        log(f"⚠ キャッシュ {label} が下限 "
+            f"{_MIN_CACHE_BYTES / 2**30:.1f}GB 未満 ({sz / 2**20:.0f}MB) — "
+            "壊れた/途中のコピーとみなして使いません。HFからの実DLへ"
+            "フォールバックします (ネットワークが必要になります)")
+        return False
+    return True
+
 
 def _hf_download(repo: str, filename: str, log, attempts: int = 6,
                  stall_secs: int = 90) -> str:
@@ -574,14 +604,15 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
     # セッションディスクの前回コピーを再利用 (v0.9.3、2026-07-14ユーザー
     # 指摘「2回目以降の生成もドライブから毎回DLしてる」— モデル切替の
     # たびに~19GBを再コピーしていた)。Driveの原本とサイズ一致なら採用
-    if dst.is_file() and dst.stat().st_size > 2**30 and (
-            dsrc is None or not dsrc.is_file()
-            or dst.stat().st_size == dsrc.stat().st_size):
+    _want = (dsrc.stat().st_size
+             if (dsrc is not None and dsrc.is_file()) else 0)
+    if dst.is_file() and _cache_size_ok(
+            dst, log, f"セッションディスク {filename}", _want):
         log(f"セッションディスクの既存コピーを再利用: {filename}")
         return str(dst)
     code = ("from huggingface_hub import hf_hub_download; "
             f"hf_hub_download({repo!r}, {filename!r})")
-    if dsrc is not None and dsrc.is_file() and dsrc.stat().st_size > 2**30:
+    if dsrc is not None and _cache_size_ok(dsrc, log, f"Drive {filename}"):
         # HF先行チャレンジ (v0.9.4、ユーザー要望「トークンせっかく用意
         # してるから最初1回だけHFからDLチャレンジして、10秒ごとに監視、
         # 駄目ならドライブへ」)。健康なHFはDrive FUSE読み(~150MB/s)の
@@ -629,7 +660,7 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         raise _drive_only_error(filename, dsrc)
 
     def _ok(path: Path) -> bool:
-        return path.is_file() and path.stat().st_size > 2**30
+        return path.is_file() and path.stat().st_size > _MIN_CACHE_BYTES
 
     got = None
     code = ("from huggingface_hub import hf_hub_download; "
@@ -684,6 +715,70 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
     return got
 
 
+def _snap_valid(root: Path) -> str:
+    """スナップショットの健全性検査 (v0.9.1-0.9.2、v0.10.3で誤判定を修正)。
+
+    ①.manifest.json (PC配置時に生成した 相対パス→サイズ の台帳) と
+    照合 — Drive同期が未完だと大きいシャードが丸ごと欠ける実障害
+    (2026-07-14: text_encoderのsafetensorsがFileNotFound)。
+    ②全JSONのパース — FUSEは同期未完ファイルを『サイズはあるのに
+    読むと空』で返す実障害 (config.json 0バイト)。
+    問題があればその相対パスを返す (""=健全)。
+
+    v0.10.3: ②は `if not json.loads(...)` と書かれていて、**ファイル**
+    ではなく**パース結果の真偽値**を見ていた。{} / [] / 0 / false / ""
+    に正当にパースされるJSON (空のindexやフラグ類) が毎回「破損」判定に
+    なり、呼び出し側がrmtree→再コピー→同じ判定…と抜けられないループに
+    落ちて「同期未完了の疑い」で終わる。パースが通れば健全とみなし、
+    本当に読めない/壊れているものだけを弾く (0バイトは明確に異常)。"""
+    import json as _json
+    mf = root / ".manifest.json"
+    if mf.is_file():
+        try:
+            man = _json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            return ".manifest.json"
+        for rel, size in man.items():
+            p = root / rel
+            if not p.is_file() or p.stat().st_size != int(size):
+                return rel
+    for jp in root.rglob("*.json"):
+        if ".cache" in jp.parts or jp.name == ".manifest.json":
+            continue
+        try:
+            if jp.stat().st_size == 0:
+                return str(jp.relative_to(root))
+            _json.loads(jp.read_text(encoding="utf-8"))   # 値は問わない
+        except Exception:
+            return str(jp.relative_to(root))
+    return ""
+
+
+def _snap_writeback(local: Path, dsrc: Path, log) -> None:
+    """スナップショットをDriveキャッシュへ書き戻す (v0.10.3で順序を修正)。
+
+    サイドカーの書き順が肝: `.manifest.json` を書き切ってから
+    `.complete` を**最後の1バイト**として打つ。旧コードは copytree の
+    中身として `.complete` が (名前順で先に) 流れ込み、manifestは最後
+    だったため、中断すると Driveに「.complete はあるが manifest 無し
+    /ファイル欠け」という状態が残った。drive_cache_ready は .complete
+    しか見ないので「配置済み」と報告する一方、_snap_valid は落ちるので
+    毎ブート再DLになる。"""
+    log(f"Driveキャッシュへベース部品を書き戻し: {local.name}")
+    # .complete は copytree に運ばせない (完成の宣言は最後に自分で打つ)
+    shutil.copytree(local, dsrc, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(".cache", ".complete"))
+    # マニフェスト (v0.9.2): 次セッションが同期未完を検出できる
+    import json as _json
+    man = {f.relative_to(local).as_posix(): f.stat().st_size
+           for f in local.rglob("*")
+           if f.is_file() and ".cache" not in f.parts
+           and f.name not in (".complete", ".manifest.json")}
+    (dsrc / ".manifest.json").write_text(
+        _json.dumps(man, ensure_ascii=False), encoding="utf-8")
+    (dsrc / ".complete").touch()   # ← 木に対する最後の書き込み
+
+
 def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     """ベース部品リポ(VAE/UMT5/config類)をsymlink無しのプレーンdirへ取得
     (v0.8.7)。transformer重み(GGUF側で持つ)は除外して約12GBに抑える。
@@ -697,36 +792,6 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     name = repo.replace("/", "--")
     local = WORK_ROOT / "_snap" / name
     marker = local / ".complete"
-
-    def _snap_valid(root: Path) -> str:
-        """スナップショットの健全性検査 (v0.9.1-0.9.2)。
-
-        ①.manifest.json (PC配置時に生成した 相対パス→サイズ の台帳) と
-        照合 — Drive同期が未完だと大きいシャードが丸ごと欠ける実障害
-        (2026-07-14: text_encoderのsafetensorsがFileNotFound)。
-        ②全JSONのパース — FUSEは同期未完ファイルを『サイズはあるのに
-        読むと空』で返す実障害 (config.json 0バイト)。
-        問題があればその相対パスを返す (""=健全)。"""
-        import json as _json
-        mf = root / ".manifest.json"
-        if mf.is_file():
-            try:
-                man = _json.loads(mf.read_text(encoding="utf-8"))
-            except Exception:
-                return ".manifest.json"
-            for rel, size in man.items():
-                p = root / rel
-                if not p.is_file() or p.stat().st_size != int(size):
-                    return rel
-        for jp in root.rglob("*.json"):
-            if ".cache" in jp.parts or jp.name == ".manifest.json":
-                continue
-            try:
-                if not _json.loads(jp.read_text(encoding="utf-8")):
-                    return str(jp.relative_to(root))
-            except Exception:
-                return str(jp.relative_to(root))
-        return ""
 
     if marker.is_file():
         bad = _snap_valid(local)
@@ -807,17 +872,7 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
     marker.touch()
     if dsrc is not None and not (dsrc / ".complete").is_file():
         try:
-            log(f"Driveキャッシュへベース部品を書き戻し: {repo}")
-            shutil.copytree(local, dsrc, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns(".cache"))
-            # マニフェスト (v0.9.2): 次セッションが同期未完を検出できる
-            import json as _json
-            man = {f.relative_to(local).as_posix(): f.stat().st_size
-                   for f in local.rglob("*")
-                   if f.is_file() and ".cache" not in f.parts
-                   and f.name not in (".complete", ".manifest.json")}
-            (dsrc / ".manifest.json").write_text(
-                _json.dumps(man, ensure_ascii=False), encoding="utf-8")
+            _snap_writeback(local, dsrc, log)
         except OSError as e:
             log(f"Drive書き戻しスキップ: {str(e)[:120]}")
     return str(local)
@@ -861,7 +916,7 @@ def drive_cache_ready() -> tuple:
     for kind, repo, fname in _drive_manifest():
         if kind == "file":
             p = dc / repo.replace("/", "--") / fname
-            if not (p.is_file() and p.stat().st_size > 2**30):
+            if not (p.is_file() and p.stat().st_size > _MIN_CACHE_BYTES):
                 missing.append(f"{repo}/{fname}")
         elif not (dc / "_snap" / repo.replace("/", "--")
                   / ".complete").is_file():
@@ -894,7 +949,7 @@ def populate_drive(log=print, wait_mount_secs: int = 180) -> bool:
         for kind, repo, fname in _drive_manifest():
             if kind == "file":
                 p = dc / repo.replace("/", "--") / fname
-                if p.is_file() and p.stat().st_size > 2**30:
+                if p.is_file() and p.stat().st_size > _MIN_CACHE_BYTES:
                     continue
                 _hf_download(repo, fname, log)
             else:
@@ -2918,6 +2973,14 @@ class VACEAdapter(_WanA14BBase):
                 # Low->LowNoise のエキスパート対応)。ドナーはCPU上で
                 # 読み込み→移植→即解放 (Q8で一時+16GB)
                 from diffusers import WanTransformer3DModel
+                # ドナーのconfigも実体dir経由 (v0.10.3、2026-07-19監査):
+                # 以前は config=self.base_repo とリポIDを渡していたため、
+                # diffusersがtransformer/config.jsonをHubから直に引きに
+                # 行き、_snapshot_local/_drive_only()を丸ごと迂回していた
+                # (walk_packはvace_base="fun"固定で踏まないが、webUIの
+                # 手動vaceジョブとlatent_refine以外の経路は既定
+                # VIDEOLAB_VACE_BASE="anisora" でここへ来る)
+                snap_base = _snapshot_local(self.base_repo, log)
                 for tgt, tag, sub in ((t_hi, "High", "transformer"),
                                       (t_lo, "Low", "transformer_2")):
                     if experts != "both" and experts != tag.lower():
@@ -2937,7 +3000,7 @@ class VACEAdapter(_WanA14BBase):
                     log(f"AniSora {tag} 読み込み (移植ドナー・config="
                         "Wan2.2-I2Vベースを明示)")
                     donor = WanTransformer3DModel.from_single_file(
-                        dp, quantization_config=qc, config=self.base_repo,
+                        dp, quantization_config=qc, config=snap_base,
                         subfolder=sub, torch_dtype=_pick_dtype())
                     _transplant_base_weights(tgt, donor, log, tag=tag,
                                              patch_mode=patch)
@@ -4268,9 +4331,13 @@ def _engine() -> dict:
         sys.path.insert(0, str(ENGINE_PACK_DIR))
     try:
         import importlib
+        # inspect_walk_mp4 は顔消失ゲートの指標 (head_band/head_diversity)
+        # を借りるために読む。標準ライブラリのみ・__main__ガード付きなので
+        # import副作用は無い (実測0.09s)。
         mods = {name: importlib.import_module(name)
                 for name in ("pose_video", "canvas_walk", "compass_vace",
-                             "color_anchor", "pixelize_sheet")}
+                             "color_anchor", "pixelize_sheet",
+                             "inspect_walk_mp4")}
     except Exception as e:              # noqa: BLE001
         _ENGINE_ERR = f"engine_packのimportに失敗: {e}"
         raise RuntimeError(_ENGINE_ERR) from e
@@ -4330,6 +4397,37 @@ def _req_save(rid: str, data: dict) -> None:
 WALKPACK_NF = 57                 # 直立6+歩行2周期+末尾静止8 (walk_layout)
 WALKPACK_W, WALKPACK_H = 480, 864   # 2x2 x セル240x432
 WALKPACK_FPS = 16
+
+# 生成の既定詳細設定 (2026-07-19 ユーザー指定)。母艦アプリの config.json と
+# 同じ値をクラウド側 (walkpack) の既定にも入れ、どちらの経路でも絵が揃う。
+# 環境変数が入っていればそちらが優先 (実験用の逃げ道)。
+WP_DEFAULTS = {
+    "SM_POSE_ARM_SWING": "0.8",
+    "SM_POSE_LEG_SWING": "0.8",
+    "SM_POSE_LEG_CROSS": "0.3",
+    "SM_POSE_BOB": "0.9",
+    # ★顔正面化は工房経路では切る (2026-07-19、ロップ実測)。
+    # 立ち絵の顔が正面寄り (実測5°/8°) だと auto が発動して「体は45°・顔は
+    # 0°」を宣言し、その無理な姿勢をモデルが髪で埋めて片方の斜め前だけ顔が
+    # 髪に覆われた。offにすると顔も実測どおり左右対称に傾き (∓10°)、症状が
+    # 消えることを実機で確認 (頭部色多様性 20.2→27.2、正面29.4と同水準)。
+    # ★全体の既定は auto のまま (ここはwalkpackにだけ効く)。offは2026-07-18
+    # に「歩行開始と同時に後頭部へ吸われる」で8+2試行全滅した旧構成でもある
+    # ため。全滅したのは前後半球レイアウト導入前=rear語彙が同居していた頃で、
+    # 今の F4/B4 + 斜めの左右明記なら安全と判断したが、GUI経路 (compass等)
+    # まで巻き戻す根拠は無い。明示的に環境変数を設定すればこの既定は上書きできる。
+    "SM_POSE_FACE_FRONT": "off",
+}
+WP_LR_REFINE = 0.55          # AniSora latent再加工のσ (旧既定0.45)
+WP_LR_PIN_RELEASE = 0.2      # σ<この値でlatent固定を解除して質感を馴染ませる
+
+
+def _wp_apply_pose_defaults() -> None:
+    """姿勢の既定値を環境変数へ (未設定のときだけ)。pose_video /
+    compass_vace は SM_POSE_* を読むので、ここで入れれば骨格生成に効く。"""
+    for k, v in WP_DEFAULTS.items():
+        if not os.environ.get(k, "").strip():
+            os.environ[k] = v
 _WALKPACK_LOCK = threading.Lock()   # 直列化 (SM_LEG_SCALE等のenvを守る)
 _WP_DIRS = ("front", "left", "right", "back",
             "front_left", "front_right", "back_left", "back_right")
@@ -4418,6 +4516,14 @@ def _pack_extract(pid: str, raw: bytes) -> int:
                 dest = pack / "meta.json"
             elif name == "landmarks.json":
                 dest = pack / "01_generation" / "landmarks.json"
+            elif name == "template.json":
+                # 依頼のシート形式 (母艦が templates/<name>.json を同梱)。
+                # ★これを落とすと _wp_sheet_layout が見つけられず、無言で
+                # T規格へフォールバックする。2026-07-19: ウディタ8方向で
+                # 依頼したのに 768x512 のT規格シートが出てきた実害。
+                # meta.json の "template" は正しいのにシートだけ違う、と
+                # いう分かりにくい壊れ方をするので必ず通すこと。
+                dest = pack / "template.json"
             elif name.lower().endswith(".png"):
                 dest = sc / name
             else:
@@ -4504,8 +4610,15 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int) -> str:
             if d not in refs or d not in present:
                 continue
             rim = Image.open(refs[d])
+            # ★骨格と同じ判定を読むこと (2026-07-19)。ここが "auto" 固定
+            # だと、SM_POSE_FACE_FRONT=off にしたとき骨格は「顔を実測どおり
+            # 傾ける」に変わるのに文面だけ「顔はカメラを向く」と言い続け、
+            # 綱引きがかえって悪化する。骨格側は
+            # build_canvas_pose_frames が引数無し=環境変数読みなので、
+            # 探針も _face_front_mode() を通す。
             if pv._adapted_yaw(d, rim, fig, front_ref=fim,
-                               face_front="auto", quiet=True) == 0.0:
+                               face_front=pv._face_front_mode(),
+                               quiet=True) == 0.0:
                 ff_diag = True
             if pv._adapted_body_yaw(d, rim, fig, front_ref=fim,
                                     mode="off", quiet=True) \
@@ -4609,6 +4722,40 @@ def _wp_dir_mp4s(out: Path) -> tuple:
     return (char or "char"), mp4s
 
 
+# 顔が写る方向 (横顔は顔面積が小さく、後ろ系は顔が無いのが正しいので対象外。
+# inspect_walk_mp4.FACE_DIRS と同じ範囲)
+_WP_FACE_DIRS = ("front", "front_left", "front_right")
+# 前向き系のうち最良に対してこの比を下回る方向は「顔が隠れている」と見なす。
+# 実測: 正常な回は 0.93、髪が顔を覆った回は 0.57 (どちらもロップ)。
+_WP_FACE_MIN_RATIO = 0.75
+# 作り直しのシード。1レイアウト=1回の生成=1個のノイズで、どのセルが崩れるかは
+# そのノイズ実現で決まる。既定42と別の実現を引き直すのが目的なので値自体に
+# 意味は無い (再現性のため固定値にしてある)。
+WP_FACE_RETRY_SEED = 43
+
+
+def _wp_face_retry_on() -> bool:
+    """顔ゲートNG時の作り直しをするか (SM_WP_FACE_RETRY、既定on)。
+
+    offにすると検査とログだけ残して作り直さない (GPU時間を使いたくない
+    ときや、ゲート自体の挙動を見たいときの逃げ道)。"""
+    return os.environ.get("SM_WP_FACE_RETRY", "on").strip().lower() \
+        not in ("off", "0", "false", "no")
+
+
+def _wp_face_score(eng: dict, im) -> float | None:
+    """キー済みRGBAセルの顔スコア (頭部帯の色多様性)。
+
+    顔が見えている頭 = 髪+肌+目で色が多様、髪に覆われた頭/後頭部は
+    髪一色に寄って低い。指標は inspect_walk_mp4 の実装をそのまま借りる
+    (二重実装するとゲートと本番で判定がずれるため)。"""
+    try:
+        iw = eng["inspect_walk_mp4"]
+        return iw.head_diversity(iw.head_band(im))
+    except Exception:                     # noqa: BLE001
+        return None
+
+
 def _wp_collect_cells(eng: dict, ffmpeg: str, out: Path,
                       nf: int = WALKPACK_NF) -> tuple:
     """方向別mp4から idle+walk1..5 のキー済みRGBAセルを取る。
@@ -4650,6 +4797,77 @@ def _wp_collect_cells(eng: dict, ffmpeg: str, out: Path,
             cells[d] = got
     return char, cells
 
+# ★コマ探索QC (まばたきコマを避けて隣を拾う) は入れていない。2026-07-19に
+# 実装しかけて実測で取り下げた:
+#   ・顔ゲートの指標 (head_diversity=頭部帯の色多様性) は、髪が顔を覆う
+#     ような大きな変化は捉えるが、目の開閉は拾えない。実測でまばたきコマ
+#     26.7 > 次コマ 26.5 と逆転していて、この指標での探索は無意味。
+#   ・常に窓内最良を取る素朴な実装は、正常な回でも全スロットを一律にずらす
+#     (実測: 5スロット全部が+2コマ移動) ので歩容が変わる副作用がある。
+#   ・目の暗画素比なら まばたきを部分的に捉えるが、front_right 32.8 に対し
+#     front_left 37.6 (通常40前後) と分離が弱く、確実に拾えない。
+# まばたき対策をやるなら目専用の判定 (_detect_eye_pair の開閉版) が要る。
+# 中途半端な指標で歩容をずらすのは、直す量より壊す量が大きい。
+
+
+def _wp_face_gate(eng: dict, ffmpeg: str, out: Path, log) -> list:
+    """前向き系の方向で「顔が髪に覆われている/後頭部化している」を検出する。
+
+    絶対値のしきい値はキャラの画風 (髪色の単調さ) に強く依存するので使わず、
+    同じキャラの前向き系どうしを比べる。顔が出ている方向は互いに近い値に
+    なり、崩れた方向だけが後頭部並みまで落ちる — 実測 (ロップ):
+      正常な回   front 29.4 / front_left 28.9 / front_right 27.2 → 比0.93
+      崩れた回   front 29.0 / front_left 26.5 / front_right 16.4 → 比0.57
+                 (このとき back系が 14.7〜16.3 = front_right は後頭部並み)
+    戻り値: (崩れていると判定した方向のリスト, 方向->スコア)。
+
+    ★半球ごとに呼べるよう、_wp_collect_cells は使わず対象方向のmp4だけを
+    自前で読む (F4の直後はB4のmp4がまだ無く、8方向前提の収集は落ちる)。"""
+    from PIL import Image
+    _, mp4s = _wp_dir_mp4s(out)
+    targets = [d for d in _WP_FACE_DIRS if d in mp4s]
+    scores: dict = {}
+    if len(targets) < 2:
+        return [], scores
+    idle_n, cyc, period, tail = eng["pose_video"].walk_layout(WALKPACK_NF)
+    want = [idle_n + int(round(period * k / 5.0)) for k in range(5)]
+    with tempfile.TemporaryDirectory() as td:
+        for d in targets:
+            sub = Path(td) / d
+            sub.mkdir()
+            r = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp4s[d]),
+                 str(sub / "f_%05d.png")],
+                capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                continue
+            vals = []
+            for i in want:
+                p = sub / f"f_{i + 1:05d}.png"
+                if not p.is_file():
+                    continue
+                try:
+                    s = _wp_face_score(
+                        eng, _wp_key(Image.open(p).convert("RGB")))
+                except Exception:         # noqa: BLE001
+                    continue
+                if s is not None:
+                    vals.append(s)
+            if vals:
+                scores[d] = sum(vals) / len(vals)
+    if len(scores) < 2:
+        return [], scores
+    best = max(scores.values())
+    bad = [d for d, v in scores.items() if v < best * _WP_FACE_MIN_RATIO]
+    detail = " / ".join(f"{d}={v:.1f}" for d, v in sorted(scores.items()))
+    if bad:
+        log(f"  ★顔ゲート: 顔が隠れている方向 {bad} ({detail}、"
+            f"最良比 {min(scores.values()) / best:.2f} "
+            f"< {_WP_FACE_MIN_RATIO})")
+    else:
+        log(f"  顔ゲート OK ({detail})")
+    return bad, scores
+
 
 def _wp_write_preview(out: Path, tcells: dict, cell_w: int, cell_h: int,
                       scale: int = 2) -> None:
@@ -4669,6 +4887,39 @@ def _wp_write_preview(out: Path, tcells: dict, cell_w: int, cell_h: int,
     frames[0].save(out / "preview.webp", save_all=True,
                    append_images=frames[1:], duration=140, loop=0,
                    disposal=2)
+
+
+# シートのコマ名 -> walkpackが持つ方向別コマの添字 (idle, walk1..walk5)。
+# walkA/walkB = 歩幅が反対の2コマ (母艦の walkAB.json と同じ walk1/walk3)。
+_WP_FRAME_IDX = {"idle": 0, "walk1": 1, "walk2": 2, "walk3": 3,
+                 "walk4": 4, "walk5": 5, "walkA": 1, "walkB": 3}
+
+
+def _wp_sheet_layout(pack: Path) -> tuple:
+    """(列数, 行数, [(col,row,dir,コマ添字)]) を返す。
+
+    パックに template.json (母艦が依頼のシート形式を同梱) があればそれに
+    従い、無ければ従来のT規格 (_WP_SHEET_PLACE) で組む。"""
+    tp = pack / "template.json"
+    if tp.is_file():
+        try:
+            cells = json.loads(tp.read_text(encoding="utf-8")).get("cells")
+            places = []
+            for c in (cells or []):
+                d, fr = str(c.get("dir")), str(c.get("frame"))
+                if d in _WP_DIRS and fr in _WP_FRAME_IDX:
+                    places.append((int(c["col"]), int(c["row"]), d,
+                                   _WP_FRAME_IDX[fr]))
+            if places:
+                cols = max(p[0] for p in places) + 1
+                rows = max(p[1] for p in places) + 1
+                return cols, rows, places
+        except Exception:                     # noqa: BLE001
+            pass                              # 壊れた定義はT規格へ退避
+    places = [(block + k, row, d, k)
+              for d, (row, block) in _WP_SHEET_PLACE.items()
+              for k in range(6)]
+    return 12, 4, places
 
 
 def _wp_assemble(eng: dict, ffmpeg: str, out: Path, meta: dict, log) -> list:
@@ -4694,11 +4945,12 @@ def _wp_assemble(eng: dict, ffmpeg: str, out: Path, meta: dict, log) -> list:
             boxes.append(bb)
     scale = min(min((ltw * 0.94) / max(1, bb[2] - bb[0]),
                     (lth * 0.96) / max(1, bb[3] - bb[1])) for bb in boxes)
-    sheet = Image.new("RGBA", (ltw * 12, lth * 4), (0, 0, 0, 0))
+    # 方向別コマを正規化 (LTサイズ=シート合成用 / セルサイズ=プレビュー用)
+    ltcells: dict = {}
     tcells: dict = {}
-    for d, (row, block) in _WP_SHEET_PLACE.items():
-        tl = []
-        for k, im in enumerate(cells[d]):
+    for d in _WP_DIRS:
+        ll, tl = [], []
+        for im in cells[d]:
             bb = im.getchannel("A").getbbox()
             crop = im.crop(bb)
             nw = max(1, round(crop.width * scale))
@@ -4708,12 +4960,22 @@ def _wp_assemble(eng: dict, ffmpeg: str, out: Path, meta: dict, log) -> list:
             cell.alpha_composite(
                 crop, ((ltw - nw) // 2,
                        max(0, lth - round(lth * 0.02) - nh)))
-            sheet.alpha_composite(cell, ((block + k) * ltw, row * lth))
+            ll.append(cell)
             tl.append(cell.resize((cell_w, cell_h), Image.LANCZOS))
+        ltcells[d] = ll
         tcells[d] = tl
+    # 依頼のシート形式で合成 (T規格/ツクール/ウディタ)。定義はパック同梱の
+    # template.json = 母艦の templates/ が唯一の正
+    scols, srows, places = _wp_sheet_layout(out.parent)
+    sheet = Image.new("RGBA", (ltw * scols, lth * srows), (0, 0, 0, 0))
+    for col, row, d, fi in places:
+        cl = ltcells.get(d) or []
+        if fi < len(cl):
+            sheet.alpha_composite(cl[fi], (col * ltw, row * lth))
     sheet.save(out / f"{char}LT.png")
-    sheet.resize((cell_w * 12, cell_h * 4),
+    sheet.resize((cell_w * scols, cell_h * srows),
                  Image.LANCZOS).save(out / f"{char}T.png")
+    log(f"シート形式: {scols}列x{srows}行 ({len(places)}コマ)")
     _wp_write_preview(out, tcells, cell_w, cell_h)
     # 方向別の「背景抜き済み実スプライト」歩行webp + 静止ポスターを出力。
     # ギャラリーが本家GUIと同じく透明スプライトでターンテーブルを回せる
@@ -4751,9 +5013,12 @@ def _wp_regen_preview(pid: str) -> list:
                         lambda m: _wp_print(f"[walkpack:{pid}] {m}"))
 
 
-def _wp_pixelize(pid: str, colors: int = 24) -> list:
+def _wp_pixelize(pid: str, colors: int = 24, dither: float = 1.0) -> list:
     """簡易シート ({char}LT.png) をドット絵化 (pixelize_sheet の
-    dither経路: Floyd-Steinberg減色+黒系1ドット縁取り)。同期・数秒。"""
+    dither経路: Floyd-Steinberg減色+黒系1ドット縁取り)。同期・数秒。
+
+    dither = 誤差拡散のスケール (GUIの「ディザの強さ」と同じ):
+    1.0=フル(市松のザラつき) / 0.6=中 / 0.3=弱 / 0=なし(ベタ塗り)。"""
     from PIL import Image
     eng = _engine()
     pz = eng["pixelize_sheet"]
@@ -4769,7 +5034,8 @@ def _wp_pixelize(pid: str, colors: int = 24) -> list:
     src = Image.open(lt)
     factor = max(1, src.height // (cell_h * 4))
     colors = max(8, min(64, int(colors)))
-    idx, mask, pal = pz.pixelize_dither(src, colors, factor)
+    dither = max(0.0, min(1.0, float(dither)))
+    idx, mask, pal = pz.pixelize_dither(src, colors, factor, dither=dither)
     pz.outline_pass(idx, mask, pal)
     img = pz.to_image(idx, mask, pal)
     img.save(out / f"{char}T_pixel.png")
@@ -4799,6 +5065,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     -> セル分割 -> 簡易シート/プレビュー。compass_vace._run_layout の
     latent_refine 分岐のサーバ内部版 (submit_job で自サーバの実ジョブを
     投入し、このオーケストレーションスレッドが完了をポーリングする)。"""
+    _wp_apply_pose_defaults()     # 姿勢の既定値 (腕/脚の振り・上下動・交差)
     eng = _engine()
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
@@ -4825,7 +5092,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         log(f"VRAM<30GBのため両ステージを{offload} offload運転にします")
     # 進捗スパン: F4 (0.02-0.45) -> B4 (0.50-0.88) -> 組み立て (0.90-)
     spans = {"F4": (0.02, 0.24, 0.24, 0.45), "B4": (0.50, 0.70, 0.70, 0.88)}
-    for tag, layout in (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)):
+    def _gen_hemisphere(tag: str, layout, seed: int = 42) -> None:
+        """半球1つ分 (骨格グリッド→VACE→AniSora再加工→セル分割)。
+
+        顔ゲートが落ちたときにシードだけ変えて作り直せるよう関数にしてある。
+        書き出し先は out/ 固定なので、呼び直すと同じ名前を上書きする
+        (退避は呼び出し側の責任)。"""
         if j.get("_cancel"):
             raise JobCancelled()
         s1lo, s1hi, s2lo, s2hi = spans[tag]
@@ -4848,10 +5120,17 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         jid1 = submit_job(_wm1, GenRequest(
             mode="i2v", prompt=prompt, images=[canvas],
             width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
-            steps=4, seed=42, guidance=1.0, extra=extra1))
+            steps=4, seed=seed, guidance=1.0, extra=extra1))
         _wp_wait(j, jid1, s1lo, s1hi)
-        extra2 = {"latent_from": jid1, "refine_strength": 0.45,
+        extra2 = {"latent_from": jid1,
+                  "refine_strength": float(
+                      os.environ.get("SM_VACE_LR_REFINE", "").strip()
+                      or WP_LR_REFINE),
                   "refine_cond_still": True, "motion_score": 3.0}
+        _pin_rel = float(os.environ.get("SM_VACE_LR_PIN_RELEASE", "").strip()
+                         or WP_LR_PIN_RELEASE)
+        if _pin_rel > 0:
+            extra2["latent_pin_release"] = _pin_rel
         if pins:
             extra2["latent_pin_frames"] = pins
         if offload:
@@ -4863,13 +5142,50 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         jid2 = submit_job(_wm2, GenRequest(
             mode="i2v", prompt=prompt, images=[canvas],
             width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
-            steps=24, seed=42, guidance=1.0, extra=extra2))
+            steps=24, seed=seed, guidance=1.0, extra=extra2))
         sj2 = _wp_wait(j, jid2, s2lo, s2hi)
         cvid = out / f"canvas_{tag}.mp4"
         shutil.copy2(sj2["path"], cvid)
         j["detail"] = f"[{tag}] セル分割"
         _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
                   idle_n, gait_end if tail else None, log)
+
+    for tag, layout in (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)):
+        _gen_hemisphere(tag, layout)
+        # 顔が写るのは前半球だけ (B4は後ろ姿3方向+横顔) なので、ゲートは
+        # F4の直後に1回だけ回す。1レイアウト=1回の生成=1個のノイズなので、
+        # 崩れた方向だけを個別に作り直すことはできない — 半球ごと引き直す。
+        if tag != "F4" or not _wp_face_retry_on():
+            continue
+        bad, sc = _wp_face_gate(eng, ffmpeg, out, log)
+        if not bad:
+            continue
+        keep = out / "_face_retry"
+        shutil.rmtree(keep, ignore_errors=True)
+        keep.mkdir(parents=True)
+        names = [p.name for p in out.glob("*_walkT.mp4")]
+        names.append(f"canvas_{tag}.mp4")
+        for n in names:                   # 1回目を退避 (悪化したら戻す)
+            if (out / n).is_file():
+                shutil.copy2(out / n, keep / n)
+        log(f"  顔ゲートNG → シードを変えて{tag}を作り直します "
+            f"(1回目を{len(names)}件退避)")
+        j["detail"] = f"[{tag}] 顔ゲートNG — 作り直し中"
+        _gen_hemisphere(tag, layout, seed=WP_FACE_RETRY_SEED)
+        _bad2, sc2 = _wp_face_gate(eng, ffmpeg, out, log)
+
+        def _ratio(s: dict) -> float:
+            """前向き系の最小/最大。1に近いほど全方向で顔が出ている。"""
+            return (min(s.values()) / max(s.values())) if s else 0.0
+        if _ratio(sc2) <= _ratio(sc):
+            log(f"  作り直しは改善せず ({_ratio(sc):.2f} → "
+                f"{_ratio(sc2):.2f}) — 1回目を採用します")
+            for n in names:
+                if (keep / n).is_file():
+                    shutil.copy2(keep / n, out / n)
+        else:
+            log(f"  作り直しで改善 ({_ratio(sc):.2f} → {_ratio(sc2):.2f})")
+        shutil.rmtree(keep, ignore_errors=True)
     j["progress"] = 0.9
     j["_beat"] = time.time()
     j["detail"] = "シート/プレビュー組み立て"
@@ -5183,7 +5499,8 @@ def _gcs_process_one(req: dict, wait: bool = True):
     # ベストエフォート — 失敗しても歩行成果物は返す。
     if req.get("pixelize"):
         try:
-            _wp_pixelize(pid, colors=int(req.get("pixel_colors") or 24))
+            _wp_pixelize(pid, colors=int(req.get("pixel_colors") or 24),
+                         dither=float(req.get("pixel_dither", 1.0)))
         except Exception as e:                    # noqa: BLE001
             _wp_print(f"[GCS] ドット絵化に失敗 (継続): {str(e)[:160]}")
     out = packs_root() / pid / "out"             # 成果物を outputs/<rid>/ へ
@@ -5777,7 +6094,11 @@ def build_app(token: str | None):
                     colors = int(body.get("colors", 24))
                 except (TypeError, ValueError):
                     colors = 24
-                files = _wp_pixelize(pid, colors=colors)
+                try:                      # ディザの強さ (0=ベタ塗り..1=フル)
+                    dither = float(body.get("dither", 1.0))
+                except (TypeError, ValueError):
+                    dither = 1.0
+                files = _wp_pixelize(pid, colors=colors, dither=dither)
         except RuntimeError as e:
             raise HTTPException(409, str(e))
         return {"ok": True, "files": files}
