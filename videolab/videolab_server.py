@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.7"  # 0.10.7: 検証用中間保全 (stage1/2キャンバス動画+プロンプト+参照をdebug/へ・保持12件) — 段階特定用 (2026-07-19「右向きだけ劣化」調査)
+__version__ = "0.10.8"  # 0.10.8: walkpack実験ノブ (pin_conf/refine のジョブ単位上書き) — キーフレーム錨+AniSora自由生成の検証用 (2026-07-19ユーザー発案)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5174,7 +5174,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     nf, w, h = WALKPACK_NF, WALKPACK_W, WALKPACK_H
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
-    pins = cv._lr_pin_frames(nf, "on")
+    _exp = j.get("_wp_exp") or {}
+    pins = cv._lr_pin_frames(nf, str(_exp.get("pin_conf") or "on"))
+    if _exp:
+        _wp_print(f"[walkpack] 実験ノブ: {_exp} -> pins={pins}")
     offload = _wp_offload()
     if offload:
         log(f"VRAM<30GBのため両ステージを{offload} offload運転にします")
@@ -5229,7 +5232,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 中間保全に失敗 (無視して続行): {str(e)[:80]}")
         extra2 = {"latent_from": jid1,
                   "refine_strength": float(
-                      os.environ.get("SM_VACE_LR_REFINE", "").strip()
+                      _exp.get("refine")
+                      or os.environ.get("SM_VACE_LR_REFINE", "").strip()
                       or WP_LR_REFINE),
                   "refine_cond_still": True, "motion_score": 3.0}
         _pin_rel = float(os.environ.get("SM_VACE_LR_PIN_RELEASE", "").strip()
@@ -5351,7 +5355,8 @@ def _walkpack_thread(jid: str, pid: str) -> None:
         j["finished"] = time.time()
 
 
-def submit_walkpack(pid: str, mock: bool = False) -> str:
+def submit_walkpack(pid: str, mock: bool = False,
+                    exp: dict | None = None) -> str:
     """疑似ジョブ (model=walkpack) を登録してオーケストレーション
     スレッドを起動する。既存workerキューには入れない (実生成は内部の
     submit_job が通常経路で流れる)。同一パックの進行中ジョブがあれば
@@ -5366,6 +5371,7 @@ def submit_walkpack(pid: str, mock: bool = False) -> str:
         jid = uuid.uuid4().hex[:12]
         JOBS[jid] = {
             "id": jid, "status": "queued", "model": "walkpack",
+            "_wp_exp": dict(exp or {}),
             "mode": "walkpack", "pack": pid,
             "prompt": f"walk_pack: {pid}", "progress": 0.0,
             "detail": "工房キュー待ち", "created": time.time(),
@@ -6255,6 +6261,19 @@ def build_app(token: str | None):
         except Exception:                 # noqa: BLE001
             body = {}
         mock = bool((body or {}).get("mock"))
+        # 実験ノブ (2026-07-19ユーザー発案「VACEはキーフレームの錨・中間は
+        # AniSoraに生成させる」): pin_conf="0,12,24,36,48"等の明示固定リスト
+        # + refine=σ をジョブ単位で上書きできる。省略時は本線の既定のまま
+        exp = {}
+        _pc = str((body or {}).get("pin_conf") or "").strip()
+        if _pc:
+            exp["pin_conf"] = _pc[:200]
+        try:
+            if (body or {}).get("refine") is not None:
+                exp["refine"] = max(0.05, min(1.0,
+                                              float(body["refine"])))
+        except (TypeError, ValueError):
+            pass
         if not mock:
             has_gpu = False
             try:
@@ -6270,7 +6289,7 @@ def build_app(token: str | None):
         missing = [d for d in _WP_DIRS if d not in refs]
         if missing:
             raise HTTPException(400, f"8方向PNGが不足しています: {missing}")
-        return {"job": submit_walkpack(pid, mock=mock)}
+        return {"job": submit_walkpack(pid, mock=mock, exp=exp)}
 
     @app.get("/api/walkpack/{pid}/files")
     def walkpack_files(pid: str, request: Request):
