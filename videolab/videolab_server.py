@@ -46,7 +46,8 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.1"  # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
+__version__ = "0.10.2"  # 0.10.2: GCE作業員モード — GCSから依頼を拾い歩行生成→outputs書き戻し、アイドル自己停止 (課金の守り)
+# 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
 # 0.9.14: ディスク退避キャッシュのquant切替取り違え根治
 # 0.9.13: 保証機構のレビュー12件修正 (詳細はcommit)
@@ -4714,8 +4715,24 @@ def _wp_assemble(eng: dict, ffmpeg: str, out: Path, meta: dict, log) -> list:
     sheet.resize((cell_w * 12, cell_h * 4),
                  Image.LANCZOS).save(out / f"{char}T.png")
     _wp_write_preview(out, tcells, cell_w, cell_h)
+    # 方向別の「背景抜き済み実スプライト」歩行webp + 静止ポスターを出力。
+    # ギャラリーが本家GUIと同じく透明スプライトでターンテーブルを回せる
+    # (mp4は背景付きの生映像なので見た目が違う、というユーザー指摘の根治)。
+    ps = 2                                    # 見やすさ用に2倍 (透明のまま)
+    for d in _WP_DIRS:
+        cl = tcells.get(d) or []
+        walk = [c.resize((cell_w * ps, cell_h * ps), Image.NEAREST)
+                for c in cl[1:6]]            # walk1..5 = 歩行コマ
+        if walk:
+            walk[0].save(out / f"{char}_{d}_walk.webp", save_all=True,
+                         append_images=walk[1:], duration=140, loop=0,
+                         disposal=2)
+    fr = tcells.get("front") or []
+    if fr:                                     # front idle = 透明ポスター
+        fr[0].resize((cell_w * ps, cell_h * ps),
+                     Image.NEAREST).save(out / f"{char}_poster.png")
     log(f"シート/プレビュー: {char}T.png / {char}LT.png / preview.webp "
-        "(簡易版 — T規格フルQCなし)")
+        "+ 方向別歩行webp8 + poster (簡易版 — T規格フルQCなし)")
     return [f"{char}T.png", f"{char}LT.png", "preview.webp"]
 
 
@@ -4762,6 +4779,10 @@ def _wp_pixelize(pid: str, colors: int = 24) -> list:
 
 
 def _wp_kind(name: str) -> str:
+    if name.endswith("_poster.png"):     # 静止ポスター (透明front idle)
+        return "poster"
+    if name.endswith("_walk.webp"):      # 方向別 透明歩行アニメ
+        return "dirwalk"
     if name == "preview.webp":
         return "preview"
     if "_pixel" in name:
@@ -4937,12 +4958,455 @@ def submit_walkpack(pid: str, mock: bool = False) -> str:
     return jid
 
 
+# ============================================================ GCE作業員 (v0.10.2)
+# 「呼ばれたら起きて仕事し、暇になったら自分で電源を切る」GPU作業員モード。
+# 依頼の真実の置き場はGCSバケット (Cloud Runの受付台 kobo_front が管理)。
+# VMはGCSから status=pack_ready の依頼を拾い、歩行生成して outputs/ へ書き戻す。
+# 本番はVMが公開ポートを持たずGCSだけと対話する構成でも成立する。
+#
+# 全機能は環境変数ゲート。無設定なら Colab/ローカル経路は一切変わらない:
+#   VIDEOLAB_GCS_BUCKET     … 立つとGCSワーカーが回り出す (依頼の取り込み〜書き戻し)
+#   VIDEOLAB_IDLE_STOP_MIN  … >0 でアイドルN分の自己停止を有効化 (課金の守り)
+#   VIDEOLAB_GCE=1          … 停止手段を poweroff にする (未設定は _shutdown_runtime)
+#   VIDEOLAB_GCS_FAKE=<dir> … GCSをローカルdirで模擬 (テスト用・バケット名無視)
+import urllib.request as _url_req
+import urllib.parse as _url_parse
+import urllib.error as _url_err
+
+GCS_BUCKET = os.environ.get("VIDEOLAB_GCS_BUCKET", "").strip()
+_GCS_FAKE = os.environ.get("VIDEOLAB_GCS_FAKE", "").strip()
+try:
+    _GCS_POLL_SEC = max(5, int(os.environ.get("VIDEOLAB_GCS_POLL", "30") or "30"))
+except ValueError:
+    _GCS_POLL_SEC = 30
+_LAST_HTTP = [time.time()]       # HTTPミドルウェアが更新 (可変参照でクロージャ共有)
+_LAST_GCS_WORK = [time.time()]   # GCSワーカーが最後に仕事した時刻
+_GCE_THREADS_UP = [False]
+
+_META = "http://metadata.google.internal/computeMetadata/v1/"
+_GCS_TOK = {"tok": "", "exp": 0.0}
+_GCS_TOK_LOCK = threading.Lock()
+
+
+def _gcs_active() -> bool:
+    return bool(GCS_BUCKET or _GCS_FAKE)
+
+
+def _idle_min() -> int:
+    try:
+        return int(os.environ.get("VIDEOLAB_IDLE_STOP_MIN", "0") or "0")
+    except ValueError:
+        return 0
+
+
+def _meta_get(path: str, timeout: int = 8) -> str:
+    r = _url_req.Request(_META + path, headers={"Metadata-Flavor": "Google"})
+    with _url_req.urlopen(r, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def _gcs_token() -> str:
+    with _GCS_TOK_LOCK:
+        if time.time() < _GCS_TOK["exp"]:
+            return _GCS_TOK["tok"]
+        d = json.loads(_meta_get("instance/service-accounts/default/token"))
+        _GCS_TOK["tok"] = str(d["access_token"])
+        _GCS_TOK["exp"] = time.time() + 60.0
+        return _GCS_TOK["tok"]
+
+
+def _gcs_read(name: str):
+    if _GCS_FAKE:
+        p = Path(_GCS_FAKE) / name
+        return p.read_bytes() if p.is_file() else None
+    url = ("https://storage.googleapis.com/storage/v1/b/"
+           + _url_parse.quote(GCS_BUCKET, safe="") + "/o/"
+           + _url_parse.quote(name, safe="") + "?alt=media")
+    r = _url_req.Request(url,
+                         headers={"Authorization": "Bearer " + _gcs_token()})
+    try:
+        with _url_req.urlopen(r, timeout=300) as resp:
+            return resp.read()
+    except _url_err.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def _gcs_write(name: str, data: bytes,
+               content_type: str = "application/octet-stream") -> None:
+    if _GCS_FAKE:
+        p = Path(_GCS_FAKE) / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return
+    url = ("https://storage.googleapis.com/upload/storage/v1/b/"
+           + _url_parse.quote(GCS_BUCKET, safe="")
+           + "/o?uploadType=media&name=" + _url_parse.quote(name, safe=""))
+    r = _url_req.Request(url, data=data, method="POST",
+                         headers={"Authorization": "Bearer " + _gcs_token(),
+                                  "Content-Type": content_type})
+    with _url_req.urlopen(r, timeout=600) as resp:
+        resp.read()
+
+
+def _gcs_list(prefix: str) -> list:
+    if _GCS_FAKE:
+        root = Path(_GCS_FAKE)
+        out = []
+        for p in root.rglob("*"):
+            if p.is_file():
+                nm = p.relative_to(root).as_posix()
+                if nm.startswith(prefix):
+                    out.append(nm)
+        return sorted(out)
+    names, page = [], ""
+    while True:
+        url = ("https://storage.googleapis.com/storage/v1/b/"
+               + _url_parse.quote(GCS_BUCKET, safe="") + "/o?prefix="
+               + _url_parse.quote(prefix, safe="")
+               + "&fields=items(name),nextPageToken")
+        if page:
+            url += "&pageToken=" + _url_parse.quote(page)
+        r = _url_req.Request(
+            url, headers={"Authorization": "Bearer " + _gcs_token()})
+        with _url_req.urlopen(r, timeout=60) as resp:
+            d = json.loads(resp.read())
+        names += [str(it["name"]) for it in d.get("items", [])]
+        page = str(d.get("nextPageToken") or "")
+        if not page:
+            return names
+
+
+def _gcs_delete(name: str) -> None:
+    if _GCS_FAKE:
+        p = Path(_GCS_FAKE) / name
+        if p.is_file():
+            p.unlink()
+        return
+    url = ("https://storage.googleapis.com/storage/v1/b/"
+           + _url_parse.quote(GCS_BUCKET, safe="") + "/o/"
+           + _url_parse.quote(name, safe=""))
+    r = _url_req.Request(url, method="DELETE",
+                         headers={"Authorization": "Bearer " + _gcs_token()})
+    try:
+        with _url_req.urlopen(r, timeout=60) as resp:
+            resp.read()
+    except _url_err.HTTPError as e:
+        if e.code != 404:
+            raise
+
+
+GCS_KEEP_OUTPUTS = 100   # 生成物の保持件数 (容量圧迫回避)。超過分は古い順に削除
+
+
+def _gcs_prune_outputs(keep: int = GCS_KEEP_OUTPUTS) -> None:
+    """完成 (done) 生成物を最新keep件だけ残し、古いものを消す。
+
+    削除対象は outputs/<rid>/ 一式 + requests/<rid>.json(+ref) + packs/<pid>.zip。
+    ベストエフォート — 失敗しても本処理は継続 (呼び出し側でtry)。"""
+    dones = []
+    for name in _gcs_list("requests/"):
+        if not name.endswith(".json"):
+            continue
+        rid = name[len("requests/"):-len(".json")]
+        req = _gcs_req_load(rid)
+        if req and req.get("status") == "done":
+            dones.append((float(req.get("updated") or 0), rid,
+                          str(req.get("pack_id") or "")))
+    if len(dones) <= keep:
+        return
+    dones.sort(reverse=True)                  # 新しい順
+    for _ts, rid, pid in dones[keep:]:        # keep番目以降=古い
+        for on in _gcs_list(f"outputs/{rid}/"):
+            _gcs_delete(on)
+        _gcs_delete(f"requests/{rid}.json")
+        _gcs_delete(f"requests/{rid}.ref.png")
+        if pid:
+            _gcs_delete(f"packs/{pid}.zip")
+    _wp_print(f"[GCS] 保持{keep}件を超える{len(dones) - keep}件の古い生成物を削除")
+
+
+def _gcs_req_load(rid: str):
+    b = _gcs_read(f"requests/{rid}.json")
+    if b is None:
+        return None
+    try:
+        d = json.loads(b.decode("utf-8"))
+        return d if isinstance(d, dict) else None
+    except (ValueError, UnicodeDecodeError):
+        return None      # 書き込み途中/壊れた依頼
+
+
+def _gcs_req_save(req: dict) -> None:
+    req["updated"] = time.time()
+    _gcs_write(f"requests/{req['request_id']}.json",
+               json.dumps(req, ensure_ascii=False).encode("utf-8"),
+               "application/json")
+
+
+_GCS_CT = {".mp4": "video/mp4", ".webp": "image/webp", ".png": "image/png",
+           ".gif": "image/gif", ".json": "application/json"}
+
+
+def _gcs_process_one(req: dict, wait: bool = True):
+    """pack_ready の依頼を1件処理: パック取り込み→walkpack→outputs書き戻し。
+
+    wait=False はテスト用 (walkpack投入=generating遷移までで戻る)。戻り値=jid。
+    例外は呼び出し側 (_gcs_worker_loop) が failed 化する。"""
+    rid = req["request_id"]
+    pid = str(req.get("pack_id") or "")
+    if not pid:
+        raise RuntimeError("pack_idがありません")
+    blob = _gcs_read(f"packs/{pid}.zip")
+    if blob is None:
+        raise RuntimeError(f"パックが見つかりません: {pid}")
+    _pack_extract(pid, blob)                    # GCS -> ローカルpacks/ へ展開
+    req["status"] = "generating"
+    req["error"] = ""
+    _gcs_req_save(req)
+    _LAST_GCS_WORK[0] = time.time()
+    jid = submit_walkpack(pid, mock=bool(req.get("_mock")))
+    if not wait:
+        return jid
+    while True:                                  # ジョブ完了までポーリング
+        time.sleep(5)
+        j = JOBS.get(jid)
+        _LAST_GCS_WORK[0] = time.time()
+        if j is None:
+            raise RuntimeError("ジョブが消えました")
+        if j.get("status") in ("done", "error", "cancelled"):
+            break
+    if j.get("status") != "done":
+        raise RuntimeError(str(j.get("detail") or "生成失敗")[:400])
+    # 依頼がドット絵化を求めていれば歩行後に実行 (out/ にpixelシートを追加)。
+    # ベストエフォート — 失敗しても歩行成果物は返す。
+    if req.get("pixelize"):
+        try:
+            _wp_pixelize(pid, colors=int(req.get("pixel_colors") or 24))
+        except Exception as e:                    # noqa: BLE001
+            _wp_print(f"[GCS] ドット絵化に失敗 (継続): {str(e)[:160]}")
+    out = packs_root() / pid / "out"             # 成果物を outputs/<rid>/ へ
+    files = []
+    if out.is_dir():
+        for p in sorted(out.iterdir()):
+            if not p.is_file():
+                continue
+            k = _wp_kind(p.name)
+            # 生mp4 (方向別/canvasの背景付き動画) は途中成果物なのでGCSへ
+            # 上げない。配布物 = シート/透明歩行webp/ポスター/ピクセル/preview。
+            if k in ("other", "mp4"):
+                continue
+            _gcs_write(f"outputs/{rid}/{p.name}", p.read_bytes(),
+                       _GCS_CT.get(p.suffix.lower(),
+                                   "application/octet-stream"))
+            files.append({"name": p.name, "size": p.stat().st_size, "kind": k})
+    order = {"preview": 0, "mp4": 1, "sheet": 2, "pixel": 3}
+    files.sort(key=lambda f: (order.get(f["kind"], 9), f["name"]))
+    manifest = {"pack_id": pid, "files": files, "finished": time.time()}
+    _gcs_write(f"outputs/{rid}/manifest.json",
+               json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+               "application/json")
+    req["status"] = "done"
+    req["error"] = ""
+    _gcs_req_save(req)
+    _LAST_GCS_WORK[0] = time.time()
+    # 完成したら途中成果物(生mp4を含むローカルパック一式)を削除して
+    # VMディスクを解放する (容量圧迫の防止)。配布物はGCSにあるので安全。
+    try:
+        shutil.rmtree(packs_root() / pid, ignore_errors=True)
+    except Exception:                         # noqa: BLE001
+        pass
+    try:                                      # 保持100件超の古い生成物を削除
+        _gcs_prune_outputs()
+    except Exception as e:                    # noqa: BLE001
+        _wp_print(f"[GCS] 刈り込みに失敗 (継続): {str(e)[:160]}")
+    return jid
+
+
+def _gcs_pick_pack_ready():
+    """GCSの依頼から status=pack_ready を1件返す (無ければNone)。"""
+    for name in _gcs_list("requests/"):
+        if not name.endswith(".json"):
+            continue
+        rid = name[len("requests/"):-len(".json")]
+        req = _gcs_req_load(rid)
+        if req and req.get("status") == "pack_ready":
+            return req
+    return None
+
+
+def _gcs_worker_loop() -> None:
+    _wp_print(f"[GCS] ワーカー開始 (bucket={GCS_BUCKET or _GCS_FAKE}, "
+              f"poll={_GCS_POLL_SEC}s)")
+    while True:
+        try:
+            req = _gcs_pick_pack_ready()
+            if req:
+                rid = req["request_id"]
+                _wp_print(f"[GCS] 取り込み {rid} pack={req.get('pack_id')}")
+                try:
+                    _gcs_process_one(req)
+                    _wp_print(f"[GCS] 完了 {rid}")
+                except Exception as e:            # noqa: BLE001
+                    _wp_print(f"[GCS] 失敗 {rid}: {str(e)[:200]}")
+                    try:
+                        req["status"] = "failed"
+                        req["error"] = str(e)[:500]
+                        _gcs_req_save(req)
+                    except Exception:             # noqa: BLE001
+                        pass
+                continue                          # 連続処理: すぐ次を探す
+        except Exception as e:                    # noqa: BLE001
+            _wp_print(f"[GCS] ポーリングエラー (継続): {str(e)[:160]}")
+        time.sleep(_GCS_POLL_SEC)
+
+
+def _gce_is_idle() -> bool:
+    """稼働中ジョブなし・キュー空・walkpack非実行なら暇。"""
+    for j in list(JOBS.values()):
+        if j.get("status") in ("queued", "running", "loading"):
+            return False
+    if WORK_Q.qsize() > 0:
+        return False
+    if _WALKPACK_LOCK.locked():
+        return False
+    return True
+
+
+def _gce_self_stop() -> None:
+    """vm/state.json を stopping にしてから電源断 (課金の守り)。
+
+    VIDEOLAB_GCE=1 のときだけ実機を poweroff する。それ以外の環境
+    (Colab/ローカル/テスト) では絶対に電源を切らず _shutdown_runtime へ。"""
+    try:
+        if _gcs_active():
+            _gcs_write("vm/state.json",
+                       json.dumps({"status": "stopping",
+                                   "updated": time.time()}).encode("utf-8"),
+                       "application/json")
+    except Exception:                             # noqa: BLE001
+        pass
+    if os.environ.get("VIDEOLAB_GCE", "").strip() == "1":
+        _wp_print("[IDLE] アイドル継続 — 電源を切ります (poweroff)")
+        try:
+            subprocess.run(["poweroff"], timeout=30)
+        except Exception:                         # noqa: BLE001
+            try:
+                subprocess.run(["shutdown", "-h", "now"], timeout=30)
+            except Exception:                     # noqa: BLE001
+                pass
+    else:
+        _wp_print("[IDLE] アイドル継続 — ランタイムを解放します")
+        _shutdown_runtime(delay=0.5)
+
+
+def _idle_stop_loop(minutes: int) -> None:
+    grace = minutes * 60.0
+    _wp_print(f"[IDLE] 自己停止監視 開始 (アイドル{minutes}分で停止)")
+    while True:
+        time.sleep(30)
+        try:
+            if not _gce_is_idle():
+                continue
+            idle_for = time.time() - max(_LAST_HTTP[0], _LAST_GCS_WORK[0])
+            if idle_for >= grace:
+                _gce_self_stop()
+                return
+        except Exception as e:                    # noqa: BLE001
+            _wp_print(f"[IDLE] 監視エラー (継続): {str(e)[:120]}")
+
+
+def _gce_external_ip() -> str:
+    try:
+        return _meta_get(
+            "instance/network-interfaces/0/access-configs/0/external-ip").strip()
+    except Exception:                             # noqa: BLE001
+        return ""
+
+
+def _gce_publish_state(url: str, token: str) -> None:
+    if not _gcs_active():
+        return
+    try:
+        _gcs_write("vm/state.json",
+                   json.dumps({"status": "up", "url": url, "token": token,
+                               "updated": time.time()},
+                              ensure_ascii=False).encode("utf-8"),
+                   "application/json")
+    except Exception as e:                        # noqa: BLE001
+        _wp_print(f"[GCS] state公開に失敗: {str(e)[:120]}")
+
+
+def start_gce_workers(url: str = "", token: str = "") -> bool:
+    """GCSワーカー + アイドル自己停止スレッドを起動 (多重起動防止)。
+
+    GCSもアイドル停止も無効なら何もしない (Colab/ローカルは素通り)。
+    起動したら True。"""
+    if _GCE_THREADS_UP[0]:
+        return True
+    if not (_gcs_active() or _idle_min() > 0):
+        return False
+    _GCE_THREADS_UP[0] = True
+    now = time.time()
+    _LAST_HTTP[0] = now
+    _LAST_GCS_WORK[0] = now
+    if not url:
+        ip = _gce_external_ip()
+        if ip:
+            url = f"http://{ip}:{DEFAULT_PORT}"
+    _gce_publish_state(url, token)
+    if _gcs_active():
+        threading.Thread(target=_gcs_worker_loop, daemon=True).start()
+    if _idle_min() > 0:
+        threading.Thread(target=_idle_stop_loop, args=(_idle_min(),),
+                         daemon=True).start()
+    return True
+
+
+def run_in_gce(host: str = "0.0.0.0", port: int = None, token: str = None):
+    """GCE VM上でサーバを起動しGCS作業員スレッドを回す ({url, token} を返す)。
+
+    トークンは 引数 > /mnt/models/token.txt > VIDEOLAB_TOKEN の順。
+    startup.sh からは `python -m videolab_server --host 0.0.0.0 ...` で
+    main() 経由に入ってもよい (main() も start_gce_workers を呼ぶ)。"""
+    port = port or DEFAULT_PORT
+    if not token:
+        tf = Path("/mnt/models/token.txt")
+        if tf.is_file():
+            token = tf.read_text(encoding="utf-8").strip()
+        token = token or os.environ.get("VIDEOLAB_TOKEN") or None
+    server = start_server(host, port, token)
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(60):
+        try:
+            with _url_req.urlopen(f"http://127.0.0.1:{port}/health",
+                                  timeout=2) as r:
+                if r.status == 200:
+                    break
+        except Exception:                         # noqa: BLE001
+            time.sleep(1)
+    ip = _gce_external_ip()
+    url = f"http://{ip}:{port}" if ip else f"http://127.0.0.1:{port}"
+    start_gce_workers(url, token or "")
+    _wp_print(f"SpriteMill VideoLab (GCE) 起動: {url}")
+    return url, token
+
+
 # ---------------------------------------------------------------- FastAPI
 def build_app(token: str | None):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, Response
 
     app = FastAPI(title="SpriteMill VideoLab", version=__version__)
+
+    @app.middleware("http")
+    async def _track_access(request: Request, call_next):
+        # アイドル自己停止の「最後の人間アクセス」時刻。/health は監視の
+        # 定期ノックなので数えない (寝坊防止より正しくアイドル判定するため)
+        if request.url.path != "/health":
+            _LAST_HTTP[0] = time.time()
+        return await call_next(request)
 
     def _auth(request: Request):
         if not token:
@@ -6351,6 +6815,11 @@ def main(argv=None):
     if args.token:
         url += f"?token={args.token}"
     print(f"SpriteMill VideoLab v{__version__}  ->  {url}", flush=True)
+    # GCE作業員モード: 環境変数が立っていればGCSワーカー+アイドル自己停止を
+    # 起動する (Colab/ローカルは env 無設定なので素通り)。startup.sh は
+    # この main() 経由で入る (--host 0.0.0.0 --token <PD固定トークン>)。
+    if start_gce_workers(token=args.token or ""):
+        print("GCE作業員モード: GCSワーカー/アイドル自己停止 稼働", flush=True)
     if not args.no_browser:
         try:
             import webbrowser
