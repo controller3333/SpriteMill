@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.4"  # 0.10.4: GCE監査修正 — ジョブ実行中もアイドル時計を進める(長ジョブ完了30秒後の即電源断を根治)、宙に浮いたgenerating依頼の再取り込み、done/failed書き戻し前のGCS再読込(作り直しの黙殺防止)、state公開を/health確認後へ+実ポートでURL生成、failed/cancelledも刈り込み対象に
+__version__ = "0.10.5"  # 0.10.5: walkpackのbody_plan=flying対応 (ホバー文面+脚振り最小/上下動強のノブ差し替え。従来は浮遊キャラも歩いていた)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4429,6 +4429,36 @@ def _wp_apply_pose_defaults() -> None:
     for k, v in WP_DEFAULTS.items():
         if not os.environ.get(k, "").strip():
             os.environ[k] = v
+
+
+# 飛行 (ホバリング) の骨格ノブ (2026-07-19ユーザー報告「浮遊ついてるのに
+# 飛んでない」): walkpackは従来biped歩行の骨格+文面しか持たず、body_plan=
+# flyingでも脚を振って歩いていた。専用骨格を作らず既存クランプ内で寄せる:
+# 脚振りは下限0.3 (pose_videoのクランプ)・交差なし・腕は下限0.5・上下動を
+# 強めてホバーの浮き沈みに流用する。文面は _WP_HOVER_PROMPT が担う。
+_WP_FLYING_ENV = {"SM_POSE_LEG_SWING": "0.3", "SM_POSE_LEG_CROSS": "0.0",
+                  "SM_POSE_ARM_SWING": "0.5", "SM_POSE_BOB": "1.6"}
+
+
+def _wp_plan_env_set(meta: dict):
+    """body_plan=flyingならノブを上書きし、復元用の退避を返す。
+    _WALKPACK_LOCK で直列化されている前提 (env競合なし)。"""
+    if str((meta or {}).get("body_plan") or "").strip() != "flying":
+        return None
+    saved = {}
+    for k, v in _WP_FLYING_ENV.items():
+        saved[k] = os.environ.get(k)
+        os.environ[k] = v
+    return saved
+
+
+def _wp_plan_env_restore(saved) -> None:
+    """flying上書きの復元。次のジョブ (biped等) に持ち越さない。"""
+    for k, old in (saved or {}).items():
+        if old is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = old
 _WALKPACK_LOCK = threading.Lock()   # 直列化 (SM_LEG_SCALE等のenvを守る)
 _WP_DIRS = ("front", "left", "right", "back",
             "front_left", "front_right", "back_left", "back_right")
@@ -4571,17 +4601,38 @@ def _wp_offload() -> str:
     return ""
 
 
-def _wp_prompt(eng: dict, refs: dict, layout, nf: int) -> str:
+# body_plan=flying 用のキャンバス文面。canvas_walk.CANVAS_PROMPT と同じ
+# 拘束 (セル中央固定・向き固定・カメラ固定・マゼンタ背景) を保ち、
+# 歩行の記述だけをホバリングに置き換える (2026-07-19)
+_WP_HOVER_PROMPT = (
+    "A game character sprite sheet: the same chibi flying character shown "
+    "in several fixed compass cells. Each figure hovers in place at a fixed "
+    "height with steady rhythmic wingbeats and a gentle vertical bob -- the "
+    "feet never touch the ground and never take a step, the legs hang "
+    "relaxed and still. Every figure stays centered in its own cell and "
+    "keeps facing its own fixed direction the entire time; the body and "
+    "head never turn, rotate, spin, or change direction. Static locked-off "
+    "tripod camera, fixed frame, no camera movement, no pan, no zoom, no "
+    "orbit. Plain flat magenta background, smooth seamless looping hover "
+    "animation."
+)
+
+
+def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
+               plan: str = "biped") -> str:
     """CANVAS_PROMPT + NO_WIND + (スカート/末尾静止節) + 方向明文。
 
     顔正面化/体ヨー追従の発動判定は compass_vace._run_layout と同じく
     pose_video._adapted_yaw / _adapted_body_yaw を quiet=True の探針で
-    呼んで文面を骨格の宣言と一致させる (体ヨー追従はエンジン既定=off)。"""
+    呼んで文面を骨格の宣言と一致させる (体ヨー追従はエンジン既定=off)。
+    plan="flying" は歩行文面をホバリングへ差し替える (骨格ノブは
+    _wp_plan_env_set が対で担当)。"""
     from PIL import Image
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
     cv = eng["compass_vace"]
-    prompt = cw.CANVAS_PROMPT + cv.NO_WIND
+    prompt = (_WP_HOVER_PROMPT if plan == "flying"
+              else cw.CANVAS_PROMPT) + cv.NO_WIND
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     try:
         fr = refs.get("front")
@@ -4594,10 +4645,15 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int) -> str:
     except Exception:                     # noqa: BLE001
         pass
     if tail:
-        prompt += (" At the very end of the video every figure stops "
-                   "walking and stands perfectly still in the same "
-                   "relaxed upright standing pose as the first frames, "
-                   "arms hanging naturally at the sides.")
+        if plan == "flying":
+            prompt += (" At the very end of the video every figure stops "
+                       "bobbing and hovers perfectly still at the same "
+                       "fixed height and pose as the first frames.")
+        else:
+            prompt += (" At the very end of the video every figure stops "
+                       "walking and stands perfectly still in the same "
+                       "relaxed upright standing pose as the first frames, "
+                       "arms hanging naturally at the sides.")
     ff_diag = db_diag = False
     try:
         fig = pv.Figure(head_frac=pv.head_frac_for_leg_scale(
@@ -5067,6 +5123,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     latent_refine 分岐のサーバ内部版 (submit_job で自サーバの実ジョブを
     投入し、このオーケストレーションスレッドが完了をポーリングする)。"""
     _wp_apply_pose_defaults()     # 姿勢の既定値 (腕/脚の振り・上下動・交差)
+    plan = str((meta or {}).get("body_plan") or "biped").strip() or "biped"
+    if plan == "flying":
+        _wp_print("[walkpack] body_plan=flying: ホバリング文面+骨格ノブで生成")
     eng = _engine()
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
@@ -5107,7 +5166,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
         frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
         canvas = cv.compose_reference(refs, w, h, layout)
-        prompt = _wp_prompt(eng, refs, layout, nf)
+        prompt = _wp_prompt(eng, refs, layout, nf, plan=plan)
         extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
                   "conditioning_scale": 1.0, "motion_score": 3.0,
                   "vace_base": "fun", "vace_lora": "lightning",
@@ -5223,7 +5282,11 @@ def _walkpack_thread(jid: str, pid: str) -> None:
             except (TypeError, ValueError):
                 ls = 1.0
             os.environ["SM_LEG_SCALE"] = str(ls)
-            _walkpack_run(j, pid, meta, log)
+            _plan_env = _wp_plan_env_set(meta)   # flyingならノブ上書き
+            try:
+                _walkpack_run(j, pid, meta, log)
+            finally:
+                _wp_plan_env_restore(_plan_env)
             j["status"] = "done"
             j["progress"] = 1.0
             log("walk_pack 完了")
