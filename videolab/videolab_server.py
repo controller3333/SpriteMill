@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.9"  # 0.10.9: 飛行の既定をキー錨方式へ昇格 (5キー均等+末尾静止固定+σ0.9。イーリス=動きの質・ドラゴン=尻尾発明抑制の2体A/Bで確定)
+__version__ = "0.10.14"  # 0.10.14: 実験ノブedge_head (動きの窓に頭部限定エッジをボブ追従で敷く=頭部形状の常時拘束、2026-07-19ユーザー発案a-4)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4461,6 +4461,89 @@ def _wp_plan_env_restore(saved) -> None:
             os.environ[k] = old
 
 
+def _wp_edge_canvas(cv_mod, refs: dict, w: int, h: int, layout):
+    """立ち絵から「キャラ限定」エッジ制御キャンバスを作る (実験a-2)。
+
+    v1 (参照キャンバスへFIND_EDGES直がけ) は、セル境界の四角枠や背景の
+    色境界まで白線化して制御を汚し、顔消失・落ち影などの崩壊を招いた
+    (2026-07-19実走)。v2はマゼンタキーでキャラを抜き、キャラ内部の輝度
+    エッジ+シルエット輪郭だけを白線化。配置は本番と同じ compose_reference
+    写像 (骨格とのキャラ位置一致が前提条件) に任せ、最後に白黒正規化して
+    レターボックス余白・セル間隙のマゼンタを完全に消す。"""
+    import tempfile
+    import numpy as np
+    from PIL import Image, ImageFilter
+    tmp = Path(tempfile.mkdtemp(prefix="edge_refs_"))
+    erefs = {}
+    for d, rp in refs.items():
+        keyed = _wp_key(Image.open(rp))           # RGBA・キャラのみ不透過
+        arr = np.asarray(keyed)
+        mask = arr[..., 3] > 128
+        g = np.asarray(keyed.convert("L"), dtype=np.float32)
+        gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
+        gy = np.abs(np.diff(g, axis=0, prepend=g[:1]))
+        inner = ((gx + gy) > 40) & mask           # キャラ内部の輝度エッジ
+        m = mask.astype(np.uint8)
+        sil = np.zeros_like(m)                    # シルエット輪郭 (境界画素)
+        sil[1:-1, 1:-1] = m[1:-1, 1:-1] & ~(
+            m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:])
+        e = np.where(inner | (sil > 0), 255, 0).astype(np.uint8)
+        eim = (Image.fromarray(e, "L").filter(ImageFilter.MaxFilter(3))
+               .convert("RGB"))
+        ep = tmp / f"{d}.png"
+        eim.save(ep)
+        erefs[d] = ep
+    canvas = cv_mod.compose_reference(erefs, w, h, layout)
+    ca = np.asarray(canvas.convert("RGB"), dtype=np.uint8)
+    white = (ca.min(axis=2) > 180)                # ほぼ白の線だけ残す
+    return Image.fromarray(
+        np.where(white, 255, 0).astype(np.uint8), "L").convert("RGB")
+
+
+def _wp_edge_head_canvas(cv_mod, refs: dict, w: int, h: int, layout,
+                         head_frac: float = 0.45):
+    """頭部限定のエッジ制御キャンバス (実験a-4、2026-07-19ユーザー発案
+    「キャニーで頭部=最も崩れやすくて崩れたら困る部位を固定」)。
+
+    頭部は歩行/ホバー中もほぼ剛体 (ボブで平行移動するだけ) なので、
+    四肢と違い動きの窓に置いても矛盾しない。キャラのbbox上部 head_frac
+    をエッジ許可ゾーンとし、それ以外は黒=自由領域。"""
+    import tempfile
+    import numpy as np
+    from PIL import Image, ImageFilter
+    tmp = Path(tempfile.mkdtemp(prefix="edge_head_"))
+    erefs = {}
+    for d, rp in refs.items():
+        keyed = _wp_key(Image.open(rp))
+        arr = np.asarray(keyed)
+        mask = arr[..., 3] > 128
+        rows = np.where(mask.any(axis=1))[0]
+        g = np.asarray(keyed.convert("L"), dtype=np.float32)
+        gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
+        gy = np.abs(np.diff(g, axis=0, prepend=g[:1]))
+        inner = ((gx + gy) > 40) & mask
+        m = mask.astype(np.uint8)
+        sil = np.zeros_like(m)
+        sil[1:-1, 1:-1] = m[1:-1, 1:-1] & ~(
+            m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:])
+        e = (inner | (sil > 0))
+        if len(rows):                       # 頭部ゾーン以外を消す
+            top = rows[0]
+            cut = top + int(round((rows[-1] - top + 1) * head_frac))
+            e[cut:, :] = False
+        eimg = np.where(e, 255, 0).astype(np.uint8)
+        eim = (Image.fromarray(eimg, "L").filter(ImageFilter.MaxFilter(3))
+               .convert("RGB"))
+        ep = tmp / f"{d}.png"
+        eim.save(ep)
+        erefs[d] = ep
+    canvas = cv_mod.compose_reference(erefs, w, h, layout)
+    ca = np.asarray(canvas.convert("RGB"), dtype=np.uint8)
+    white = (ca.min(axis=2) > 180)
+    return Image.fromarray(
+        np.where(white, 255, 0).astype(np.uint8), "L").convert("RGB")
+
+
 def _wp_flying_frames(frames, idle_n: int, gait_end: int, canvas_h: int):
     """飛行用poseフレーム列: 先頭の直立骨格を全フレームに使い、歩行窓だけ
     上下ボブ (sin・2往復) を与える。ノブで脚振りを最小化しても、歩行骨格を
@@ -5214,6 +5297,50 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             frames = _wp_flying_frames(frames, idle_n, gait_end, h)
             log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
         canvas = cv.compose_reference(refs, w, h, layout)
+        if _exp.get("edge_idle"):
+            _ecv = _wp_edge_canvas(cv, refs, w, h, layout)
+            if _ecv.size != frames[0].size:
+                _ecv = _ecv.resize(frames[0].size)
+            from PIL import Image as _Img
+            _blk = _Img.new(frames[0].mode, frames[0].size, 0)
+            _mid = _blk if _exp.get("no_pose") else None
+            _heads = None
+            if _exp.get("edge_head"):
+                # 頭部限定エッジを動きの窓に敷く。flyingのボブと同じsinで
+                # 平行移動させ、拘束と動きの矛盾を消す (a-4)
+                import math
+                _hcv = _wp_edge_head_canvas(cv, refs, w, h, layout)
+                if _hcv.size != frames[0].size:
+                    _hcv = _hcv.resize(frames[0].size)
+                _amp = max(2, round(h * 0.012))
+                _win = max(1, gait_end - idle_n + 1)
+                _heads = {}
+                for k in range(idle_n, gait_end + 1):
+                    dy = round(_amp * math.sin(
+                        2 * math.pi * 2.0 * (k - idle_n) / _win))                         if plan == "flying" else 0
+                    if dy not in _heads:
+                        im = _Img.new(_hcv.mode, _hcv.size, 0)
+                        im.paste(_hcv, (0, dy))
+                        _heads[dy] = im
+                try:
+                    _hcv.save(out / f"edgehead_{tag}.png")
+                except Exception:                 # noqa: BLE001
+                    pass
+
+                def _mid_frame(k):
+                    import math as _m
+                    dy = round(_amp * _m.sin(
+                        2 * _m.pi * 2.0 * (k - idle_n) / _win))                         if plan == "flying" else 0
+                    return _heads[dy]
+            frames = [_ecv if (k < idle_n or k > gait_end)
+                      else (_mid_frame(k) if _heads is not None
+                            else (_mid or fr))
+                      for k, fr in enumerate(frames)]
+            try:                     # 何を食わせたか後から目視できるように
+                _ecv.save(out / f"edgecanvas_{tag}.png")
+            except Exception:                     # noqa: BLE001
+                pass
+            log(f"[{tag}] 実験edge_idle v2: キャラ限定エッジ (セル枠なし)")
         prompt = _wp_prompt(eng, refs, layout, nf, plan=plan)
         extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
                   "conditioning_scale": 1.0, "motion_score": 3.0,
@@ -5224,6 +5351,42 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         j["detail"] = f"[{tag}] 生成1/2: VACEフル骨格"
         log(f"[{tag}] 生成1/2: VACEフル骨格制御 steps=4 cfg=1.0 "
             "(latent直出し)")
+        if _exp.get("skip_vace"):
+            # ★実験: VACE抜き。骨格フレーム列を refine_frames_b64 で直接
+            # latent化し、σ再加工の出発点+latent固定キーにする。つまり
+            # 「AniSoraが参照キャンバス(i2v条件)を見ながら、骨格画像の
+            # 錨の間を自力で描く」構図。σはアダプタ側クランプで最大0.90
+            j["detail"] = f"[{tag}] 実験: VACE抜き (骨格を直接latent化)"
+            log(f"[{tag}] 実験skip_vace: 骨格{len(frames)}fを直接latent源に")
+            extra2 = {"refine_frames_b64": pv.encode_frames_b64(frames),
+                      "refine_strength": float(_exp.get("refine") or 0.9),
+                      "refine_cond_still": True, "motion_score": 3.0}
+            _pin_rel0 = float(os.environ.get(
+                "SM_VACE_LR_PIN_RELEASE", "").strip() or WP_LR_PIN_RELEASE)
+            if _pin_rel0 > 0:
+                extra2["latent_pin_release"] = _pin_rel0
+            if pins:
+                extra2["latent_pin_frames"] = pins
+            if offload:
+                extra2["offload"] = offload
+            _wm2x = "mock" if j.get("_wp_mock") else "anisora"
+            jid2 = submit_job(_wm2x, GenRequest(
+                mode="i2v", prompt=prompt, images=[canvas],
+                width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+                steps=24, seed=seed, guidance=1.0, extra=extra2))
+            sj2 = _wp_wait(j, jid2, s1lo, s2hi)
+            cvid = out / f"canvas_{tag}.mp4"
+            shutil.copy2(sj2["path"], cvid)
+            try:
+                (out / f"prompt_{tag}.txt").write_text(prompt,
+                                                       encoding="utf-8")
+                canvas.save(out / f"refcanvas_{tag}.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            j["detail"] = f"[{tag}] セル分割"
+            _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                      idle_n, gait_end if tail else None, log)
+            return
         _wm1 = "mock" if j.get("_wp_mock") else "vace"
         jid1 = submit_job(_wm1, GenRequest(
             mode="i2v", prompt=prompt, images=[canvas],
@@ -6287,6 +6450,22 @@ def build_app(token: str | None):
                                               float(body["refine"])))
         except (TypeError, ValueError):
             pass
+        if (body or {}).get("edge_idle"):
+            # 実験a (2026-07-19): idle/末尾静止の制御を立ち絵Cannyへ差し替え
+            exp["edge_idle"] = True
+        if (body or {}).get("edge_head"):
+            # 実験a-4: 動きの窓に頭部限定エッジ (ボブ追従) を敷く
+            exp["edge_head"] = True
+        if (body or {}).get("no_pose"):
+            # 実験a-3 (2026-07-19ユーザー仮説「骨格が人間じゃないから
+            # オープンポーズが邪魔」): 歩行窓の制御を黒=無条件にして、
+            # 人型骨格の強制もモダリティ混載も両方消す (edge_idleと併用)
+            exp["no_pose"] = True
+        if (body or {}).get("skip_vace"):
+            # 実験 (2026-07-19ユーザー発案): VACEを通さず、骨格フレーム列
+            # そのものをlatent源にしてAniSoraへ渡す (入力画像=参照キャンバス、
+            # キー=骨格のlatent固定)。見え方の観察用
+            exp["skip_vace"] = True
         if not mock:
             has_gpu = False
             try:
