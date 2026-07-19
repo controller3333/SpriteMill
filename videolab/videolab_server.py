@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.14"  # 0.10.14: 実験ノブedge_head (動きの窓に頭部限定エッジをボブ追従で敷く=頭部形状の常時拘束、2026-07-19ユーザー発案a-4)
+__version__ = "0.10.16"  # 0.10.16: コンパス3x3をwalkpack既定へ昇格 (VRAM40GB以上。隣接汚染根治=尻尾発明/板翼の消滅を3体で実証。半球はlayout="hemi"で残置)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5278,7 +5278,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     if offload:
         log(f"VRAM<30GBのため両ステージを{offload} offload運転にします")
     # 進捗スパン: F4 (0.02-0.45) -> B4 (0.50-0.88) -> 組み立て (0.90-)
-    spans = {"F4": (0.02, 0.24, 0.24, 0.45), "B4": (0.50, 0.70, 0.70, 0.88)}
+    spans = {"F4": (0.02, 0.24, 0.24, 0.45), "B4": (0.50, 0.70, 0.70, 0.88),
+             "C9": (0.02, 0.45, 0.45, 0.88)}
     def _gen_hemisphere(tag: str, layout, seed: int = 42) -> None:
         """半球1つ分 (骨格グリッド→VACE→AniSora再加工→セル分割)。
 
@@ -5435,7 +5436,35 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
                   idle_n, gait_end if tail else None, log)
 
-    for tag, layout in (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)):
+    _lay_req = str(_exp.get("layout") or "").strip()
+    if _lay_req == "compass":
+        _use_c9 = True
+    elif _lay_req in ("hemi", "4x2"):
+        _use_c9 = False
+    else:
+        # ★既定=コンパス昇格 (2026-07-20ユーザー仮説→3体実証):
+        # 半球2枚 (F4/B4) は backの隣にright という角度不連続の同居で
+        # 隣接セル汚染が起きる (backに余計な尻尾がrightから染み、rightの
+        # 翼がbackへ吸われて板化)。3x3コンパスは隣=隣接角度なので染みても
+        # 無害 — ドラゴン(尻尾/板翼消滅)・イーリス(right品質回復)・
+        # ロップ(biped歩行健全) で確認。キャンバス2.25倍のVRAMが要るため
+        # 40GB未満の機体 (L4/T4/A100-40) は従来の半球へフォールバック
+        # (半球時代の絵はそのまま再現可能 = layout="hemi" 明示でも可)
+        _use_c9 = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                _tot = torch.cuda.get_device_properties(0).total_memory
+                _use_c9 = _tot >= 40 * (1 << 30)
+        except Exception:                     # noqa: BLE001
+            pass
+    if _use_c9 and _lay_req != "compass":
+        _wp_print("[walkpack] レイアウト: コンパス3x3 (VRAM充足・既定)")
+    if _use_c9:
+        w, h = (WALKPACK_W // 2) * 3, (WALKPACK_H // 2) * 3
+    _layouts = ((("C9", cw.LAYOUT_COMPASS),) if _use_c9
+                else (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)))
+    for tag, layout in _layouts:
         _gen_hemisphere(tag, layout)
         # 顔が写るのは前半球だけ (B4は後ろ姿3方向+横顔) なので、ゲートは
         # F4の直後に1回だけ回す。1レイアウト=1回の生成=1個のノイズなので、
@@ -6453,6 +6482,14 @@ def build_app(token: str | None):
         if (body or {}).get("edge_idle"):
             # 実験a (2026-07-19): idle/末尾静止の制御を立ち絵Cannyへ差し替え
             exp["edge_idle"] = True
+        if str((body or {}).get("layout") or "").strip() in ("hemi", "4x2"):
+            exp["layout"] = "hemi"     # 半球へ明示固定 (比較実験用)
+        if str((body or {}).get("layout") or "").strip() == "compass":
+            # 実験 (2026-07-20ユーザー仮説「半球配置の隣接汚染」— B4は
+            # backの隣にrightという角度不連続な同居で、尻尾がrightへ染み
+            # 翼がbackへ吸われる疑い): 3x3コンパス配置 (隣=隣接角度) で
+            # 同条件生成して比較する
+            exp["layout"] = "compass"
         if (body or {}).get("edge_head"):
             # 実験a-4: 動きの窓に頭部限定エッジ (ボブ追従) を敷く
             exp["edge_head"] = True
