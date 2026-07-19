@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.8"  # 0.10.8: walkpack実験ノブ (pin_conf/refine のジョブ単位上書き) — キーフレーム錨+AniSora自由生成の検証用 (2026-07-19ユーザー発案)
+__version__ = "0.10.9"  # 0.10.9: 飛行の既定をキー錨方式へ昇格 (5キー均等+末尾静止固定+σ0.9。イーリス=動きの質・ドラゴン=尻尾発明抑制の2体A/Bで確定)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5175,6 +5175,19 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
+    if plan == "flying" and not _exp:
+        # ★飛行の既定=キー錨方式 (2026-07-19ユーザー発案→イーリス/ドラゴン
+        # 2体のA/Bで昇格確定): 均等5キー+末尾静止をlatent固定し、中間は
+        # σ0.9でAniSoraに生成させる。σ0.45の全体浅がけより羽ばたきが
+        # 生き生きし、骨格に無い部位 (尻尾・翼) の「無条件区間の発明」
+        # (浮いた尻尾の塊等) も固定間隔が短くなることで実測で消えた。
+        # APIの pin_conf/refine 明示指定はこの既定より優先される
+        _keys = sorted({0, gait_end // 4, gait_end // 2,
+                        gait_end * 3 // 4, gait_end}
+                       | set(range(gait_end + 1, nf)))
+        _exp = {"pin_conf": ",".join(map(str, _keys)), "refine": 0.9}
+        _wp_print("[walkpack] 飛行: キー錨既定 "
+                  f"(keys={_keys[:5]}+末尾静止, σ0.9)")
     pins = cv._lr_pin_frames(nf, str(_exp.get("pin_conf") or "on"))
     if _exp:
         _wp_print(f"[walkpack] 実験ノブ: {_exp} -> pins={pins}")
