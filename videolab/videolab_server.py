@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.22"  # 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.23"  # 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4431,6 +4431,52 @@ def _wp_apply_pose_defaults() -> None:
             os.environ[k] = v
 
 
+# 管理ノブ (2026-07-20要望「私側から設定を変えられる管理GUI」): 受付台の
+# /admin が GCS config/walkpack_knobs.json に保存し、walkpackが依頼ごとに
+# 読む=サーバ再起動不要で次の生成から反映 (アプリの詳細設定モーダルと同じ
+# 思想)。優先順位: 実験ノブ(_exp明示) > 管理ノブ > 環境変数 > 既定値。
+# flyingの姿勢envだけは体格の生命線なので管理ノブより後に上書きする。
+_WP_KNOB_ENV = {"arm_swing": "SM_POSE_ARM_SWING",
+                "leg_swing": "SM_POSE_LEG_SWING",
+                "leg_cross": "SM_POSE_LEG_CROSS",
+                "bob": "SM_POSE_BOB",
+                "refine": "SM_VACE_LR_REFINE",
+                "pin_release": "SM_VACE_LR_PIN_RELEASE"}
+
+
+def _wp_admin_knobs() -> dict:
+    """GCSの管理ノブを読む (無い/壊れている/非GCS環境は空={既定運転})。"""
+    if not _gcs_active():
+        return {}
+    try:
+        raw = _gcs_read("config/walkpack_knobs.json")
+        if raw is None:
+            return {}
+        d = json.loads(raw.decode("utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:                             # noqa: BLE001
+        return {}
+
+
+def _wp_knob_int(kn: dict, key: str, dflt: int, lo: int, hi: int) -> int:
+    """管理ノブの整数値をクランプして読む (壊れた値でジョブを落とさない)。"""
+    try:
+        return max(lo, min(hi, int(float(kn.get(key) or dflt))))
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _wp_knob_env_set(knobs: dict):
+    """管理ノブを環境変数へ (復元用の退避を返す)。_WALKPACK_LOCK 直列前提。"""
+    saved = {}
+    for key, env in _WP_KNOB_ENV.items():
+        if key not in knobs or knobs[key] is None:
+            continue
+        saved[env] = os.environ.get(env)
+        os.environ[env] = str(knobs[key])
+    return saved
+
+
 # 飛行 (ホバリング) の骨格ノブ (2026-07-19ユーザー報告「浮遊ついてるのに
 # 飛んでない」): walkpackは従来biped歩行の骨格+文面しか持たず、body_plan=
 # flyingでも脚を振って歩いていた。専用骨格を作らず既存クランプ内で寄せる:
@@ -5400,7 +5446,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         _exp = {"pin_conf": ",".join(map(str, _keys)), "refine": 0.9}
         _wp_print(f"[walkpack] {plan}: キー錨既定 "
                   f"(keys={_keys[:5]}+末尾静止, σ0.9)")
-    pins = cv._lr_pin_frames(nf, str(_exp.get("pin_conf") or "on"))
+    _kn = j.get("_wp_knobs") or {}       # 管理GUIのノブ (受付台/adminで設定)
+    if _kn:
+        _wp_print(f"[walkpack] 管理ノブ適用: {_kn}")
+    pins = cv._lr_pin_frames(nf, str(
+        _exp.get("pin_conf")
+        or ("off" if _kn.get("latent_pin") is False else "on")))
     if _exp:
         _wp_print(f"[walkpack] 実験ノブ: {_exp} -> pins={pins}")
     offload = _wp_offload()
@@ -5506,7 +5557,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         if offload:
             extra1["offload"] = offload
         j["detail"] = f"[{tag}] 生成1/2: VACEフル骨格"
-        log(f"[{tag}] 生成1/2: VACEフル骨格制御 steps=4 cfg=1.0 "
+        log(f"[{tag}] 生成1/2: VACEフル骨格制御 "
+            f"steps={_wp_knob_int(_kn, 'vace_steps', 4, 1, 8)} cfg=1.0 "
             "(latent直出し)")
         if _exp.get("skip_vace"):
             # ★実験: VACE抜き。骨格フレーム列を refine_frames_b64 で直接
@@ -5545,11 +5597,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                       idle_n, gait_end if tail else None, log,
                       canvas_w=w, canvas_h=h)
             return
+        _st1 = _wp_knob_int(_kn, "vace_steps", 4, 1, 8)
         _wm1 = "mock" if j.get("_wp_mock") else "vace"
         jid1 = submit_job(_wm1, GenRequest(
             mode="i2v", prompt=prompt, images=[canvas],
             width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
-            steps=4, seed=seed, guidance=1.0, extra=extra1))
+            steps=_st1, seed=seed, guidance=1.0, extra=extra1))
         sj1 = _wp_wait(j, jid1, s1lo, s1hi)
         try:
             # ★検証用の中間保全 (2026-07-19ユーザー提案「結果のみだと
@@ -5578,14 +5631,16 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             extra2["latent_pin_frames"] = pins
         if offload:
             extra2["offload"] = offload
+        _st2 = _wp_knob_int(_kn, "refine_total", 24, 4, 40)
         j["detail"] = f"[{tag}] 生成2/2: AniSora latent再加工"
-        log(f"[{tag}] 生成2/2: AniSora latent再加工 σ=0.45 steps=24 "
+        log(f"[{tag}] 生成2/2: AniSora latent再加工 "
+            f"σ={extra2['refine_strength']} steps={_st2} "
             f"(latent固定 {pins})")
         _wm2 = "mock" if j.get("_wp_mock") else "anisora"
         jid2 = submit_job(_wm2, GenRequest(
             mode="i2v", prompt=prompt, images=[canvas],
             width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
-            steps=24, seed=seed, guidance=1.0, extra=extra2))
+            steps=_st2, seed=seed, guidance=1.0, extra=extra2))
         sj2 = _wp_wait(j, jid2, s2lo, s2hi)
         cvid = out / f"canvas_{tag}.mp4"
         shutil.copy2(sj2["path"], cvid)
@@ -5694,11 +5749,15 @@ def _walkpack_thread(jid: str, pid: str) -> None:
             except (TypeError, ValueError):
                 ls = 1.0
             os.environ["SM_LEG_SCALE"] = str(ls)
+            _knobs = _wp_admin_knobs()           # 管理GUI (受付台/admin) の値
+            j["_wp_knobs"] = _knobs
+            _knob_env = _wp_knob_env_set(_knobs)
             _plan_env = _wp_plan_env_set(meta)   # flyingならノブ上書き
             try:
                 _walkpack_run(j, pid, meta, log)
             finally:
                 _wp_plan_env_restore(_plan_env)
+                _wp_plan_env_restore(_knob_env)
             j["status"] = "done"
             j["progress"] = 1.0
             log("walk_pack 完了")
