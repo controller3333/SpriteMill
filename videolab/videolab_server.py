@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.27"  # 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.28"  # 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4516,6 +4516,27 @@ def _wp_plan_env_restore(saved) -> None:
             os.environ[k] = old
 
 
+def _wp_edge_ref(im):
+    """立ち絵1枚 → キャラ限定の線画 (a-2実験と同じ: 内部輝度エッジ+
+    シルエット輪郭の白線、黒地RGB)。"""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    keyed = _wp_key(im)                           # RGBA・キャラのみ不透過
+    arr = np.asarray(keyed)
+    mask = arr[..., 3] > 128
+    g = np.asarray(keyed.convert("L"), dtype=np.float32)
+    gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
+    gy = np.abs(np.diff(g, axis=0, prepend=g[:1]))
+    inner = ((gx + gy) > 40) & mask               # キャラ内部の輝度エッジ
+    m = mask.astype(np.uint8)
+    sil = np.zeros_like(m)                        # シルエット輪郭 (境界画素)
+    sil[1:-1, 1:-1] = m[1:-1, 1:-1] & ~(
+        m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:])
+    e = np.where(inner | (sil > 0), 255, 0).astype(np.uint8)
+    return (Image.fromarray(e, "L").filter(ImageFilter.MaxFilter(3))
+            .convert("RGB"))
+
+
 def _wp_edge_canvas(cv_mod, refs: dict, w: int, h: int, layout):
     """立ち絵から「キャラ限定」エッジ制御キャンバスを作る (実験a-2)。
 
@@ -4531,20 +4552,7 @@ def _wp_edge_canvas(cv_mod, refs: dict, w: int, h: int, layout):
     tmp = Path(tempfile.mkdtemp(prefix="edge_refs_"))
     erefs = {}
     for d, rp in refs.items():
-        keyed = _wp_key(Image.open(rp))           # RGBA・キャラのみ不透過
-        arr = np.asarray(keyed)
-        mask = arr[..., 3] > 128
-        g = np.asarray(keyed.convert("L"), dtype=np.float32)
-        gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
-        gy = np.abs(np.diff(g, axis=0, prepend=g[:1]))
-        inner = ((gx + gy) > 40) & mask           # キャラ内部の輝度エッジ
-        m = mask.astype(np.uint8)
-        sil = np.zeros_like(m)                    # シルエット輪郭 (境界画素)
-        sil[1:-1, 1:-1] = m[1:-1, 1:-1] & ~(
-            m[:-2, 1:-1] & m[2:, 1:-1] & m[1:-1, :-2] & m[1:-1, 2:])
-        e = np.where(inner | (sil > 0), 255, 0).astype(np.uint8)
-        eim = (Image.fromarray(e, "L").filter(ImageFilter.MaxFilter(3))
-               .convert("RGB"))
+        eim = _wp_edge_ref(Image.open(rp))
         ep = tmp / f"{d}.png"
         eim.save(ep)
         erefs[d] = ep
@@ -4597,6 +4605,108 @@ def _wp_edge_head_canvas(cv_mod, refs: dict, w: int, h: int, layout,
     white = (ca.min(axis=2) > 180)
     return Image.fromarray(
         np.where(white, 255, 0).astype(np.uint8), "L").convert("RGB")
+
+
+def _wp_depth_ref(im):
+    """立ち絵から疑似深度マップを作る (2026-07-20ユーザー発案「Depthを計測で
+    動かせばいろんな形状に対応できるのでは」の第1弾)。
+
+    単眼深度モデルは持ち込まず、シルエットの侵食距離でドーム状の起伏を
+    作る近似 (輪郭=遠・中心=近)。VACEに「この形の立体が居る」と言うのが
+    目的で、正確な深度である必要はない。戻り値はRGB化したグレースケール。"""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    keyed = _wp_key(im)
+    a = np.asarray(keyed)[:, :, 3] > 128
+    mask = Image.fromarray(np.where(a, 255, 0).astype(np.uint8), "L")
+    # 繰り返しMinFilterで侵食し「何回で消えたか」= 輪郭からの深さ
+    depth = np.zeros(a.shape, dtype=np.float32)
+    cur = mask
+    for i in range(24):
+        arr = np.asarray(cur) > 128
+        if not arr.any():
+            break
+        depth[arr] = i + 1
+        cur = cur.filter(ImageFilter.MinFilter(3))
+    if depth.max() > 0:
+        depth /= depth.max()
+    g = np.where(a, (70 + 185 * depth), 0).astype(np.uint8)
+    return Image.fromarray(g, "L").convert("RGB")
+
+
+# 体格別の手続き運動 (深度/線画リファレンスを1フレームぶん動かす)。
+# 位相 ph=0..1 (歩行窓内)。戻り値 = (dx, dy, 回転deg, sx, sy)
+def _wp_move_params(plan: str, ph: float, cw: int, ch: int):
+    import math
+    s = math.sin(2 * math.pi * 2.0 * ph)          # 2往復/周期
+    if plan == "flying":
+        return (0, round(-abs(ch * 0.012) * s), 0.0, 1.0, 1.0)
+    if plan == "quadruped":
+        # 這行のロッキング: 前後に小さく揺れ+わずかな上下
+        return (round(cw * 0.008 * s), round(-ch * 0.006 * abs(s)),
+                1.8 * s, 1.0, 1.0)
+    if plan == "serpentine":
+        return (round(cw * 0.02 * s), 0, 0.0, 1.0, 1.0)
+    if plan == "amorphous":
+        return (0, 0, 0.0, 1.0 + 0.04 * s, 1.0 - 0.06 * s)
+    return (0, round(-ch * 0.008 * abs(s)), 0.0, 1.0, 1.0)   # other
+
+
+def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
+                      gait_end: int, w: int, h: int, layout,
+                      mode: str = "depth"):
+    """深度/線画リファレンスを体格別の手続き運動で動かした制御フレーム列。
+
+    骨格語彙に依存しないので任意形状に対応する: 形の権威=立ち絵実測の
+    深度(または線画)、動き=体格ごとの剛体/伸縮変換 (ボブ・ロッキング・
+    蛇行・拍動)。idle/末尾静止窓は無変換の同じ絵=静止アンカー。"""
+    from PIL import Image
+    import tempfile as _tf
+    base_refs = {}
+    for d, rp in refs.items():
+        im = Image.open(rp)
+        base_refs[d] = (_wp_depth_ref(im) if mode == "depth"
+                        else _wp_edge_ref(im))    # line=a-2のキャラ限定線画
+    win = max(1, gait_end - idle_n + 1)
+    cw_cell, ch_cell = w // 3, h // 3   # compass想定 (hemiは呼ばない)
+    tmp = Path(_tf.mkdtemp(prefix="depth_refs_"))
+    frames = []
+    cache = {}
+    for k in range(nf):
+        if k < idle_n or k > gait_end:
+            key = None
+        else:
+            key = _wp_move_params(plan, (k - idle_n) / win, cw_cell, ch_cell)
+        if key in cache:
+            frames.append(cache[key])
+            continue
+        drefs = {}
+        for d, dim in base_refs.items():
+            out = dim
+            if key is not None:
+                dx, dy, rot, sx, sy = key
+                out = dim
+                if rot or sx != 1.0 or sy != 1.0:
+                    ow, oh = out.size
+                    out = out.rotate(rot, resample=Image.BILINEAR,
+                                     center=(ow / 2, oh * 0.9))
+                    if sx != 1.0 or sy != 1.0:
+                        nw, nh = max(1, round(ow * sx)), max(1, round(oh * sy))
+                        scaled = out.resize((nw, nh), Image.BILINEAR)
+                        out = Image.new(dim.mode, (ow, oh), 0)
+                        # 足元 (下端中央) を基準に貼る=接地維持
+                        out.paste(scaled, ((ow - nw) // 2, oh - nh))
+                if dx or dy:
+                    sh = Image.new(out.mode, out.size, 0)
+                    sh.paste(out, (dx, dy))
+                    out = sh
+            p = tmp / f"{d}_{hash(key) & 0xffffff:x}.png"
+            out.save(p)
+            drefs[d] = p
+        fr = cv_mod.compose_reference(drefs, w, h, layout).convert("RGB")
+        cache[key] = fr
+        frames.append(fr)
+    return frames
 
 
 def _wp_flying_frames(frames, idle_n: int, gait_end: int, canvas_h: int):
@@ -5514,8 +5624,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         # 消えて猫背が復活 ②flying=ボブ骨格まで外すと動きの源が尽きて静止
         # (motion score 3.0問題と複合)。動き量の適正化と頭アンカーの再設計
         # とセットで再昇格する。SM_WP_EDGE_FACE=on で実験再開できる
-        _edge_face = (os.environ.get("SM_WP_EDGE_FACE", "off").strip().lower()
-                      not in ("off", "0", "false", "no")
+        _edge_face = ((_exp.get("edge_face")
+                       or os.environ.get("SM_WP_EDGE_FACE", "off")
+                       .strip().lower() not in ("off", "0", "false", "no"))
                       and not (_exp.get("edge_idle") or _exp.get("edge_head")
                                or _exp.get("no_pose")))
         if plan == "biped":
@@ -5543,6 +5654,17 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
             frames = _wp_flying_frames(frames, idle_n, gait_end, h)
             log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
+        elif _exp.get("depth_move") or _exp.get("line_move"):
+            # 実験b (2026-07-20ユーザー発案「Depthを計測で動かせば任意形状に
+            # 対応できるのでは」+「ラインアートも」): 立ち絵実測の深度/線画を
+            # 体格別の手続き運動 (ボブ・ロッキング・蛇行・拍動) で動かして
+            # 制御に流す。形の権威と動きの源を同時に供給=発明抑制+静止化
+            # 対策の両取りを狙う。VACEはマルチモーダル制御学習なので語彙内
+            _mode = "depth" if _exp.get("depth_move") else "line"
+            frames = _wp_moving_frames(cv, refs, plan, nf, idle_n,
+                                       gait_end, w, h, layout, mode=_mode)
+            log(f"[{tag}] 実験{_mode}_move: {plan}の{_mode}制御 "
+                "(実測マップ+手続き運動)")
         else:
             # 二足マネキンは非二足の姿勢を表現できず、直立骨格を出すと
             # ハイハイ等が立ち上がる方向へ引っ張られる (赤さん実障害)。
@@ -6910,6 +7032,14 @@ def build_app(token: str | None):
             exp["layout"] = "compass"
         if "free_idle" in (body or {}):
             exp["free_idle"] = bool(body["free_idle"])
+        if (body or {}).get("edge_face"):
+            # 顔エッジv2の単発検証用 (2026-07-20): 既定offのままジョブ単位で
+            # noeyes骨格+頭部キャニーを有効化できる
+            exp["edge_face"] = True
+        if (body or {}).get("depth_move"):
+            exp["depth_move"] = True   # 実験b: 実測深度+手続き運動 (非二足)
+        if (body or {}).get("line_move"):
+            exp["line_move"] = True    # 実験b: 実測線画+手続き運動 (非二足)
         elif False:
             # 実験 (2026-07-20ユーザー診断「四肢の状態まで元の絵に合わせて
             # 開始しないとおかしくなる」— 足開きスタンスの立ち絵×足閉じ
