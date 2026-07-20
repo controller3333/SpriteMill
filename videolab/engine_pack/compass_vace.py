@@ -361,16 +361,23 @@ def _lr_pin_frames(nf: int, conf: str = "on") -> list:
 _DIR_CLAUSES = {
     "front": ("faces the camera square-on and keeps the whole face "
               "visible while marching in place"),
-    "front_left": ("is a three-quarter front view that keeps the body and "
-                   "face angled 45 degrees toward the camera with both "
-                   "eyes visible for the entire walk, never flattening "
-                   "into a straight-on front view and never turning into "
-                   "a pure side profile"),
-    "front_right": ("is a three-quarter front view that keeps the body and "
-                    "face angled 45 degrees toward the camera with both "
-                    "eyes visible for the entire walk, never flattening "
-                    "into a straight-on front view and never turning into "
-                    "a pure side profile"),
+    # ★左右を必ず明記する (2026-07-19)。以前この2つは一字一句同じ文面で、
+    # 左右を示す語が1つも無かった。1レイアウト=1ノイズの同時サンプルなので、
+    # テキスト上で交換可能な2セルは対称性の破れをノイズに委ねることになり、
+    # 「どちらか片方の斜め前だけが崩れ、どちらが崩れるかは回ごとに移る」
+    # という症状になる (実際にロップで左前→右前と移動した)。純横の
+    # left/right が "facing left"/"facing right" で崩れないのと同じ語彙に
+    # 斜めを紐づけて、非対称性を文面で固定する。
+    "front_left": ("is a three-quarter front view turned 45 degrees to the "
+                   "left, exactly midway between facing the camera and "
+                   "facing left, keeping both eyes visible for the entire "
+                   "walk, never flattening into a straight-on front view "
+                   "and never turning into a pure side profile"),
+    "front_right": ("is a three-quarter front view turned 45 degrees to the "
+                    "right, exactly midway between facing the camera and "
+                    "facing right, keeping both eyes visible for the entire "
+                    "walk, never flattening into a straight-on front view "
+                    "and never turning into a pure side profile"),
     "left": ("is an exact left profile facing left, with one eye visible "
              "on the side of the face"),
     "right": ("is an exact right profile facing right, with one eye "
@@ -379,12 +386,15 @@ _DIR_CLAUSES = {
              "outfit is visible, each knee bends away from the viewer, and "
              "whenever a foot lifts, its heel and sole rise toward the "
              "camera"),
-    "back_left": ("is a three-quarter rear view seen from behind at a "
-                  "fixed 45 degree angle: the face stays hidden behind "
-                  "the head, each knee bends away from the viewer, and "
-                  "lifted feet show heel and sole toward the camera"),
-    "back_right": ("is a three-quarter rear view seen from behind at a "
-                   "fixed 45 degree angle: the face stays hidden behind "
+    # 後ろ斜めも同じ理由で左右を明記する (前斜めと同型の対称性の罠)
+    "back_left": ("is a three-quarter rear view turned 45 degrees to the "
+                  "left, exactly midway between facing away from the camera "
+                  "and facing left: the face stays hidden behind the head, "
+                  "each knee bends away from the viewer, and lifted feet "
+                  "show heel and sole toward the camera"),
+    "back_right": ("is a three-quarter rear view turned 45 degrees to the "
+                   "right, exactly midway between facing away from the "
+                   "camera and facing right: the face stays hidden behind "
                    "the head, each knee bends away from the viewer, and "
                    "lifted feet show heel and sole toward the camera"),
 }
@@ -392,14 +402,38 @@ _FRONT_FAMILY = {"front", "front_left", "front_right", "left", "right"}
 # 顔正面化 (pose_video._face_front_mode) が発動したセルの斜め前節:
 # 骨格が顔0°+両耳を宣言するのに文面が「45°・正面化禁止」のままだと
 # 骨格とテキストが綱引きする — 「体は45°・顔はカメラへ」で一致させる
+# ★{side} で左右を必ず埋める。差し替え節も左右を書かないと、せっかく
+# _DIR_CLAUSES を非対称にしても発動時に両斜めが同一文面へ戻ってしまう
 _DIAG_FACE_FRONT_CLAUSE = (
-    "keeps its body angled 45 degrees toward the camera while its face "
+    "keeps its body angled 45 degrees to the {side} while its face "
     "stays turned toward the camera with both eyes fully visible for the "
     "entire walk, exactly as in the very first frame, never turning away "
     "and never becoming a pure side profile")
 # 体ヨー追従の発動セル用: 骨格の体が浅い斜め (床20°) なので「45度」を
 # 言わせない — 骨格・参照・テキストの三者を「ほぼ正面のまま歩く」で一致
 _DIAG_BODY_FOLLOW_CLAUSE = (
+    "walks facing the camera, the body turned only slightly to the {side}, "
+    "keeping the face turned straight to the camera with both eyes fully "
+    "visible for the entire walk, exactly as in the very first frame, "
+    "never turning away and never becoming a pure side profile")
+
+
+def _diag_side(d: str) -> str:
+    """斜め方向 -> "left"/"right"。差し替え節の {side} を埋めるため。"""
+    return "right" if d.endswith("_right") else "left"
+
+
+# COMPASS専用の左右中立版 (上の {side} 版と本文は同一で、側の指定だけを
+# 元の "toward the camera" / "to the side" に戻したもの)。compassは角2セルを
+# 「the two corner figures」と1文でまとめて指すので個別の左右を差し込めない。
+# ★この文面は触らないこと: 角セルに語彙を足した版は下段の角まで後ろ向きへ
+# 化けた実測がある (2026-07-18 真ロップ実走)。
+_DIAG_FACE_FRONT_CLAUSE_COMPASS = (
+    "keeps its body angled 45 degrees toward the camera while its face "
+    "stays turned toward the camera with both eyes fully visible for the "
+    "entire walk, exactly as in the very first frame, never turning away "
+    "and never becoming a pure side profile")
+_DIAG_BODY_FOLLOW_CLAUSE_COMPASS = (
     "walks facing the camera, the body turned only slightly to the side, "
     "keeping the face turned straight to the camera with both eyes fully "
     "visible for the entire walk, exactly as in the very first frame, "
@@ -438,9 +472,9 @@ def _direction_text(layout, face_front_diag: bool = False,
         # 真ロップ実走。方向タグの全併記が1向きへ収束する既知実測
         # 「全タグ=全部後ろ姿」と同型の汚染)
         corner = ("and each of the two corner figures "
-                  f"{_DIAG_BODY_FOLLOW_CLAUSE}" if body_follow_diag else
+                  f"{_DIAG_BODY_FOLLOW_CLAUSE_COMPASS}" if body_follow_diag else
                   "and each of the two corner figures "
-                  f"{_DIAG_FACE_FRONT_CLAUSE}" if face_front_diag else
+                  f"{_DIAG_FACE_FRONT_CLAUSE_COMPASS}" if face_front_diag else
                   "and the two corner figures are "
                   "three-quarter front views that keep the body and "
                   "face angled 45 degrees toward the camera with both "
@@ -483,9 +517,9 @@ def _direction_text(layout, face_front_diag: bool = False,
         if poison and d in ("back_left", "back_right"):
             clause = _DIR_CLAUSES["back"]
         if body_follow_diag and d in ("front_left", "front_right"):
-            clause = _DIAG_BODY_FOLLOW_CLAUSE
+            clause = _DIAG_BODY_FOLLOW_CLAUSE.format(side=_diag_side(d))
         elif face_front_diag and d in ("front_left", "front_right"):
-            clause = _DIAG_FACE_FRONT_CLAUSE
+            clause = _DIAG_FACE_FRONT_CLAUSE.format(side=_diag_side(d))
         parts.append(f" On this sheet {_cell_phrase(i, cols, rows)} "
                      f"{clause}.")
     return "".join(parts)

@@ -535,26 +535,62 @@ def _ellipse_poly(p0, p1, half_w: float, seg: int = 24) -> list:
     return pts
 
 
+_FACE_IDX = (0, 14, 15, 16, 17)      # 鼻・両目・両耳 (BODY_18)
+_EYE_IDX = (14, 15)                  # 両目のみ
+
+
+def _face_points_mode() -> str:
+    """骨格に描く顔点の範囲 (SM_POSE_FACE_POINTS)。
+
+    on (既定) = 従来どおり鼻目耳+face68。
+    noeyes    = 目とface68だけ消し、鼻・耳は残す。2026-07-20実走の教訓:
+                目の誤配置が顔を壊す一方、鼻・耳は「頭の位置と向き」の
+                宣言で、全部消すと猫背が復活した (頭の所在が語られなく
+                なる)。顔の細部の権威は頭部エッジへ委ねる折衷。
+    off       = 体のみ (全顔点なし)。実験用。"""
+    v = os.environ.get("SM_POSE_FACE_POINTS", "on").strip().lower()
+    if v in ("off", "0", "false", "no"):
+        return "off"
+    if v in ("noeyes", "no_eyes", "body+nose"):
+        return "noeyes"
+    return "on"
+
+
+def _face_skip_idx() -> tuple:
+    m = _face_points_mode()
+    if m == "off":
+        return _FACE_IDX
+    if m == "noeyes":
+        return _EYE_IDX
+    return ()
+
+
 def _draw_openpose_onto(img: Image.Image, kps: list,
                         face68: list | None = None) -> None:
     """既存キャンバスへ1人分のOpenPose骨格を重ね描きする (グリッド用)。
 
     face68 を渡すと BODY_18 の上に白い顔ドットを重ねる (正準の描画順:
     draw_bodypose→draw_facepose。白はOP_COLORSに無い色なので骨格側と
-    衝突しない)。"""
+    衝突しない)。SM_POSE_FACE_POINTS=noeyes は目とface68だけ・off は
+    顔点全部を描かない (_face_points_mode 参照)。"""
     dr = ImageDraw.Draw(img)
+    skip = _face_skip_idx()
     sw = max(2, round(4 * min(img.width, img.height) / 512.0))  # 標準4px@512
     for li, (a, b) in enumerate(OP_LIMBS):
         if kps[a] is None or kps[b] is None:
+            continue
+        if a in skip or b in skip:
             continue
         col = tuple(int(c * 0.6) for c in OP_COLORS[li])
         dr.polygon(_ellipse_poly(kps[a], kps[b], sw), fill=col)
     for i in range(18):
         if kps[i] is None:
             continue
+        if i in skip:
+            continue
         x, y = kps[i]
         dr.ellipse((x - sw, y - sw, x + sw, y + sw), fill=OP_COLORS[i])
-    if face68:
+    if face68 and not skip:
         # 正準比: 関節円r4に対し顔ドットr3 (draw_facepose)
         fr = max(1, round(sw * 0.75))
         for x, y in face68:
@@ -1249,6 +1285,73 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
             ndy = max(-nlim, min(nlim, nshift))
             if abs(ndy) > 0.008 * fig.total:
                 fig.nose_dy = ndy
+        # ---- スタンス実測 → 外転 leg_out (2026-07-20 骨合わせ第1弾) ----
+        # 足開きの立ち絵 (神爺さん実例) に足閉じ標準骨格を当てると、
+        # 静止窓はfree_idleで守れても歩行窓に姿勢矛盾が残る。足元バンドの
+        # 足クラスタ間隔から立ち姿の開きを実測し、脚鎖全体の外転角へ写す。
+        # スカート等で足が1塊のとき・足が写らないときは不発=既定0度
+        # (安全側)。SM_POSE_STANCE_FIT=off で無効化。
+        if os.environ.get("SM_POSE_STANCE_FIT", "").strip().lower()                 not in ("off", "0", "false"):
+            try:
+                band = fg[max(y0, y1 - max(2, int(0.10 * ch_img))):y1 + 1]
+                cols = band.sum(axis=0)
+                on = cols > max(1, int(0.25 * band.shape[0]))
+                runs, st = [], None
+                for x, v_ in enumerate(on.tolist() + [False]):
+                    if v_ and st is None:
+                        st = x
+                    elif not v_ and st is not None:
+                        runs.append((st, x - 1))
+                        st = None
+                runs = [r for r in runs if r[1] - r[0] >= 2]
+                if len(runs) >= 2:
+                    c1 = (runs[0][0] + runs[0][1]) / 2.0
+                    c2 = (runs[-1][0] + runs[-1][1]) / 2.0
+                    half_w = (c2 - c1) / 2.0 / ch_img * fig.total
+                    leg_len = fig.leg_upper + fig.leg_lower
+                    x_off = half_w - fig.hip_x
+                    if x_off > 0 and leg_len > 0:
+                        out_deg = math.degrees(
+                            math.asin(min(0.42, x_off / leg_len)))
+                        if out_deg >= 3.0:
+                            fig.leg_out = min(22.0, out_deg)
+                            print(f"[pose] スタンス実測: 足間隔"
+                                  f"{c2 - c1:.0f}px → 外転"
+                                  f"{fig.leg_out:.1f}°")
+            except Exception:                     # noqa: BLE001
+                pass
+        # ---- 腕の実測フィット (2026-07-20 骨合わせ第2弾: 腕) ----
+        # 手首バンドの外縁半幅から arm_out の必要角を逆算し、既定より
+        # 外へ張るぶんだけ加算する (袖広ローブ等)。内側方向は既存の
+        # 「腕鎖がシルエットからはみ出さないガード」の持ち場なので触らず、
+        # 外側のみ。腕上げ・持ち物ポーズの誤検知はクランプ+閾値で減衰。
+        # SM_POSE_ARM_OUT_FIT=off で無効化。
+        if os.environ.get("SM_POSE_ARM_OUT_FIT", "").strip().lower()                 not in ("off", "0", "false"):
+            try:
+                wrist_y = (fig.shoulder_y - 0.01
+                           - fig.arm_upper - fig.arm_lower)
+                wr = int(round(ch_img * (1.0 - wrist_y / fig.total)))
+                half_band = max(2, int(0.05 * ch_img))
+                b0 = max(0, wr - half_band)
+                b1 = min(ch_img, wr + half_band)
+                band = fg[y0 + b0:y0 + b1]
+                cols = np.where(band.any(axis=0))[0]
+                if len(cols) > 4:
+                    half_w = (cols[-1] - cols[0]) / 2.0 / ch_img * fig.total
+                    target_x = half_w - fig.arm_r * 1.6
+                    base_ao = 11.0            # IDLE_POSEの既定arm_out
+                    cur_x = (fig.sh_x + math.sin(math.radians(base_ao))
+                             * fig.arm_upper)
+                    if target_x > cur_x and fig.arm_upper > 0:
+                        s = min(0.85, (target_x - fig.sh_x)
+                                / fig.arm_upper)
+                        add = math.degrees(math.asin(max(0.0, s))) - base_ao
+                        if add >= 3.0:
+                            fig.arm_out_add = min(25.0, add)
+                            print(f"[pose] 腕実測: 手首バンド半幅→"
+                                  f"arm_out +{fig.arm_out_add:.1f}°")
+            except Exception:                     # noqa: BLE001
+                pass
         return fig
     except Exception:
         return fig
@@ -1860,7 +1963,8 @@ def build_canvas_pose_frames(dir_refs: dict, num_frames: int,
                              face68: bool | None = None,
                              yaw_adapt: bool | None = None,
                              face_front: str | None = None,
-                             diag_body: str | None = None) -> list:
+                             diag_body: str | None = None,
+                             kps_out: list | None = None) -> list:
     """グリッド(コンパス)配置の骨格制御フレーム列を返す (8方向1発生成用)。
 
     layout = (cols, rows, [方向 or None, ...]) — canvas_walk.LAYOUT_COMPASS等。
@@ -1971,6 +2075,7 @@ def build_canvas_pose_frames(dir_refs: dict, num_frames: int,
             ang = walk_angles_at(ph, arm_swing=arm_swing,
                                  leg_swing=leg_swing)
         img = Image.new("RGB", (width, height), (0, 0, 0))
+        _rec = [] if kps_out is not None else None
         for yaw, yaw_h, fig, scale, cx, by, ff, hem_abs, a_hide in cells:
             # 接地補正 (体型フィットでfigがセル毎に違うため個別に計算)
             gait = idle_n <= i < idle_n + m   # 直立区間は内転しない
@@ -1993,7 +2098,14 @@ def build_canvas_pose_frames(dir_refs: dict, num_frames: int,
                                                < hem_abs + 3.0):
                         kps[j] = None
             f68 = _face68_pts(fig, yaw_h, scale, cx, by2) if face68 else None
+            if _rec is not None:
+                # パペット用の生キーポイント (2026-07-20ユーザー発案
+                # 「骨に線画を貼り付けて動かす」): 描画と同じ座標系の
+                # BODY_18リストをセル順に記録する
+                _rec.append(list(kps))
             _draw_openpose_onto(img, kps, f68)
+        if kps_out is not None:
+            kps_out.append(_rec)
         frames.append(img)
     return frames
 

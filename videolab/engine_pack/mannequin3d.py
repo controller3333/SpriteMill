@@ -132,6 +132,12 @@ class Figure:
         # ---- 高さ方向の寸法だけ体の縮尺に追従 ----
         self.arm_upper = 0.165 * b
         self.arm_lower = 0.148 * b
+        # スタンス実測の外転角 (度・pose_video._fit_figure_to_charが設定。
+        # 足開き立ち絵のキャラだけ>0になる。2026-07-20 骨合わせ)
+        self.leg_out = 0.0
+        # 腕の開き実測の加算角 (度・同上第2弾: 袖広ローブ等で腕の質量が
+        # 外に張るキャラは骨格の腕も外へ=袖の中に骨を収める)
+        self.arm_out_add = 0.0
         ankle = 0.070 * b
         self.leg_upper = (self.hip_y - ankle) / 2.0
         self.leg_lower = (self.hip_y - ankle) / 2.0
@@ -163,16 +169,22 @@ class Figure:
         fdir = _rotx((0, 0, 1), -fp)
         tv = (fdir[0] * self.foot_len, fdir[1] * self.foot_len,
               fdir[2] * self.foot_len)
+        ad = 0.0
         if gait and leg_cross > 0.0:
             reach = math.degrees(math.asin(min(1.0, self.hip_x /
                                                (self.leg_upper
                                                 + self.leg_lower))))
             ad = (reach * max(0.0, 1.0 - kn / 45.0)
                   * min(1.5, leg_cross))
-            if ad > 0.0:
-                v = _rotz(v, -side * ad)   # 脚全体を股関節まわりに内転
-                w = _rotz(w, -side * ad)
-                tv = _rotz(tv, -side * ad)
+        # ★スタンス実測の外転 (2026-07-20 骨合わせ): 足開き立ち絵の
+        # キャラは常時 leg_out 度だけ脚鎖全体を外へ。歩行の内転(ad)と
+        # 同軸の逆符号なので正味角で1回だけ回す (回転経路はモデル歩きで
+        # 実証済みの _rotz を共用 = 幾何の新規リスクなし)
+        net = ad - float(getattr(self, "leg_out", 0.0))
+        if abs(net) > 1e-6:
+            v = _rotz(v, -side * net)
+            w = _rotz(w, -side * net)
+            tv = _rotz(tv, -side * net)
         knee = _add(hip, v)
         ankle = _add(knee, w)
         toe = _add(ankle, tv)
@@ -184,6 +196,7 @@ class Figure:
                gait=False) -> dict[str, tuple]:
         """ポーズの関節位置 (ワールド3D)。pose() と同じ式で計算する
         (脚は _leg_chain 共用で構造的に一致)。walk_warp のMLS制御点用。"""
+        arm_out = arm_out + float(getattr(self, "arm_out_add", 0.0))
         J: dict[str, tuple] = {
             "head_c": (0.0, self.head_cy, 0.0),
             "head_top": (0.0, self.head_cy + self.head_r * 0.9, 0.0),
@@ -255,6 +268,7 @@ class Figure:
         # 腕 (+x側=赤, -x側=青)。arm_out で軽く外へ開く (胴との分離)。
         # 角度の符号は「+=前方(+z)へ振る」(_rotxは+角で-z側へ倒すため負符号。
         # 検証指摘 2026-07-11: 符号が逆で接地コマの前脚色が全滅していた)
+        arm_out = arm_out + float(getattr(self, "arm_out_add", 0.0))
         for side, sh_pitch, elb, color in (
                 (+1, shR, elbR, C_RED), (-1, shL, elbL, C_BLUE)):
             sh = (side * self.sh_x, self.shoulder_y - 0.01, 0)
