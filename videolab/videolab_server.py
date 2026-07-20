@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.19"  # 0.10.19: free_idleを非flyingの既定へ昇格 (静止窓の姿勢権限を立ち絵に一本化=四肢増産の根治。神爺さん改善+ロップ無害+遷移帯クリーンの3点実証)
+__version__ = "0.10.20"  # 0.10.20: 取り残し根治3点 (実障害4eb7f4ce) — ①生成中ハートビート120s毎+stale拾い直し7800s→900s ②SIGTERM/自己停止で請負をpack_readyへ解放 (FastAPI shutdownイベント) ③取り込み窓のアイドル時計更新+停止後の新規請負拒否。finishの読み直し/保存も有界リトライ化 (盲目上書き廃止)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5647,6 +5647,14 @@ except ValueError:
 _LAST_HTTP = [time.time()]       # HTTPミドルウェアが更新 (可変参照でクロージャ共有)
 _LAST_GCS_WORK = [time.time()]   # GCSワーカーが最後に仕事した時刻
 _GCE_THREADS_UP = [False]
+# 請負中の依頼 (rid, pack_id)。SIGTERM/自己停止時に generating を pack_ready
+# へ戻すための目印 (2026-07-20 実障害4eb7f4ce: 外部stopが請負91秒後に直撃し
+# generating が永久残留)。generating 書込より前に立てること — 書込前に死ねば
+# 解放は no-op で pack_ready のまま=受付台の起こし直しが効く。
+_GCS_INFLIGHT: list = [None]
+# 停止シーケンス開始後は新規の請負を止める (停止決定〜電源断の窓で
+# pack_ready を generating に引き込んで死ぬTOCTOUの防止)
+_GCS_STOPPING = [False]
 
 _META = "http://metadata.google.internal/computeMetadata/v1/"
 _GCS_TOK = {"tok": "", "exp": 0.0}
@@ -5876,16 +5884,30 @@ def _gcs_req_finish(req: dict, status: str, error: str = "") -> None:
     「同じpack_idのままのpack_ready」(=取り込み前に失敗した自分の依頼) —
     のときだけ status/error を差し込んで保存する。所有が外れていたら保存を
     放棄 (受付側の新しい内容が勝ち)。依頼自体が消えていた場合も復活させ
-    ない。読み直しの通信失敗時だけ従来通り手元を書く (終了状態の喪失=
-    generatingのまま宙に浮く方が実害が大きい)。"""
+    ない。
+
+    (2026-07-20) 読み直し失敗時に手元の古いスナップショットを無条件保存する
+    従来動作を廃止 — 所有判定を素通りして受付側のredo (waiting化) を黙って
+    doneへ巻き戻す実害の方が大きい。読み直しも保存も有界リトライにし、
+    それでも駄目なら generating のまま残す (ハートビート途絶→stale拾い直し
+    が最大~16分で自動回収するので、終了状態の喪失はもう永久ではない)。
+    リトライ中は _LAST_GCS_WORK を進めてアイドル自己停止に断ち切られない
+    ようにする。"""
     rid = req["request_id"]
     req["status"] = status                    # 呼び出し側から見える手元も更新
     req["error"] = error
-    try:
-        cur = _gcs_req_load(rid)
-    except Exception:                         # noqa: BLE001
-        _gcs_req_save(req)                    # 読み直せない → 従来動作で保存
-        return
+    cur = None
+    for i in range(4):                        # 読み直し: 計~45秒粘る
+        try:
+            cur = _gcs_req_load(rid)
+            break
+        except Exception:                     # noqa: BLE001
+            if i == 3:
+                _wp_print(f"[GCS] 依頼 {rid} の読み直し不能 — 書き戻しを"
+                          "見送り (stale拾い直しに委ねる)")
+                return
+            _LAST_GCS_WORK[0] = time.time()
+            time.sleep(15)
     if cur is None:                           # 依頼が削除済み → 復活させない
         _wp_print(f"[GCS] 依頼 {rid} は生成中に削除された — 書き戻しを放棄")
         return
@@ -5898,7 +5920,31 @@ def _gcs_req_finish(req: dict, status: str, error: str = "") -> None:
         return
     cur["status"] = status
     cur["error"] = error
+    for i in range(6):                        # 保存: 計~2.5分粘る (一発勝負廃止)
+        try:
+            _gcs_req_save(cur)
+            return
+        except Exception:                     # noqa: BLE001
+            if i == 5:
+                raise
+            _LAST_GCS_WORK[0] = time.time()
+            time.sleep(30)
+
+
+def _gcs_req_heartbeat(rid: str, pid: str) -> bool:
+    """生成中の依頼の updated を進める (生存証明 2026-07-20)。
+
+    これで「updated が止まった generating = 死んだ請負」が成立し、
+    _GCS_STALE_GEN_SEC を数分オーダーへ短縮できる (従来7800sは
+    walkpackタイムアウト基準の壁時計で、生存性を証明しなかった)。
+    読み直した cur を保存するのが要点 — 手元の req を書くと受付側の
+    フィールド (pw_salt等) を潰す。所有が外れていたら False (以後打たない)。"""
+    cur = _gcs_req_load(rid)
+    if (not cur or cur.get("status") != "generating"
+            or str(cur.get("pack_id") or "") != pid):
+        return False
     _gcs_req_save(cur)
+    return True
 
 
 _GCS_CT = {".mp4": "video/mp4", ".webp": "image/webp", ".png": "image/png",
@@ -5925,10 +5971,18 @@ def _gcs_process_one(req: dict, wait: bool = True):
     jid = submit_walkpack(pid, mock=bool(req.get("_mock")))
     if not wait:
         return jid
+    beat = time.time()                           # ハートビート (120s毎)
+    own = True
     while True:                                  # ジョブ完了までポーリング
         time.sleep(5)
         j = JOBS.get(jid)
         _LAST_GCS_WORK[0] = time.time()
+        if own and time.time() - beat >= 120:
+            beat = time.time()
+            try:
+                own = _gcs_req_heartbeat(rid, pid)
+            except Exception:                     # noqa: BLE001
+                pass                              # 欠け打ち許容 (900sは7回分超)
         if j is None:
             raise RuntimeError("ジョブが消えました")
         if j.get("status") in ("done", "error", "cancelled"):
@@ -5988,10 +6042,13 @@ def _gcs_process_one(req: dict, wait: bool = True):
 # (2026-07-19) generating のまま宙に浮いた依頼の再取り込み猶予。VMがジョブ中に
 # 死ぬと (アイドル自己停止/プリエンプト/OOM/startup.shのpkill) 依頼は
 # generating のまま誰も再試行せず、受付側の complete/fail も409で拒むため
-# 永久に「生成中」で固まっていた。walkpackのクライアント側タイムアウトが
-# 7200s (colab_bridge) なので、それ+余裕を超えて updated が止まっている
-# generating は死産と判断して拾い直す (_REQ_CLAIM_TIMEOUT と同じ思想)。
-_GCS_STALE_GEN_SEC = 7200.0 + 600.0
+# 永久に「生成中」で固まっていた。
+# (2026-07-20) 基準を「walkpackタイムアウト(7800s)の壁時計」から「ハート
+# ビート途絶」へ変更 — 生成中は _gcs_req_heartbeat が120s毎に updated を
+# 進めるので、900s (7回分超の余裕) 止まっていれば死産と断定できる。
+# ★受付台側の起こし直し閾値 _STALE_GEN_WAKE (kobo_front/main.py) は必ず
+# この値より大きく保つこと — 逆だと起きたVMが拾えず起床スラッシングになる。
+_GCS_STALE_GEN_SEC = 900.0
 
 
 def _gcs_pick_pack_ready():
@@ -6023,9 +6080,15 @@ def _gcs_worker_loop() -> None:
               f"poll={_GCS_POLL_SEC}s)")
     while True:
         try:
+            if _GCS_STOPPING[0]:                  # 停止決定後は新規請負なし
+                return
             req = _gcs_pick_pack_ready()
             if req:
                 rid = req["request_id"]
+                # 取り込み窓 (pack DL/展開〜generating書込) もアイドル時計を
+                # 進める — 大きいzipのDL中に猶予満了→電源断の競合防止
+                _LAST_GCS_WORK[0] = time.time()
+                _GCS_INFLIGHT[0] = (rid, str(req.get("pack_id") or ""))
                 _wp_print(f"[GCS] 取り込み {rid} pack={req.get('pack_id')}")
                 try:
                     _gcs_process_one(req)
@@ -6038,10 +6101,41 @@ def _gcs_worker_loop() -> None:
                         _gcs_req_finish(req, "failed", str(e)[:500])
                     except Exception:             # noqa: BLE001
                         pass
+                finally:
+                    _GCS_INFLIGHT[0] = None
                 continue                          # 連続処理: すぐ次を探す
         except Exception as e:                    # noqa: BLE001
             _wp_print(f"[GCS] ポーリングエラー (継続): {str(e)[:160]}")
         time.sleep(_GCS_POLL_SEC)
+
+
+def _gcs_release_inflight() -> None:
+    """請負中の依頼を pack_ready へ戻してから死ぬ (2026-07-20)。
+
+    uvicorn は SIGTERM 受信→graceful shutdown→FastAPIのshutdownイベント、
+    の順で確実にここへ来る。gcloud stop (猶予~90s)・Spotプリエンプト (30s)・
+    startup.sh の pkill・自己停止poweroff→systemdのTERM、の全経路が対象。
+    守れないのは SIGKILL/OOM-kill だけで、そこはハートビート途絶→stale
+    拾い直し (最大~16分) がバックストップする。
+
+    二重解放は無害: 解放が pack_ready を書いた直後に走行中ワーカーが done を
+    書く順序でも、_gcs_req_finish の所有判定が「同pack_idのpack_ready」を
+    所有扱いするため done が勝つ。逆順は所有外で解放がskipされる。"""
+    _GCS_STOPPING[0] = True                   # 先に新規請負を止める
+    snap = _GCS_INFLIGHT[0]
+    if not snap or not _gcs_active():
+        return
+    rid, pid = snap
+    try:
+        cur = _gcs_req_load(rid)
+        if (cur and cur.get("status") == "generating"
+                and str(cur.get("pack_id") or "") == pid):
+            cur["status"] = "pack_ready"
+            cur["error"] = ""
+            _gcs_req_save(cur)
+            _wp_print(f"[GCS] 停止前に請負を解放: {rid} → pack_ready")
+    except Exception as e:                    # noqa: BLE001
+        _wp_print(f"[GCS] 請負解放に失敗 (stale拾い直しへ委任): {str(e)[:120]}")
 
 
 def _gce_is_idle() -> bool:
@@ -6061,6 +6155,7 @@ def _gce_self_stop() -> None:
 
     VIDEOLAB_GCE=1 のときだけ実機を poweroff する。それ以外の環境
     (Colab/ローカル/テスト) では絶対に電源を切らず _shutdown_runtime へ。"""
+    _GCS_STOPPING[0] = True   # 停止決定〜電源断の窓で新規請負しない (TOCTOU防止)
     try:
         if _gcs_active():
             _gcs_write("vm/state.json",
@@ -6191,6 +6286,9 @@ def build_app(token: str | None):
     from fastapi.responses import FileResponse, HTMLResponse, Response
 
     app = FastAPI(title="SpriteMill VideoLab", version=__version__)
+    # SIGTERM→uvicorn graceful→ここ、の順で必ず呼ばれる (signal.signalは
+    # uvicornが上書きするので使えない)。請負中依頼の pack_ready 戻し。
+    app.add_event_handler("shutdown", _gcs_release_inflight)
 
     @app.middleware("http")
     async def _track_access(request: Request, call_next):
