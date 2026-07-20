@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.20"  # 0.10.20: 取り残し根治3点 (実障害4eb7f4ce) — ①生成中ハートビート120s毎+stale拾い直し7800s→900s ②SIGTERM/自己停止で請負をpack_readyへ解放 (FastAPI shutdownイベント) ③取り込み窓のアイドル時計更新+停止後の新規請負拒否。finishの読み直し/保存も有界リトライ化 (盲目上書き廃止)
+__version__ = "0.10.21"  # 0.10.21: 隣セル見切れ欠片の除去 (_wp_drop_stray: キー後の孤立成分のうち縁接触かつ本体5%以下だけ透明化。神爺さんfront歩行1コマ目の実障害) / 0.10.20: 取り残し根治3点 (実障害4eb7f4ce) — ①生成中ハートビート120s毎+stale拾い直し7800s→900s ②SIGTERM/自己停止で請負をpack_readyへ解放 ③取り込み窓のアイドル時計更新+停止後の新規請負拒否。finishの読み直し/保存も有界リトライ化
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4873,9 +4873,67 @@ def _wp_split(eng: dict, ffmpeg: str, cvid: Path, layout, refs: dict,
             raise RuntimeError(f"ffmpeg分割失敗: {r.stderr[-300:]}")
 
 
+def _wp_drop_stray(im, min_keep_ratio: float = 0.05):
+    """セル境界からはみ込んだ隣セルの欠片 (孤立成分) を透明化する。
+
+    コンパス/半球キャンバスはセルが隣接しており、歩行で腕や足がセル境界を
+    またぐ位相では、隣セルの切り出しに手先の欠片が写り込む (2026-07-20
+    神爺さん front歩行1コマ目の実障害、ユーザー指摘「隣の見切れてるの
+    気になります」)。キーイング後の不透過画素を連結成分に分け、
+    「最大成分 (=キャラ本体) に非接続 かつ 縁から1割以内の帯にある かつ
+    面積が本体の5%以下」の成分だけを消す。判定を接触でなく帯にするのは、
+    組立の下端中央アンカーが内容を数px水平シフトさせ、境界で切れた欠片が
+    縁から浮くため (実測: 神爺さんの欠片はx=2..7で縁非接触)。本体は縁に
+    近くても最大成分なので消えない。帯の外の孤立成分 (装飾等) は温存。"""
+    import numpy as np
+    from PIL import Image
+    arr = np.array(im)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        return im
+    mask = arr[:, :, 3] > 16
+    if not mask.any():
+        return im
+    H, W = mask.shape
+    comps = []                      # (面積, 縁接触, 成分マスク)
+    work = mask.copy()
+    while work.any():
+        ys, xs = np.nonzero(work)
+        comp = np.zeros((H, W), dtype=bool)
+        comp[ys[0], xs[0]] = True
+        n = 1
+        while True:                 # 4近傍の膨張をマスク内で飽和するまで
+            grow = comp.copy()
+            grow[1:, :] |= comp[:-1, :]
+            grow[:-1, :] |= comp[1:, :]
+            grow[:, 1:] |= comp[:, :-1]
+            grow[:, :-1] |= comp[:, 1:]
+            grow &= mask
+            m = int(grow.sum())
+            if m == n:
+                break
+            comp, n = grow, m
+        cys, cxs = np.nonzero(comp)
+        mx, my = max(2, W // 10), max(2, H // 10)
+        near = bool(cxs.min() < mx or cxs.max() >= W - mx
+                    or cys.min() < my or cys.max() >= H - my)
+        comps.append((n, near, comp))
+        work &= ~comp
+    if len(comps) <= 1:
+        return im
+    main_area = max(c[0] for c in comps)
+    thr = max(48.0, min_keep_ratio * main_area)
+    dropped = False
+    for area, near, comp in comps:
+        if area != main_area and near and area <= thr:
+            arr[:, :, 3][comp] = 0
+            dropped = True
+    return Image.fromarray(arr) if dropped else im
+
+
 def _wp_key(im, thr: int = 70):
     """マゼンタ背景 -> 透過 (build_T_sheet の素朴キー版: min(R,B)-G>=thr)。
-    連結成分キーイング (bg_magenta_mask) は使わない簡易版。"""
+    連結成分キーイング (bg_magenta_mask) は使わない簡易版。
+    キー後に隣セルの見切れ欠片を落とす (_wp_drop_stray)。"""
     import numpy as np
     from PIL import Image
     a = np.asarray(im.convert("RGB"), dtype=np.int16)
@@ -4883,7 +4941,7 @@ def _wp_key(im, thr: int = 70):
     alpha = np.where(bg, 0, 255).astype(np.uint8)
     out = im.convert("RGBA")
     out.putalpha(Image.fromarray(alpha, "L"))
-    return out
+    return _wp_drop_stray(out)
 
 
 def _wp_dir_mp4s(out: Path) -> tuple:
@@ -6286,9 +6344,14 @@ def build_app(token: str | None):
     from fastapi.responses import FileResponse, HTMLResponse, Response
 
     app = FastAPI(title="SpriteMill VideoLab", version=__version__)
+
     # SIGTERM→uvicorn graceful→ここ、の順で必ず呼ばれる (signal.signalは
     # uvicornが上書きするので使えない)。請負中依頼の pack_ready 戻し。
-    app.add_event_handler("shutdown", _gcs_release_inflight)
+    # ★app.add_event_handler は VMの古いFastAPIに存在しない (AttributeError
+    # でサーバ即死、2026-07-20実障害)。on_event デコレータは新旧両方にある。
+    @app.on_event("shutdown")
+    def _release_on_shutdown():
+        _gcs_release_inflight()
 
     @app.middleware("http")
     async def _track_access(request: Request, call_next):
