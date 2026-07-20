@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.23"  # 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.27"  # 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4466,6 +4466,15 @@ def _wp_knob_int(kn: dict, key: str, dflt: int, lo: int, hi: int) -> int:
         return dflt
 
 
+def _wp_knob_float(kn: dict, key: str, dflt: float, lo: float,
+                   hi: float) -> float:
+    """管理ノブの実数値をクランプして読む (壊れた値でジョブを落とさない)。"""
+    try:
+        return max(lo, min(hi, float(kn.get(key) or dflt)))
+    except (TypeError, ValueError):
+        return dflt
+
+
 def _wp_knob_env_set(knobs: dict):
     """管理ノブを環境変数へ (復元用の退避を返す)。_WALKPACK_LOCK 直列前提。"""
     saved = {}
@@ -4819,6 +4828,16 @@ _WP_PLAN_PROMPTS = {
 # 上記の体格 (walkpackで二足歩行骨格を当ててはいけないもの)
 _WP_NAT_PLANS = tuple(_WP_PLAN_PROMPTS)
 
+# 発明抑制 (2026-07-20ユーザー観察「キャラを動かさずに何もない場所に新しく
+# 何かを描く」への第1弾): stage2は guidance=1.0 でネガティブプロンプトが
+# 効かないため、「空白は空白のまま」を正のプロンプトで宣言する。骨格なし
+# 経路はσ0.9の自由スロットが約8個あり、ノイズの解決先から「新規物体」を
+# 言語で奪う。bipedは骨格latentが動きを強制するので対象外 (実績運転不変)
+_WP_NO_PROPS = (
+    " Nothing new ever appears anywhere in the frame: no props, no objects, "
+    "no effects, no particles, no extra creatures; the flat magenta "
+    "background stays completely empty at all times.")
+
 
 def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
                plan: str = "biped") -> str:
@@ -4839,7 +4858,14 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
         prompt = _WP_PLAN_PROMPTS[plan] + _WP_CELL_LOCK
     else:
         prompt = cw.CANVAS_PROMPT
-    prompt += cv.NO_WIND
+    if plan == "biped":
+        prompt += cv.NO_WIND
+    else:
+        # 歩かない体格では「歩行由来の揺れ」文言が空転する (文意の整合)。
+        # あわせて発明抑制節 (_WP_NO_PROPS) を宣言する
+        prompt += cv.NO_WIND.replace("the walking motion itself",
+                                     "the character's own movement")
+        prompt += _WP_NO_PROPS
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     try:
         fr = refs.get("front")
@@ -5443,7 +5469,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         _keys = sorted({0, gait_end // 4, gait_end // 2,
                         gait_end * 3 // 4, gait_end}
                        | set(range(gait_end + 1, nf)))
-        _exp = {"pin_conf": ",".join(map(str, _keys)), "refine": 0.9}
+        # σは環境変数 (=管理ノブ経由) を尊重する。従来の0.9ハードコードは
+        # 管理ノブ"refine"がキー錨経路に一切届かない死にノブだった
+        # (2026-07-20監査案F)。未設定時は0.9で完全同値
+        _exp = {"pin_conf": ",".join(map(str, _keys)),
+                "refine": float(os.environ.get(
+                    "SM_VACE_LR_REFINE", "").strip() or 0.9)}
         _wp_print(f"[walkpack] {plan}: キー錨既定 "
                   f"(keys={_keys[:5]}+末尾静止, σ0.9)")
     _kn = j.get("_wp_knobs") or {}       # 管理GUIのノブ (受付台/adminで設定)
@@ -5472,19 +5503,79 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         j["detail"] = f"[{tag}] 骨格グリッド生成"
         log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
             f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
-        if plan in _WP_NAT_PLANS:
+        # 顔エッジ固定 (2026-07-20昇格、ユーザー報告「OpenPoseが目の位置を
+        # 外して顔を壊す事例が数件」): 顔の権威を骨格の顔点から頭部エッジ
+        # (立ち絵実測キャニー=a-4実験部品) へ移す。二足=体のみ骨格+歩行窓に
+        # 顔エッジ、flying/非二足=骨格なし+全域顔エッジ (flyingのボブは
+        # エッジをsin同期シフト)。SM_WP_EDGE_FACE=off で旧動作。実験ノブ
+        # (edge_idle等) 指定時は実験側に譲る
+        # ★2026-07-20実走で既定offへ後退: 顔は直るが (神爺さん/ドラゴン
+        # 両方で顔無傷・線写り込みなし)、①二足=顔点を消すと頭の位置権威が
+        # 消えて猫背が復活 ②flying=ボブ骨格まで外すと動きの源が尽きて静止
+        # (motion score 3.0問題と複合)。動き量の適正化と頭アンカーの再設計
+        # とセットで再昇格する。SM_WP_EDGE_FACE=on で実験再開できる
+        _edge_face = (os.environ.get("SM_WP_EDGE_FACE", "off").strip().lower()
+                      not in ("off", "0", "false", "no")
+                      and not (_exp.get("edge_idle") or _exp.get("edge_head")
+                               or _exp.get("no_pose")))
+        if plan == "biped":
+            _fp_save = os.environ.get("SM_POSE_FACE_POINTS")
+            if _edge_face:
+                # noeyes=目とface68だけ消す (2026-07-20実走の教訓: 全消しは
+                # 頭の位置権威まで消えて猫背復活。鼻・耳=頭アンカーは残し、
+                # 壊し屋の目だけ排除して顔の細部はエッジに委ねる)
+                os.environ["SM_POSE_FACE_POINTS"] = "noeyes"
+            try:
+                frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+            finally:
+                if _edge_face:
+                    if _fp_save is None:
+                        os.environ.pop("SM_POSE_FACE_POINTS", None)
+                    else:
+                        os.environ["SM_POSE_FACE_POINTS"] = _fp_save
+            if _edge_face:
+                log(f"[{tag}] 骨格=目なし (鼻耳=頭アンカー維持・顔は頭部エッジで固定)")
+        elif plan == "flying":
+            # v0.10.6実証・キー錨と併用の実績経路: 直立+上下ボブ骨格。
+            # ★エッジ実験on時もこの骨格は維持する (2026-07-20実走: 骨格まで
+            # 外すと動きの源が尽きて静止化)。エッジは同じsin式でボブに同期
+            # して上に重なるだけ
+            frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+            frames = _wp_flying_frames(frames, idle_n, gait_end, h)
+            log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
+        else:
             # 二足マネキンは非二足の姿勢を表現できず、直立骨格を出すと
             # ハイハイ等が立ち上がる方向へ引っ張られる (赤さん実障害)。
-            # 全フレーム黒=制御なし。姿勢はキー錨(立ち絵由来)と文面が担う
+            # 姿勢はキー錨 (立ち絵由来) と文面が担う
             from PIL import Image as _ImgN
             frames = [_ImgN.new("RGB", (w, h), 0) for _ in range(nf)]
             log(f"[{tag}] {plan}: 骨格制御なし (キー錨+文面で誘導)")
-        else:
-            frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
-        if plan == "flying":
-            # 歩行骨格は条件に出さない (上の _wp_flying_frames 参照)
-            frames = _wp_flying_frames(frames, idle_n, gait_end, h)
-            log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
+        if _edge_face:
+            import numpy as _npE
+            _hcv = _wp_edge_head_canvas(cv, refs, w, h, layout)
+            if _hcv.size != frames[0].size:
+                _hcv = _hcv.resize(frames[0].size)
+            try:
+                _hcv.save(out / f"edgehead_{tag}.png")   # 検証用 (backyard)
+            except Exception:                 # noqa: BLE001
+                pass
+            _ha = _npE.asarray(_hcv.convert("RGB"))
+            _ampF = max(2, round(h * 0.012))
+            _winF = max(1, gait_end - idle_n + 1)
+            def _face_fix(fr, k):
+                if plan == "biped" and not (idle_n <= k <= gait_end):
+                    return fr                 # idle窓はfree_idleの領分
+                dy = 0
+                if plan == "flying" and idle_n <= k <= gait_end:
+                    dy = round(_ampF * math.sin(
+                        2 * math.pi * 2.0 * (k - idle_n) / _winF))
+                sh = _npE.roll(_ha, dy, axis=0) if dy else _ha
+                base = _npE.asarray(fr.convert("RGB"))
+                from PIL import Image as _ImgE
+                return _ImgE.fromarray(_npE.maximum(base, sh))
+            frames = [_face_fix(fr, k) for k, fr in enumerate(frames)]
+            log(f"[{tag}] 顔エッジ固定: 頭部キャニーを制御へ合成 "
+                f"({'歩行窓のみ' if plan == 'biped' else '全域'})")
         canvas = cv.compose_reference(refs, w, h, layout)
         _free = _exp.get("free_idle")
         if _free is None:
@@ -5569,7 +5660,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験skip_vace: 骨格{len(frames)}fを直接latent源に")
             extra2 = {"refine_frames_b64": pv.encode_frames_b64(frames),
                       "refine_strength": float(_exp.get("refine") or 0.9),
-                      "refine_cond_still": True, "motion_score": 3.0}
+                      "refine_cond_still": True,
+                      "motion_score": _wp_knob_float(
+                          _kn, "motion", 3.0, 2.0, 4.0)}
             _pin_rel0 = float(os.environ.get(
                 "SM_VACE_LR_PIN_RELEASE", "").strip() or WP_LR_PIN_RELEASE)
             if _pin_rel0 > 0:
@@ -5622,7 +5715,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                       _exp.get("refine")
                       or os.environ.get("SM_VACE_LR_REFINE", "").strip()
                       or WP_LR_REFINE),
-                  "refine_cond_still": True, "motion_score": 3.0}
+                  "refine_cond_still": True,
+                  # stage2の動き量は管理ノブ"motion"で調整可 (公式レンジ
+                  # 2.0-4.0、既定3.0=V3.2公式例の標準値)。stage1は3.0固定
+                  # (キー錨の錨自体を動かす変更は別実験に分離)
+                  "motion_score": _wp_knob_float(
+                      _kn, "motion", 3.0, 2.0, 4.0)}
         _pin_rel = float(os.environ.get("SM_VACE_LR_PIN_RELEASE", "").strip()
                          or WP_LR_PIN_RELEASE)
         if _pin_rel > 0:
