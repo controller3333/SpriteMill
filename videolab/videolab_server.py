@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.32"  # 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.34"  # 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4717,6 +4717,148 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
     return frames
 
 
+# パペット (2026-07-20ユーザー発案「骨に線画を貼り付けて動かす感じにすれば
+# アニメーションになるのかも」): 骨格キーポイントで線画をパーツ分割し、
+# ボーンごとの剛体ワープで「キャラ自身の線が歩く」制御ビデオを作る。
+# 骨の動きの正確さ×線画の同一性固定の合流。パーツ= (BODY_18の端点対)。
+_PUPPET_PARTS = ((2, 3), (3, 4), (5, 6), (6, 7),      # 腕 (上腕/前腕 左右)
+                 (8, 9), (9, 10), (11, 12), (12, 13),  # 脚 (腿/脛 左右)
+                 (1, 0))                               # 頭 (首→鼻)
+# 胴 = 首(1)と腰中点(8,11)の仮想セグメント (特別扱い)
+
+
+def _wp_puppet_frames(line_canvas, kps_frames, layout, w: int, h: int):
+    """線画キャンバス+フレーム別キーポイント → パペット制御フレーム列。
+
+    各セルの線画画素を「idle姿勢のどのボーンに最も近いか」で分割し、
+    フレームごとに idleボーン→現フレームボーン の相似変換でワープして
+    再合成する。関節の割れ・パーツ重なりは制御用途では許容 (VACEが均す)。"""
+    import numpy as np
+    from PIL import Image
+    cols, rows, dirs = layout
+    cw, ch = w // cols, h // rows
+    la = np.asarray(line_canvas.convert("L"))
+    idle = kps_frames[0]
+    n_cells = len(idle) if idle else 0
+
+    def _seg_pts(kps):
+        segs = []
+        for a, b in _PUPPET_PARTS:
+            if kps[a] is not None and kps[b] is not None:
+                segs.append((np.array(kps[a]), np.array(kps[b])))
+            else:
+                segs.append(None)
+        # 胴: 首→腰中点
+        if kps[1] is not None and kps[8] is not None and kps[11] is not None:
+            hip = (np.array(kps[8]) + np.array(kps[11])) / 2.0
+            segs.append((np.array(kps[1]), hip))
+        else:
+            segs.append(None)
+        return segs
+
+    # セル矩形をdirs順に (Noneセルはキーポイント記録に現れない)
+    cell_rects = []
+    ci = 0
+    for i, d in enumerate(dirs):
+        if d is None:
+            continue
+        cell_rects.append(((i % cols) * cw, (i // cols) * ch))
+        ci += 1
+    cell_rects = cell_rects[:n_cells]
+
+    # パーツ割り当て (セルごとに1回)
+    cell_parts = []          # [(part_layers, idle_segs, (ox,oy))]
+    for ci, (ox, oy) in enumerate(cell_rects):
+        segs0 = _seg_pts(idle[ci])
+        sub = la[oy:oy + ch, ox:ox + cw]
+        ys, xs = np.nonzero(sub > 40)
+        if not len(ys):
+            cell_parts.append(None)
+            continue
+        pts = np.stack([xs + ox, ys + oy], axis=1).astype(np.float64)
+        dists = np.full((len(pts), len(segs0)), 1e9)
+        for si, seg in enumerate(segs0):
+            if seg is None:
+                continue
+            p0, p1 = seg
+            v = p1 - p0
+            vv = float(v @ v) or 1.0
+            t = np.clip(((pts - p0) @ v) / vv, 0.0, 1.0)
+            proj = p0[None, :] + t[:, None] * v[None, :]
+            dists[:, si] = np.linalg.norm(pts - proj, axis=1)
+        # 頭の所有権を優先 (2026-07-20ユーザー指摘「これ後頭部割れますよw」):
+        # 最近傍だけだと後頭部の線が胴パーツに取られ、頭がボブした瞬間に
+        # 頭蓋の線が泣き別れる。①頭セグメント距離に0.5バイアス (髭など
+        # アゴ下の頭部要素も頭へ)、②首より上の画素は無条件で頭
+        _head_si = len(_PUPPET_PARTS) - 1          # (1,0)=首→鼻
+        dists[:, _head_si] *= 0.5
+        owner = np.argmin(dists, axis=1)
+        _neck = idle[ci][1]
+        if _neck is not None and segs0[_head_si] is not None:
+            owner[pts[:, 1] < float(_neck[1])] = _head_si
+        layers = []
+        for si in range(len(segs0)):
+            sel = owner == si
+            if not sel.any() or segs0[si] is None:
+                layers.append(None)
+                continue
+            lay = np.zeros((ch, cw), dtype=np.uint8)
+            lay[ys[sel], xs[sel]] = sub[ys[sel], xs[sel]]
+            layers.append(Image.fromarray(lay, "L"))
+        cell_parts.append((layers, segs0, (ox, oy)))
+
+    def _sim_affine(p0, p1, q0, q1):
+        """相似変換 q=T(p): p0->q0, p1->q1 の PIL逆係数 (dst->src)。"""
+        vp, vq = p1 - p0, q1 - q0
+        lp = float(np.hypot(*vp)) or 1.0
+        lq = float(np.hypot(*vq)) or 1.0
+        s = lq / lp
+        ang = np.arctan2(vq[1], vq[0]) - np.arctan2(vp[1], vp[0])
+        ca, sa = np.cos(ang), np.sin(ang)
+        # 順方向: q = s*R*(p-p0)+q0 → 逆: p = R^-1*(q-q0)/s + p0
+        inv_s = 1.0 / s
+        a, b = ca * inv_s, sa * inv_s
+        # PIL transform係数 (x_src = a*x+b*y+c, y_src = d*x+e*y+f)
+        c = p0[0] - a * q0[0] - b * q0[1]
+        d2, e2 = -sa * inv_s, ca * inv_s
+        f2 = p0[1] + sa * inv_s * q0[0] - ca * inv_s * q0[1]
+        return (a, b, c, d2, e2, f2)
+
+    frames = []
+    cache = {}
+    for kf in kps_frames:
+        key = tuple(
+            tuple((round(p[0], 1), round(p[1], 1)) if p else None
+                  for p in kps)
+            for kps in kf)
+        if key in cache:
+            frames.append(cache[key])
+            continue
+        canvas = np.zeros((h, w), dtype=np.uint8)
+        for ci, cp in enumerate(cell_parts):
+            if cp is None or ci >= len(kf):
+                continue
+            layers, segs0, (ox, oy) = cp
+            segsF = _seg_pts(kf[ci])
+            for si, lay in enumerate(layers):
+                if lay is None or segsF[si] is None or segs0[si] is None:
+                    continue
+                p0, p1 = segs0[si]
+                q0, q1 = segsF[si]
+                # セルローカル座標へ
+                co = _sim_affine(p0 - (ox, oy), p1 - (ox, oy),
+                                 q0 - (ox, oy), q1 - (ox, oy))
+                warped = lay.transform((cw, ch), Image.AFFINE, co,
+                                       resample=Image.BILINEAR)
+                wa = np.asarray(warped)
+                region = canvas[oy:oy + ch, ox:ox + cw]
+                np.maximum(region, wa, out=region)
+        fr = Image.fromarray(canvas, "L").convert("RGB")
+        cache[key] = fr
+        frames.append(fr)
+    return frames
+
+
 def _wp_flying_frames(frames, idle_n: int, gait_end: int, canvas_h: int):
     """飛行用poseフレーム列: 先頭の直立骨格を全フレームに使い、歩行窓だけ
     上下ボブ (sin・2往復) を与える。ノブで脚振りを最小化しても、歩行骨格を
@@ -5637,7 +5779,27 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                        .strip().lower() not in ("off", "0", "false", "no"))
                       and not (_exp.get("edge_idle") or _exp.get("edge_head")
                                or _exp.get("no_pose")))
-        if plan == "biped":
+        if plan == "biped" and _exp.get("line_puppet"):
+            # 実験c (2026-07-20ユーザー発案「骨に線画を貼り付けて動かす」):
+            # 骨格キーポイントで線画をパーツ分割し、ボーン相似変換で
+            # 「キャラ自身の線が歩く」制御ビデオを作る。骨の動きの正確さ×
+            # 線画の同一性固定の合流。idle窓もパペット線画を出す (idle変換=
+            # 恒等=立ち絵自身の線なのでfree_idleの矛盾問題は起きない)
+            _krec = []
+            pv.build_canvas_pose_frames(refs, nf, w, h, layout,
+                                        kps_out=_krec)
+            _lcv = _wp_edge_canvas(cv, refs, w, h, layout)
+            if _lcv.size != (w, h):
+                _lcv = _lcv.resize((w, h))
+            frames = _wp_puppet_frames(_lcv, _krec, layout, w, h)
+            try:
+                frames[idle_n].save(out / f"control_{tag}_idle.png")
+                frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                    out / f"control_{tag}_move.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            log(f"[{tag}] 実験line_puppet: 線画パペット制御 (骨で線を駆動)")
+        elif plan == "biped":
             _fp_save = os.environ.get("SM_POSE_FACE_POINTS")
             if _edge_face:
                 # noeyes=目とface68だけ消す (2026-07-20実走の教訓: 全消しは
@@ -5745,7 +5907,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # 実証)、骨格開始境界 f6 前後も全数検査でクリーン。flyingは
             # キー錨既定で充分な実績があり未検証のため見送り。自然移動
             # 体格は全フレーム黒なので対象外 (再ブランクは無意味)
-            _free = plan not in (("flying",) + _WP_NAT_PLANS)
+            _free = (plan not in (("flying",) + _WP_NAT_PLANS)
+                     and not _exp.get("line_puppet"))
         if _free:
             from PIL import Image as _ImgF
             _blkF = _ImgF.new(frames[0].mode, frames[0].size, 0)
@@ -7075,6 +7238,8 @@ def build_app(token: str | None):
             exp["depth_move"] = True   # 実験b: 実測深度+手続き運動 (非二足)
         if (body or {}).get("line_move"):
             exp["line_move"] = True    # 実験b: 実測線画+手続き運動 (非二足)
+        if (body or {}).get("line_puppet"):
+            exp["line_puppet"] = True  # 実験c: 骨駆動の線画パペット (二足)
         elif False:
             # 実験 (2026-07-20ユーザー診断「四肢の状態まで元の絵に合わせて
             # 開始しないとおかしくなる」— 足開きスタンスの立ち絵×足閉じ
