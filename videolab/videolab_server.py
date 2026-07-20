@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.21"  # 0.10.21: 隣セル見切れ欠片の除去 (_wp_drop_stray: キー後の孤立成分のうち縁接触かつ本体5%以下だけ透明化。神爺さんfront歩行1コマ目の実障害) / 0.10.20: 取り残し根治3点 (実障害4eb7f4ce) — ①生成中ハートビート120s毎+stale拾い直し7800s→900s ②SIGTERM/自己停止で請負をpack_readyへ解放 ③取り込み窓のアイドル時計更新+停止後の新規請負拒否。finishの読み直し/保存も有界リトライ化
+__version__ = "0.10.22"  # 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4728,6 +4728,51 @@ _WP_HOVER_PROMPT = (
     "animation."
 )
 
+# 共通拘束 (セル固定・向き固定・カメラ固定・マゼンタ背景)。体格別文面の
+# 語尾に連結する (2026-07-20 赤さん実障害: quadrupedにも歩行文面が出て
+# ハイハイが直立歩行に化けた)
+_WP_CELL_LOCK = (
+    " Every figure stays centered in its own cell and keeps facing its own "
+    "fixed direction the entire time; the body and head never turn, rotate, "
+    "spin, or change direction. The character never stands up on two legs "
+    "and never changes its overall posture from the reference. Static "
+    "locked-off tripod camera, fixed frame, no camera movement, no pan, no "
+    "zoom, no orbit. Plain flat magenta background, smooth seamless looping "
+    "animation."
+)
+
+# 非二足の「自然移動」体格 -> 動きの文面。骨格は出さず (二足マネキンしか
+# 無いため)、キー錨+立ち絵と文面だけで動きを誘導する
+_WP_PLAN_PROMPTS = {
+    "quadruped": (
+        "A game character sprite sheet: the same character shown in several "
+        "fixed compass cells. Each figure moves on all fours in place with "
+        "a steady four-legged gait -- hands/front limbs and knees/hind "
+        "limbs alternate in a natural crawling rhythm while the body stays "
+        "low to the ground the entire time."
+    ),
+    "serpentine": (
+        "A game character sprite sheet: the same character shown in several "
+        "fixed compass cells. Each figure slithers in place with a smooth "
+        "serpentine undulation -- the body waves side to side in a steady "
+        "rhythm, staying low to the ground, with no legs and no steps."
+    ),
+    "amorphous": (
+        "A game character sprite sheet: the same character shown in several "
+        "fixed compass cells. Each figure bounces and squishes in place "
+        "with a soft rhythmic wobble -- the whole body gently squashes and "
+        "stretches like a blob, keeping its overall silhouette."
+    ),
+    "other": (
+        "A game character sprite sheet: the same character shown in several "
+        "fixed compass cells. Each figure moves in place with the natural "
+        "locomotion that fits its body -- a subtle steady movement rhythm "
+        "that keeps the exact posture and silhouette of the reference."
+    ),
+}
+# 上記の体格 (walkpackで二足歩行骨格を当ててはいけないもの)
+_WP_NAT_PLANS = tuple(_WP_PLAN_PROMPTS)
+
 
 def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
                plan: str = "biped") -> str:
@@ -4742,8 +4787,13 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
     cv = eng["compass_vace"]
-    prompt = (_WP_HOVER_PROMPT if plan == "flying"
-              else cw.CANVAS_PROMPT) + cv.NO_WIND
+    if plan == "flying":
+        prompt = _WP_HOVER_PROMPT
+    elif plan in _WP_NAT_PLANS:
+        prompt = _WP_PLAN_PROMPTS[plan] + _WP_CELL_LOCK
+    else:
+        prompt = cw.CANVAS_PROMPT
+    prompt += cv.NO_WIND
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     try:
         fr = refs.get("front")
@@ -4760,6 +4810,10 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
             prompt += (" At the very end of the video every figure stops "
                        "bobbing and hovers perfectly still at the same "
                        "fixed height and pose as the first frames.")
+        elif plan in _WP_NAT_PLANS:
+            prompt += (" At the very end of the video every figure stops "
+                       "moving and rests perfectly still in exactly the "
+                       "same pose as the first frames.")
         else:
             prompt += (" At the very end of the video every figure stops "
                        "walking and stands perfectly still in the same "
@@ -5304,6 +5358,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     plan = str((meta or {}).get("body_plan") or "biped").strip() or "biped"
     if plan == "flying":
         _wp_print("[walkpack] body_plan=flying: ホバリング文面+骨格ノブで生成")
+    elif plan in _WP_NAT_PLANS:
+        # (2026-07-20 赤さん実障害「ハイハイを無理やり二足歩行に」): 非二足は
+        # 二足マネキン骨格が姿勢を直立へ引っ張るため骨格制御を出さず、
+        # キー錨 (立ち絵由来のstage1固定) + 体格別文面だけで動きを誘導する
+        _wp_print(f"[walkpack] body_plan={plan}: 自然移動ルート "
+                  "(二足骨格なし+キー錨+体格別文面)")
     eng = _engine()
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
@@ -5325,18 +5385,20 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
-    if plan == "flying" and not _exp:
+    if plan in (("flying",) + _WP_NAT_PLANS) and not _exp:
         # ★飛行の既定=キー錨方式 (2026-07-19ユーザー発案→イーリス/ドラゴン
         # 2体のA/Bで昇格確定): 均等5キー+末尾静止をlatent固定し、中間は
         # σ0.9でAniSoraに生成させる。σ0.45の全体浅がけより羽ばたきが
         # 生き生きし、骨格に無い部位 (尻尾・翼) の「無条件区間の発明」
         # (浮いた尻尾の塊等) も固定間隔が短くなることで実測で消えた。
+        # 自然移動体格 (quadruped等) も同方式: 骨格が無い分、立ち絵由来の
+        # stage1キーが姿勢の錨になる (2026-07-20)。
         # APIの pin_conf/refine 明示指定はこの既定より優先される
         _keys = sorted({0, gait_end // 4, gait_end // 2,
                         gait_end * 3 // 4, gait_end}
                        | set(range(gait_end + 1, nf)))
         _exp = {"pin_conf": ",".join(map(str, _keys)), "refine": 0.9}
-        _wp_print("[walkpack] 飛行: キー錨既定 "
+        _wp_print(f"[walkpack] {plan}: キー錨既定 "
                   f"(keys={_keys[:5]}+末尾静止, σ0.9)")
     pins = cv._lr_pin_frames(nf, str(_exp.get("pin_conf") or "on"))
     if _exp:
@@ -5359,7 +5421,15 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         j["detail"] = f"[{tag}] 骨格グリッド生成"
         log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
             f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
-        frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+        if plan in _WP_NAT_PLANS:
+            # 二足マネキンは非二足の姿勢を表現できず、直立骨格を出すと
+            # ハイハイ等が立ち上がる方向へ引っ張られる (赤さん実障害)。
+            # 全フレーム黒=制御なし。姿勢はキー錨(立ち絵由来)と文面が担う
+            from PIL import Image as _ImgN
+            frames = [_ImgN.new("RGB", (w, h), 0) for _ in range(nf)]
+            log(f"[{tag}] {plan}: 骨格制御なし (キー錨+文面で誘導)")
+        else:
+            frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
         if plan == "flying":
             # 歩行骨格は条件に出さない (上の _wp_flying_frames 参照)
             frames = _wp_flying_frames(frames, idle_n, gait_end, h)
@@ -5374,8 +5444,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # ユーザー診断「頭部問題の四肢版」)。姿勢権限を各フレーム1つに
             # すると増産が消え (神爺さん実証)、標準ポーズには無害 (ロップ
             # 実証)、骨格開始境界 f6 前後も全数検査でクリーン。flyingは
-            # キー錨既定で充分な実績があり未検証のため見送り
-            _free = plan != "flying"
+            # キー錨既定で充分な実績があり未検証のため見送り。自然移動
+            # 体格は全フレーム黒なので対象外 (再ブランクは無意味)
+            _free = plan not in (("flying",) + _WP_NAT_PLANS)
         if _free:
             from PIL import Image as _ImgF
             _blkF = _ImgF.new(frames[0].mode, frames[0].size, 0)
