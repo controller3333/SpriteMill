@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.28"  # 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.30"  # 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4704,6 +4704,13 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
             out.save(p)
             drefs[d] = p
         fr = cv_mod.compose_reference(drefs, w, h, layout).convert("RGB")
+        # ★セル間隙・レターボックスのマゼンタを黒へ正規化 (a-2と同じ教訓:
+        # 骨格キャンバスは全面黒地=マゼンタ混じりの制御は分布外)
+        import numpy as _npM
+        fa = _npM.asarray(fr).astype(_npM.int16)
+        mg = (_npM.minimum(fa[..., 0], fa[..., 2]) - fa[..., 1]) >= 70
+        fa[mg] = 0
+        fr = Image.fromarray(fa.astype("uint8"), "RGB")
         cache[key] = fr
         frames.append(fr)
     return frames
@@ -5663,15 +5670,41 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             _mode = "depth" if _exp.get("depth_move") else "line"
             frames = _wp_moving_frames(cv, refs, plan, nf, idle_n,
                                        gait_end, w, h, layout, mode=_mode)
+            try:                     # 何で誘導したか後から目視できるように
+                frames[idle_n].save(out / f"control_{tag}_idle.png")
+                frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                    out / f"control_{tag}_move.png")
+            except Exception:                 # noqa: BLE001
+                pass
             log(f"[{tag}] 実験{_mode}_move: {plan}の{_mode}制御 "
                 "(実測マップ+手続き運動)")
         else:
-            # 二足マネキンは非二足の姿勢を表現できず、直立骨格を出すと
-            # ハイハイ等が立ち上がる方向へ引っ張られる (赤さん実障害)。
-            # 姿勢はキー錨 (立ち絵由来) と文面が担う
-            from PIL import Image as _ImgN
-            frames = [_ImgN.new("RGB", (w, h), 0) for _ in range(nf)]
-            log(f"[{tag}] {plan}: 骨格制御なし (キー錨+文面で誘導)")
+            # ★深度制御が既定 (2026-07-20ユーザー発案「Depthを計測で動かす」
+            # → 赤さんr2/r3の2世代×3-way同条件比較で昇格確定):
+            # 立ち絵実測の疑似深度を体格別の手続き運動で動かして制御に流す。
+            # キー錨のみ (黒制御) は静止化・発明の温床だった — 形の権威と
+            # 動きの源を深度が同時供給する。SM_WP_NAT_CONTROL=none で
+            # 旧動作 (キー錨のみ)、=line で線画制御。
+            _nat_ctl = os.environ.get(
+                "SM_WP_NAT_CONTROL", "depth").strip().lower()
+            if _nat_ctl in ("depth", "line"):
+                frames = _wp_moving_frames(cv, refs, plan, nf, idle_n,
+                                           gait_end, w, h, layout,
+                                           mode=_nat_ctl)
+                try:
+                    frames[idle_n].save(out / f"control_{tag}_idle.png")
+                    frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                        out / f"control_{tag}_move.png")
+                except Exception:             # noqa: BLE001
+                    pass
+                log(f"[{tag}] {plan}: {_nat_ctl}制御既定 "
+                    "(実測マップ+手続き運動+キー錨)")
+            else:
+                # 旧動作: 二足マネキンは非二足の姿勢を表現できないため
+                # 全フレーム黒。姿勢はキー錨 (立ち絵由来) と文面が担う
+                from PIL import Image as _ImgN
+                frames = [_ImgN.new("RGB", (w, h), 0) for _ in range(nf)]
+                log(f"[{tag}] {plan}: 骨格制御なし (キー錨+文面で誘導)")
         if _edge_face:
             import numpy as _npE
             _hcv = _wp_edge_head_canvas(cv, refs, w, h, layout)
