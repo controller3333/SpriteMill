@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.31"  # 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.32"  # 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5680,14 +5680,15 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験{_mode}_move: {plan}の{_mode}制御 "
                 "(実測マップ+手続き運動)")
         else:
-            # ★深度制御が既定 (2026-07-20ユーザー発案「Depthを計測で動かす」
-            # → 赤さんr2/r3の2世代×3-way同条件比較で昇格確定):
-            # 立ち絵実測の疑似深度を体格別の手続き運動で動かして制御に流す。
-            # キー錨のみ (黒制御) は静止化・発明の温床だった — 形の権威と
-            # 動きの源を深度が同時供給する。SM_WP_NAT_CONTROL=none で
-            # 旧動作 (キー錨のみ)、=line で線画制御。
+            # ★線画制御が既定 (2026-07-20夜、ユーザー目視判定で深度から反転:
+            # 「深度だと細かいディテールが崩れるが、ラインアートだと完璧に
+            # 維持」— スライム娘の前髪の房で実証)。深度ドームは体積しか
+            # 語らず内部線は毎スパン再創作になるが、線画は内部エッジを毎
+            # フレーム明示するので同一性が固定される。動きの振幅は深度が
+            # 僅差で上だが、スプライトは同一性が王様。
+            # SM_WP_NAT_CONTROL=depth/none、管理ノブnat_controlで切替可。
             _nat_ctl = os.environ.get(
-                "SM_WP_NAT_CONTROL", "depth").strip().lower()
+                "SM_WP_NAT_CONTROL", "line").strip().lower()
             if _nat_ctl in ("depth", "line"):
                 frames = _wp_moving_frames(cv, refs, plan, nf, idle_n,
                                            gait_end, w, h, layout,
