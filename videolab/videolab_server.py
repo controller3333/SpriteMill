@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.18"  # 0.10.18: 実験ノブfree_idle (idle/静止窓の骨格制御を撤去=立ち絵の四肢姿勢を尊重。足開き立ち絵×標準骨格の脚増産への対策、2026-07-20ユーザー診断)
+__version__ = "0.10.19"  # 0.10.19: free_idleを非flyingの既定へ昇格 (静止窓の姿勢権限を立ち絵に一本化=四肢増産の根治。神爺さん改善+ロップ無害+遷移帯クリーンの3点実証)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -5307,7 +5307,18 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             frames = _wp_flying_frames(frames, idle_n, gait_end, h)
             log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
         canvas = cv.compose_reference(refs, w, h, layout)
-        if _exp.get("free_idle"):
+        _free = _exp.get("free_idle")
+        if _free is None:
+            # ★既定ON (2026-07-20昇格): idle/末尾静止窓の骨格制御を出さず、
+            # 立ち絵自身に姿勢を委ねる。静止フレームに「参照の姿勢」と
+            # 「骨格の標準姿勢」が同時に権利主張する重ね合わせが四肢増産の
+            # 正体だった (足開きローブの神爺さんで脚が増える実障害。
+            # ユーザー診断「頭部問題の四肢版」)。姿勢権限を各フレーム1つに
+            # すると増産が消え (神爺さん実証)、標準ポーズには無害 (ロップ
+            # 実証)、骨格開始境界 f6 前後も全数検査でクリーン。flyingは
+            # キー錨既定で充分な実績があり未検証のため見送り
+            _free = plan != "flying"
+        if _free:
             from PIL import Image as _ImgF
             _blkF = _ImgF.new(frames[0].mode, frames[0].size, 0)
             frames = [_blkF if (k < idle_n or k > gait_end) else fr
@@ -6508,7 +6519,9 @@ def build_app(token: str | None):
             # 翼がbackへ吸われる疑い): 3x3コンパス配置 (隣=隣接角度) で
             # 同条件生成して比較する
             exp["layout"] = "compass"
-        if (body or {}).get("free_idle"):
+        if "free_idle" in (body or {}):
+            exp["free_idle"] = bool(body["free_idle"])
+        elif False:
             # 実験 (2026-07-20ユーザー診断「四肢の状態まで元の絵に合わせて
             # 開始しないとおかしくなる」— 足開きスタンスの立ち絵×足閉じ
             # idle骨格で脚が増産される実例): idle/末尾静止の制御を黒=無条件
