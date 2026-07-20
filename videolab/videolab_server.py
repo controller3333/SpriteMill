@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.16"  # 0.10.16: コンパス3x3をwalkpack既定へ昇格 (VRAM40GB以上。隣接汚染根治=尻尾発明/板翼の消滅を3体で実証。半球はlayout="hemi"で残置)
+__version__ = "0.10.18"  # 0.10.18: 実験ノブfree_idle (idle/静止窓の骨格制御を撤去=立ち絵の四肢姿勢を尊重。足開き立ち絵×標準骨格の脚増産への対策、2026-07-20ユーザー診断)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4828,14 +4828,23 @@ def _wp_wait(j: dict, sub: str, lo: float, hi: float) -> dict:
 
 
 def _wp_split(eng: dict, ffmpeg: str, cvid: Path, layout, refs: dict,
-              char: str, out: Path, idle_n: int, gait_end, log) -> None:
+              char: str, out: Path, idle_n: int, gait_end, log,
+              canvas_w: int = None, canvas_h: int = None) -> None:
     """キャンバスmp4を方向別セルへ。color_anchor があれば
     分割+カラーアンカー+拡大の単一パス、失敗時は素のcrop分割
-    (canvas_walk.split_canvas_video の簡易移植) へ後退。"""
+    (canvas_walk.split_canvas_video の簡易移植) へ後退。
+
+    ★セル寸法は必ず実キャンバス寸法から割ること (2026-07-20実障害):
+    旧実装はグローバル定数 WALKPACK_W/H (480x864=半球前提) を直書きして
+    おり、コンパス3x3 (720x1296) では160x288の窓で左上領域だけを切る
+    壊れた分割になった。dir mp4は「存在するが中身が誤領域」で、キーイング
+    空→シート組立が無言スキップ→空manifest→「DLできない」(バイクr4/r5・
+    ファッティーナの実障害)。"""
     cv = eng["compass_vace"]
     idx_of = eng["canvas_walk"].IDX
     cols, rows = layout[0], layout[1]
-    cw, ch = WALKPACK_W // cols, WALKPACK_H // rows
+    cw = (canvas_w or WALKPACK_W) // cols
+    ch = (canvas_h or WALKPACK_H) // rows
     jobs = []
     for i, d in enumerate(layout[2]):
         if d is None:
@@ -5298,6 +5307,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             frames = _wp_flying_frames(frames, idle_n, gait_end, h)
             log(f"[{tag}] 飛行: 骨格を直立+上下ボブ列に差し替え")
         canvas = cv.compose_reference(refs, w, h, layout)
+        if _exp.get("free_idle"):
+            from PIL import Image as _ImgF
+            _blkF = _ImgF.new(frames[0].mode, frames[0].size, 0)
+            frames = [_blkF if (k < idle_n or k > gait_end) else fr
+                      for k, fr in enumerate(frames)]
+            log(f"[{tag}] free_idle: idle/静止の骨格制御を撤去 "
+                "(立ち絵の姿勢を尊重)")
         if _exp.get("edge_idle"):
             _ecv = _wp_edge_canvas(cv, refs, w, h, layout)
             if _ecv.size != frames[0].size:
@@ -5386,7 +5402,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 pass
             j["detail"] = f"[{tag}] セル分割"
             _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
-                      idle_n, gait_end if tail else None, log)
+                      idle_n, gait_end if tail else None, log,
+                      canvas_w=w, canvas_h=h)
             return
         _wm1 = "mock" if j.get("_wp_mock") else "vace"
         jid1 = submit_job(_wm1, GenRequest(
@@ -5434,7 +5451,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         shutil.copy2(sj2["path"], cvid)
         j["detail"] = f"[{tag}] セル分割"
         _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
-                  idle_n, gait_end if tail else None, log)
+                  idle_n, gait_end if tail else None, log,
+                  canvas_w=w, canvas_h=h)
 
     _lay_req = str(_exp.get("layout") or "").strip()
     if _lay_req == "compass":
@@ -6490,6 +6508,13 @@ def build_app(token: str | None):
             # 翼がbackへ吸われる疑い): 3x3コンパス配置 (隣=隣接角度) で
             # 同条件生成して比較する
             exp["layout"] = "compass"
+        if (body or {}).get("free_idle"):
+            # 実験 (2026-07-20ユーザー診断「四肢の状態まで元の絵に合わせて
+            # 開始しないとおかしくなる」— 足開きスタンスの立ち絵×足閉じ
+            # idle骨格で脚が増産される実例): idle/末尾静止の制御を黒=無条件
+            # にして、立ち絵と骨格標準姿勢のポーズ矛盾を発生源から消す。
+            # 歩行窓は骨格が握るので向きの錨は維持される
+            exp["free_idle"] = True
         if (body or {}).get("edge_head"):
             # 実験a-4: 動きの窓に頭部限定エッジ (ボブ追従) を敷く
             exp["edge_head"] = True
