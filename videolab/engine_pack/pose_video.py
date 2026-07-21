@@ -316,6 +316,64 @@ def walk_angles_at(phase: float, arm_swing: float = 1.0,
     return ang
 
 
+def _gait_mode() -> str:
+    """SM_POSE_GAIT: walk (既定) / crawl = 四つん這い (体格メニュー
+    「四足歩行(骨格固定)」2026-07-21ユーザー裁定「人型骨格を四つん這いに
+    して四足に対応」)。"""
+    v = os.environ.get("SM_POSE_GAIT", "walk").strip().lower()
+    return "crawl" if v == "crawl" else "walk"
+
+
+def _crawl_J(fig: Figure, angles: dict) -> dict:
+    """四つん這い(ハイハイ)の関節ワールド座標。
+
+    人型骨格をクロール姿勢に組み直す: 膝と手が接地・胴ほぼ水平・頭は
+    前方で持ち上げ。歩容は WALK_POSES の振り角を流用し、対角肢 (右手+
+    左膝が同時に前) が自然に成立する (WALK_POSESが元々 shR=-hipR 系の
+    対角位相)。寸法は fig.total (立ち身長) 基準の比率で組む — 参照の
+    ハイハイ立ち絵の bbox に写像されるのはセル側のレターボックスなので、
+    ここでは解剖学的な比率よりクロールらしい輪郭を優先する。
+    座標系: y=上, z=前 (進行方向), 接地面 y=0。"""
+    import math as _m
+    T = fig.total
+    hipx = fig.sh_x * 0.9
+    J: dict = {}
+    # 脚: 腰(後方)から腿が下へ、振り角で前後スイング。膝が接地点
+    for side, tag in ((+1, "R"), (-1, "L")):
+        phi = _m.radians(float(angles.get(f"hip{tag}", 0.0)) * 0.55)
+        hip = (side * hipx, 0.36 * T, -0.30 * T)
+        knee = (hip[0], hip[1] - 0.36 * T * _m.cos(phi),
+                hip[2] + 0.36 * T * _m.sin(phi))
+        # 脛は膝から後方へ寝かせる (すね接地・足は後ろで軽く浮く)
+        ankle = (knee[0], knee[1] + 0.04 * T, knee[2] - 0.30 * T)
+        toe = (ankle[0], ankle[1] + 0.02 * T, ankle[2] - 0.10 * T)
+        J[f"hip_{tag}"] = hip
+        J[f"knee_{tag}"] = knee
+        J[f"ankle_{tag}"] = ankle
+        J[f"toe_{tag}"] = toe
+    # 腕=前脚: 肩(前方)から真下へ、振り角で前後スイング。手が接地点
+    for side, tag in ((+1, "R"), (-1, "L")):
+        psi = _m.radians(float(angles.get(f"sh{tag}", 0.0)) * 0.55)
+        sh = (side * fig.sh_x, 0.42 * T, 0.18 * T)
+        elbow = (sh[0], sh[1] - 0.22 * T * _m.cos(psi),
+                 sh[2] + 0.22 * T * _m.sin(psi))
+        psi2 = psi * 1.15
+        wrist = (elbow[0], elbow[1] - 0.20 * T * _m.cos(psi2),
+                 elbow[2] + 0.20 * T * _m.sin(psi2))
+        J[f"sh_{tag}"] = sh
+        J[f"elbow_{tag}"] = elbow
+        J[f"wrist_{tag}"] = wrist
+    # 胴・首・頭: 頭は前方で持ち上げて前を見る (ハイハイの赤ちゃん)
+    J["neck"] = (0.0, 0.46 * T, 0.22 * T)
+    hr = getattr(fig, "face_r", fig.head_r)
+    J["head_c"] = (0.0, 0.46 * T + hr * 0.9, 0.30 * T)
+    J["chin"] = (J["head_c"][0], J["head_c"][1] - hr * 0.6,
+                 J["head_c"][2] + hr * 0.5)
+    J["head_top"] = (0.0, J["head_c"][1] + hr * 0.9, J["head_c"][2])
+    J["torso"] = (0.0, 0.40 * T, -0.05 * T)
+    return J
+
+
 def _ground_shift(fig: Figure, angles: dict, leg_cross: float = 1.0,
                   gait: bool = False) -> float:
     """接地補正量 (ワールドy)。低い方の足首を接地線に着けるための沈み込み。
@@ -325,6 +383,8 @@ def _ground_shift(fig: Figure, angles: dict, leg_cross: float = 1.0,
     「直立時の足首高さ」の差だけ全身を沈めると、接地で最低・通過で最高の
     自然な上下動 (振幅≈脚長×(1-cos振り角)≈脚長の1割) が幾何から生まれ、
     足も毎フレーム接地する。"""
+    if _gait_mode() == "crawl":
+        return 0.0        # 四つん這いは膝・手の接地が幾何から常に成立
     J = fig.joints(**{k: angles[k] for k in _ANGLE_KEYS},
                    leg_cross=leg_cross, gait=gait)
     nominal = fig.hip_y - fig.leg_upper - fig.leg_lower   # 直立時の足首y
@@ -408,18 +468,27 @@ def _keypoints(fig: Figure, angles: dict, yaw: float, scale: float,
     キャラの鼻が実際の顔より前に出る=首前傾スマホ首宣言の矯正)。"""
     if yaw_head is None:
         yaw_head = yaw
-    J = fig.joints(**angles, leg_cross=leg_cross, gait=gait)
+    _crawl = _gait_mode() == "crawl"
+    if _crawl:
+        # 頭中心が体軸から前方 (z=0.30T) に外れているため、頭別ヨーだと
+        # 顔クラスタが首から分離する — crawlは頭=体ヨーに固定 (ハイハイの
+        # 頭は進行方向を向くので語彙上も正しい)
+        yaw_head = yaw
+    J = (_crawl_J(fig, angles) if _crawl
+         else fig.joints(**angles, leg_cross=leg_cross, gait=gait))
     kps: list = [None] * 18
-    # Neck = 肩の中点 (mannequin の肩と同じ高さ・中心)
-    kps[1] = _project((0.0, fig.shoulder_y - 0.01, 0.0), yaw, scale, cx,
-                      base_y, total=fig.total)
+    # Neck = 肩の中点 (mannequin の肩と同じ高さ・中心)。crawlは前方の首
+    kps[1] = _project(J["neck"] if _crawl
+                      else (0.0, fig.shoulder_y - 0.01, 0.0),
+                      yaw, scale, cx, base_y, total=fig.total)
     for op_i, name in _BODY_MAP.items():
         kps[op_i] = _project(J[name], yaw, scale, cx, base_y,
                              total=fig.total)
     # 顔: 頭中心 + r単位オフセット、法線カリング。face_r はキャラ実測の
     # 頭幅から入る上書き (無ければ絶対系の頭半径)。耳が髪の外に浮くと
-    # VACEがそこに点を描く (2026-07-12 ロップ実害) ため輪郭内に収める
-    hc = (0.0, fig.head_cy, 0.0)
+    # VACEがそこに点を描く (2026-07-12 ロップ実害) ため輪郭内に収める。
+    # crawlは前方へ持ち上げた頭中心を使う (顔は進行方向を向く)
+    hc = J["head_c"] if _crawl else (0.0, fig.head_cy, 0.0)
     r = getattr(fig, "face_r", fig.head_r)
     for op_i, (off, n, thr) in _FACE_PTS.items():
         nn = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2)
@@ -565,6 +634,20 @@ def _face_skip_idx() -> tuple:
     return ()
 
 
+_LEGS_KEEP = (8, 9, 10, 11, 12, 13)   # 腰・膝・足首 (左右)
+
+
+def _body_parts_mode() -> str:
+    """SM_POSE_BODY_PARTS: full (既定) / legs = 腰から下 (8-13) だけ描く。
+
+    2026-07-21実験h (走る忍者実障害): 参照立ち絵が全方向「走りの途中」
+    (前傾・拳・片脚上げ) の依頼に直立歩行骨格の上半身を毎回被せると、
+    参照と制御の全面矛盾で二重人格化・ブロブ発明・頭身潰れが起きた。
+    脚だけ骨格で誘導し、上半身の姿勢権威を参照立ち絵へ返す折衷モード。"""
+    v = os.environ.get("SM_POSE_BODY_PARTS", "full").strip().lower()
+    return "legs" if v in ("legs", "legs_only") else "full"
+
+
 def _draw_openpose_onto(img: Image.Image, kps: list,
                         face68: list | None = None) -> None:
     """既存キャンバスへ1人分のOpenPose骨格を重ね描きする (グリッド用)。
@@ -574,7 +657,9 @@ def _draw_openpose_onto(img: Image.Image, kps: list,
     衝突しない)。SM_POSE_FACE_POINTS=noeyes は目とface68だけ・off は
     顔点全部を描かない (_face_points_mode 参照)。"""
     dr = ImageDraw.Draw(img)
-    skip = _face_skip_idx()
+    skip = set(_face_skip_idx())
+    if _body_parts_mode() == "legs":
+        skip.update(i for i in range(18) if i not in _LEGS_KEEP)
     sw = max(2, round(4 * min(img.width, img.height) / 512.0))  # 標準4px@512
     for li, (a, b) in enumerate(OP_LIMBS):
         if kps[a] is None or kps[b] is None:
@@ -2058,6 +2143,32 @@ def build_canvas_pose_frames(dir_refs: dict, num_frames: int,
         if hem_abs is not None:
             a_hide = (os.environ.get("SM_POSE_SKIRT_FEET", "auto")
                       .strip().lower() in ("off", "0", "false", "no"))
+        if _gait_mode() == "crawl":
+            # クロール骨格は標準写像 (直立身長→bbox高) だと食み出す:
+            # z奥行き0.85T×俯瞰投影で前後ビューが縦に膨らみ、巨頭チビは
+            # 頭基準スケールで四肢が参照外へ出る (2026-07-21実測)。
+            # idleポーズの投影bboxを実測し、参照キャラbboxへレターボックス
+            # 収容する縮尺・接地・中心へ補正する
+            _kps0 = _keypoints(fig0, dict(IDLE_POSE), yaw_v, scale,
+                               0.0, 0.0, 1.0, False, yaw_head=yaw_v)
+            _pts0 = [p for p in _kps0 if p is not None]
+            _ma = _fg_mask(ref)
+            _mys, _mxs = np.nonzero(_ma)
+            if len(_pts0) >= 6 and _mxs.size:
+                _xs0 = [p[0] for p in _pts0]
+                _ys0 = [p[1] for p in _pts0]
+                _bw = max(_xs0) - min(_xs0)
+                _bh = max(_ys0) - min(_ys0)
+                _asp = ((_mxs.max() - _mxs.min() + 1)
+                        / max(1, _mys.max() - _mys.min() + 1))
+                if _bw > 1 and _bh > 1:
+                    _k = min(chh / _bh, (chh * _asp) / _bw) * 0.96
+                    cells.append((yaw_v, yaw_h, fig0, scale * _k,
+                                  (ox + cx) - (min(_xs0) + max(_xs0))
+                                  / 2.0 * _k,
+                                  (oy + base_y) - max(_ys0) * _k, ff,
+                                  hem_abs, a_hide))
+                    continue
         cells.append((yaw_v, yaw_h, fig0, scale, ox + cx, oy + base_y, ff,
                       hem_abs, a_hide))
     n = max(2, int(num_frames))

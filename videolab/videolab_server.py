@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.42"  # 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.45"  # 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4665,9 +4665,51 @@ def _wp_move_params(plan: str, ph: float, cw: int, ch: int):
     return (0, round(-ch * 0.008 * abs(s)), 0.0, 1.0, 1.0)   # other
 
 
+def _wp_face_boxes(pack: Path) -> dict:
+    """pack/01_generation/face_boxes.json を読む (実験g3の顔限定線画用)。
+
+    形式: {方向: [x0, y0, x1, y1]} — 立ち絵画像に対する相対座標 (0..1)。
+    顔が見えない方向 (背面) は載せない。壊れた値は方向ごとに黙って捨てる
+    (顔なし扱い=そのセルは黒ギャップ)。"""
+    p = pack / "01_generation" / "face_boxes.json"
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                             # noqa: BLE001
+        return {}
+    out = {}
+    for d, v in (raw or {}).items():
+        try:
+            x0, y0, x1, y1 = (float(v[0]), float(v[1]),
+                              float(v[2]), float(v[3]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1:
+            out[str(d)] = (x0, y0, x1, y1)
+    return out
+
+
+def _wp_face_mask_ref(im, box):
+    """線画/深度リファレンスを顔ボックス (相対座標) だけ残して黒にする。
+    手続き運動の前に適用するので、顔線は全身と同じ運動に追従する。"""
+    import numpy as np
+    from PIL import Image
+    arr = np.array(im.convert("RGB"))
+    H0, W0 = arr.shape[:2]
+    x0 = max(0, int(round(box[0] * W0)))
+    y0 = max(0, int(round(box[1] * H0)))
+    x1 = min(W0, int(round(box[2] * W0)))
+    y1 = min(H0, int(round(box[3] * H0)))
+    keep = np.zeros((H0, W0), dtype=bool)
+    keep[y0:y1, x0:x1] = True
+    arr[~keep] = 0
+    return Image.fromarray(arr, "RGB")
+
+
 def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
                       gait_end: int, w: int, h: int, layout,
-                      mode: str = "depth"):
+                      mode: str = "depth", face_boxes: dict | None = None):
     """深度/線画リファレンスを体格別の手続き運動で動かした制御フレーム列。
 
     骨格語彙に依存しないので任意形状に対応する: 形の権威=立ち絵実測の
@@ -4678,8 +4720,14 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
     base_refs = {}
     for d, rp in refs.items():
         im = Image.open(rp)
-        base_refs[d] = (_wp_depth_ref(im) if mode == "depth"
-                        else _wp_edge_ref(im))    # line=a-2のキャラ限定線画
+        ref = (_wp_depth_ref(im) if mode == "depth"
+               else _wp_edge_ref(im))    # line=a-2のキャラ限定線画
+        if face_boxes is not None:
+            # 実験g3: 顔ボックスだけ残す (無い方向=背面等は全黒=制御なし)
+            ref = (_wp_face_mask_ref(ref, face_boxes[d])
+                   if d in face_boxes
+                   else Image.new("RGB", ref.size, 0))
+        base_refs[d] = ref
     win = max(1, gait_end - idle_n + 1)
     cw_cell, ch_cell = w // 3, h // 3   # compass想定 (hemiは呼ばない)
     tmp = Path(_tf.mkdtemp(prefix="depth_refs_"))
@@ -5086,6 +5134,9 @@ def _pack_extract(pid: str, raw: bytes) -> int:
                 dest = pack / "meta.json"
             elif name == "landmarks.json":
                 dest = pack / "01_generation" / "landmarks.json"
+            elif name == "face_boxes.json":
+                # 実験g3: VLM実測の顔ボックス (方向→相対座標)
+                dest = pack / "01_generation" / "face_boxes.json"
             elif name == "template.json":
                 # 依頼のシート形式 (母艦が templates/<name>.json を同梱)。
                 # ★これを落とすと _wp_sheet_layout が見つけられず、無言で
@@ -5213,7 +5264,8 @@ _WP_NO_PROPS = (
 
 
 def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
-               plan: str = "biped") -> str:
+               plan: str = "biped", gait_run: bool = False,
+               keep_posture: bool = False) -> str:
     """CANVAS_PROMPT + NO_WIND + (スカート/末尾静止節) + 方向明文。
 
     顔正面化/体ヨー追従の発動判定は compass_vace._run_layout と同じく
@@ -5233,6 +5285,26 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
         prompt = cw.CANVAS_PROMPT
     if plan == "biped":
         prompt += cv.NO_WIND
+        if keep_posture:
+            # biped_legs (体格メニュー「二足歩行(脚のみ固定)」): 上半身の
+            # 姿勢権威は参照立ち絵。歩様は参照ポーズが示すリズムに委ねる
+            prompt += (" The torso, head and arms of every figure keep "
+                       "exactly the posture shown in the reference art "
+                       "through the whole cycle -- only the legs move, "
+                       "cycling in the rhythm the reference pose implies "
+                       "(a walk, or a fast run if the pose is a running "
+                       "stance).")
+        if gait_run:
+            # 実験h (2026-07-21「走る忍者」): 依頼が走りの動き。guidance=1.0
+            # でネガ無効のため正宣言のみ。上半身は参照姿勢の維持を明言する
+            # (legs_onlyで骨格の上半身権威を外した分の言い分)
+            prompt += (" LOCOMOTION: every figure is RUNNING in place, "
+                       "not walking -- a fast sprint cycle: knees driving "
+                       "high, rear foot kicking up, strong forward lean. "
+                       "The torso, head and arms keep exactly the posture "
+                       "shown in the reference art (the bent-forward "
+                       "running stance with clenched fists) through the "
+                       "whole cycle; only the legs cycle rapidly.")
     else:
         # 歩かない体格では「歩行由来の揺れ」文言が空転する (文意の整合)。
         # あわせて発明抑制節 (_WP_NO_PROPS) を宣言する
@@ -5800,7 +5872,19 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     latent_refine 分岐のサーバ内部版 (submit_job で自サーバの実ジョブを
     投入し、このオーケストレーションスレッドが完了をポーリングする)。"""
     _wp_apply_pose_defaults()     # 姿勢の既定値 (腕/脚の振り・上下動・交差)
-    plan = str((meta or {}).get("body_plan") or "biped").strip() or "biped"
+    plan_raw = str((meta or {}).get("body_plan") or "biped").strip() or "biped"
+    # 体格メニュー8種 (2026-07-21ユーザー要望): 亜種はベース体格へ正規化し、
+    # 差分は文面/骨格モードで表現する。
+    #   biped_legs     = 二足歩行(脚のみ固定): 骨格=脚だけ+上半身は参照姿勢
+    #                    (走る忍者実障害で実証した実験hの正式化)
+    #   quadruped_bone = 四足歩行(骨格固定): 人型骨格を四つん這いに変形
+    plan = {"biped_legs": "biped",
+            "quadruped_bone": "quadruped"}.get(plan_raw, plan_raw)
+    if plan_raw == "biped_legs":
+        _wp_print("[walkpack] body_plan=biped_legs: 骨格=脚のみ "
+                  "(上半身の姿勢は参照立ち絵に委ねる)")
+    elif plan_raw == "quadruped_bone":
+        _wp_print("[walkpack] body_plan=quadruped_bone: 四つん這い骨格")
     if plan == "flying":
         _wp_print("[walkpack] body_plan=flying: ホバリング文面+骨格ノブで生成")
     elif plan in _WP_NAT_PLANS:
@@ -5830,7 +5914,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
-    if plan in (("flying",) + _WP_NAT_PLANS) and not _exp:
+    if plan_raw == "biped_legs":
+        # 体格メニューの正式経路 (実験hの昇格): 骨格=脚のみ+姿勢維持文面
+        _exp.setdefault("legs_only", True)
+        _exp.setdefault("keep_posture", True)
+    if (plan in (("flying",) + _WP_NAT_PLANS) and not _exp
+            and plan_raw != "quadruped_bone"):
         # ★飛行の既定=キー錨方式 (2026-07-19ユーザー発案→イーリス/ドラゴン
         # 2体のA/Bで昇格確定): 均等5キー+末尾静止をlatent固定し、中間は
         # σ0.9でAniSoraに生成させる。σ0.45の全体浅がけより羽ばたきが
@@ -5873,6 +5962,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         if j.get("_cancel"):
             raise JobCancelled()
         s1lo, s1hi, s2lo, s2hi = spans[tag]
+        _face_gap = None       # 実験g3: 間引きギャップ用の顔限定制御列
         j["detail"] = f"[{tag}] 骨格グリッド生成"
         log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
             f"直立{idle_n}+歩行{gait_end - idle_n + 1}+静止{tail})")
@@ -5973,11 +6063,18 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験line_puppet: 線画パペット制御 (骨で線を駆動)")
         elif plan == "biped":
             _fp_save = os.environ.get("SM_POSE_FACE_POINTS")
+            _bp_save = os.environ.get("SM_POSE_BODY_PARTS")
             if _edge_face:
                 # noeyes=目とface68だけ消す (2026-07-20実走の教訓: 全消しは
                 # 頭の位置権威まで消えて猫背復活。鼻・耳=頭アンカーは残し、
                 # 壊し屋の目だけ排除して顔の細部はエッジに委ねる)
                 os.environ["SM_POSE_FACE_POINTS"] = "noeyes"
+            if _exp.get("legs_only"):
+                # 実験h (2026-07-21ユーザー発案「ポーズ制御を脚だけに」):
+                # 参照が走り姿勢の依頼で、直立歩行骨格の上半身が参照と
+                # 全面矛盾して二重人格化した対策。脚(腰8-13)だけ誘導し、
+                # 上半身の姿勢権威を参照立ち絵へ返す
+                os.environ["SM_POSE_BODY_PARTS"] = "legs"
             try:
                 frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
             finally:
@@ -5986,8 +6083,31 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                         os.environ.pop("SM_POSE_FACE_POINTS", None)
                     else:
                         os.environ["SM_POSE_FACE_POINTS"] = _fp_save
+                if _exp.get("legs_only"):
+                    if _bp_save is None:
+                        os.environ.pop("SM_POSE_BODY_PARTS", None)
+                    else:
+                        os.environ["SM_POSE_BODY_PARTS"] = _bp_save
             if _edge_face:
                 log(f"[{tag}] 骨格=目なし (鼻耳=頭アンカー維持・顔は頭部エッジで固定)")
+            if _exp.get("legs_only"):
+                log(f"[{tag}] 実験legs_only: 骨格=脚のみ "
+                    "(上半身の姿勢は参照立ち絵に委ねる)")
+        elif plan_raw == "quadruped_bone":
+            # 体格メニュー「四足歩行(骨格固定)」(2026-07-21ユーザー裁定
+            # 「人型骨格を四つん這いにして四足に対応」): 人型骨格をクロール
+            # 姿勢 (胴前傾・手=前脚として接地・対角肢交互) で出す。
+            # ハイハイ赤ちゃん等「人型が四つん這いになった」体格向け
+            _gait_save = os.environ.get("SM_POSE_GAIT")
+            os.environ["SM_POSE_GAIT"] = "crawl"
+            try:
+                frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+            finally:
+                if _gait_save is None:
+                    os.environ.pop("SM_POSE_GAIT", None)
+                else:
+                    os.environ["SM_POSE_GAIT"] = _gait_save
+            log(f"[{tag}] 四つん這い骨格 (crawl gait)")
         elif plan == "flying":
             # v0.10.6実証・キー錨と併用の実績経路: 直立+上下ボブ骨格。
             # ★エッジ実験on時もこの骨格は維持する (2026-07-20実走: 骨格まで
@@ -6023,10 +6143,35 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # SM_WP_NAT_CONTROL=depth/none、管理ノブnat_controlで切替可。
             _nat_ctl = os.environ.get(
                 "SM_WP_NAT_CONTROL", "line").strip().lower()
+            if plan == "other":
+                # 2026-07-21ユーザー裁定 (体格メニュー8種): その他=
+                # 「動画AIに動きを委ねる」— 手続き運動を出さず、
+                # キー錨+文面のみで誘導する
+                _nat_ctl = "none"
             if _nat_ctl in ("depth", "line"):
                 frames = _wp_moving_frames(cv, refs, plan, nf, idle_n,
                                            gait_end, w, h, layout,
                                            mode=_nat_ctl)
+                if _exp.get("face_line"):
+                    # 実験g3: 間引きギャップ用の顔限定制御列 (同じ手続き
+                    # 運動に顔線が追従する)。顔ボックス未計測なら従来の
+                    # 黒ギャップへフォールバック
+                    _fbx = _wp_face_boxes(pack)
+                    if _fbx:
+                        _face_gap = _wp_moving_frames(
+                            cv, refs, plan, nf, idle_n, gait_end, w, h,
+                            layout, mode=_nat_ctl, face_boxes=_fbx)
+                        try:
+                            _face_gap[idle_n + max(
+                                1, (gait_end - idle_n) // 4)].save(
+                                out / f"control_{tag}_facegap.png")
+                        except Exception:     # noqa: BLE001
+                            pass
+                        log(f"[{tag}] 実験face_line: 顔限定線画を"
+                            f"間引きギャップへ ({len(_fbx)}方向に顔)")
+                    else:
+                        log(f"[{tag}] 実験face_line: face_boxes.json"
+                            "が無いためギャップは黒 (従来)")
                 try:
                     frames[idle_n].save(out / f"control_{tag}_idle.png")
                     frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
@@ -6068,6 +6213,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 顔エッジ固定: 頭部キャニーを制御へ合成 "
                 f"({'歩行窓のみ' if plan == 'biped' else '全域'})")
         canvas = cv.compose_reference(refs, w, h, layout)
+        # 骨格駆動の体格 (biped / 四つん這い骨格): free_idle・pose_every の
+        # 「骨格=抽象記号だから間引ける」系の裁定を共有する
+        _bone = (plan == "biped" or plan_raw == "quadruped_bone")
         _free = _exp.get("free_idle")
         if _free is None:
             # ★既定ON (2026-07-20昇格): idle/末尾静止窓の骨格制御を出さず、
@@ -6079,7 +6227,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # 実証)、骨格開始境界 f6 前後も全数検査でクリーン。flyingは
             # キー錨既定で充分な実績があり未検証のため見送り。自然移動
             # 体格は全フレーム黒なので対象外 (再ブランクは無意味)
-            _free = (plan not in (("flying",) + _WP_NAT_PLANS)
+            _free = (_bone
                      and not _exp.get("line_puppet")
                      and not _exp.get("scribble_mix")
                      and not _exp.get("key_interp"))
@@ -6101,7 +6249,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         # 実験g2 (2026-07-21): 非人型 (線画制御) はAPI明示のときだけ間引き
         # 可 — 既定は毎フレーム線画のまま (間引き昇格はA/B判定後)。
         # flyingは対象外 (ボブ骨格が動きの源で、間引くと静止化リスク)
-        _pe_on = (plan == "biped"
+        _pe_on = (_bone
                   or (_pe_exp > 1 and plan in _WP_NAT_PLANS))
         if _pev > 1 and _pe_on:
             # 実験f (2026-07-20ユーザー発案「3フレームごとくらいに制御して
@@ -6112,11 +6260,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             from PIL import Image as _ImgPE
             _blkP = _ImgPE.new(frames[0].mode, frames[0].size, 0)
             frames = [fr if (k < idle_n or k > gait_end
-                             or (k - idle_n) % _pev == 0) else _blkP
+                             or (k - idle_n) % _pev == 0)
+                      else (_face_gap[k] if _face_gap else _blkP)
                       for k, fr in enumerate(frames)]
             log(f"[{tag}] pose_every={_pev}: 歩行窓の"
-                f"{'骨格' if plan == 'biped' else '線画制御'}を間引き "
-                "(中割はVACEに委ねる)")
+                f"{'骨格' if _bone else '線画制御'}を間引き "
+                f"(ギャップ={'顔限定線画' if _face_gap else '黒'}、"
+                "中割はVACEに委ねる)")
         if _exp.get("edge_idle"):
             _ecv = _wp_edge_canvas(cv, refs, w, h, layout)
             if _ecv.size != frames[0].size:
@@ -6161,7 +6311,9 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             except Exception:                     # noqa: BLE001
                 pass
             log(f"[{tag}] 実験edge_idle v2: キャラ限定エッジ (セル枠なし)")
-        prompt = _wp_prompt(eng, refs, layout, nf, plan=plan)
+        prompt = _wp_prompt(eng, refs, layout, nf, plan=plan,
+                            gait_run=bool(_exp.get("gait_run")),
+                            keep_posture=bool(_exp.get("keep_posture")))
         extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
                   "conditioning_scale": 1.0, "motion_score": 3.0,
                   "vace_base": "fun", "vace_lora": "lightning",
@@ -7454,6 +7606,18 @@ def build_app(token: str | None):
                 exp["pose_every"] = max(2, min(12, int(body["pose_every"])))
         except (TypeError, ValueError):
             pass
+        if (body or {}).get("face_line"):
+            # 実験g3 (2026-07-21ユーザー発案「顔だけ毎フレーム線画で出し、
+            # 3フレームに1回全身線画」): 非人型の間引きギャップを黒でなく
+            # 顔限定線画にする。顔=見た目の権威を毎フレーム守り、体の
+            # 中割だけVACEに委ねる。要 pack/01_generation/face_boxes.json
+            exp["face_line"] = True
+        if (body or {}).get("legs_only"):
+            # 実験h (2026-07-21「走る忍者」): 骨格=脚のみ。参照が走り姿勢
+            # の依頼で直立歩行の上半身骨格が参照と全面矛盾する対策
+            exp["legs_only"] = True
+        if (body or {}).get("gait_run"):
+            exp["gait_run"] = True     # 実験h: 文面を走りサイクル宣言に
         try:
             if (body or {}).get("key_interp_pose") is not None:
                 # 実験e2: N フレームに1回だけ骨格ドットの道しるべを置く
