@@ -47,6 +47,69 @@ from pathlib import Path, PurePosixPath
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07-21ユーザー裁定「体型という名前は撤退。二足歩行や四足歩行も含めてVACE依存を完全に捨て、動画AI処理は共通してAniSoraのみの頭部固定インペイント方式に」— 新値ai=AI生成(既定)をanisora_inpaint A型へ、stretch_v/stretch_h/move_vはGPU到達時も手続き完結。VACE骨格系(biped等)はレガシー互換で残置=旧依頼のpack_ready戻し専用。★同時に実穴修正: share_packのpack metaにエイリアス解決後のベース体格しか載らず、*_aiのGPU自動ルーティングが実配線では一度も発火していなかった — run_configにbody_plan_rawを永続化しmetaは生値を書く) / 0.10.56: 背面の頭部固定 (A型インペイント: 顔ボックス無し方向=背面系は従来bbox全体生成で頭部が無防備=振り向き顔の発明を許していた。実測方向の顔帯中央値から頭部帯を推定して凍結・横幅=シルエット実測。2026-07-21ユーザー指摘「こっち向く危険」) / 0.10.55: 管理ノブσ/再加工stepsをAI通過(anisora_inpaint)経路へ配線 (σ=0.85・steps=24ハードコードの死にノブ解消。「AI通過の動き量レバー=σとmotion」が両方とも管理GUIから回せるように。優先順位=API明示>管理ノブ>経路既定0.85) / 0.10.54: キャラ別モーション文 (母艦Codexが依頼の日本語コンセプトを英語モーション記述へ翻案→pack同梱→動画プロンプト末尾へ注入。「日本語がモデルに届かない」問題の正面解決) / 0.10.53: A型インペイント既定化 (ユーザー図解「Aにしないと体は動かない」— 凍結=顔窓+bbox外背景・生成=体全体。B型=下部帯は inpaint_mode:"bottom" で残置) / 0.10.52: インペイント系マスクを顔認識対応 (切断線=実測顔ボックス下端+4%より下にクランプ。赤さんAI通過の瞬き実障害: 巨頭チビはbbox比率の切断線が顔を横切る)。pipelineは*_ai依頼で顔ボックスをVLM実測しshare_packが同梱 / 0.10.51: 体格12択のAI通過 (*_ai=anisora_inpaint既定・体格別frac。素のやわらか値は母艦の手続き経路へ=このサーバには来ない) / 0.10.50: biped_legsの正式経路にlegs_mask=0.55を既定組込 (r3昇格: 忍者実走で黒い塊=参照の上げた脚の残存が完全消滅・上半身は実画素凍結・脚2本のストライド健全) / 0.10.49: 実験r3=legs_mask (VACEマスク同居: 上半身=実画素凍結・脚領域=骨格入り生成・idle/静止=全身実画素。忍者の「参照の上げた脚が第3の脚として残存」の構造的排除) / 0.10.48: 実験r2=anisora_inpaint (手続きアニメ土台+空間latent固定=RePaint式。凍結領域は手続き運動ごと画素完全、四肢だけAniSoraがσ再加工。VACE不使用=ユーザー発案「固定はマスク済みならAniSora単体で完結」) / 0.10.47: 実験r=region_mask (キャラ下部だけ空の潜在=標準インペイントで部分生成、上部=実画素保持) + 実験p=procedural (参照絵へ手続き運動を直接適用・生成なし=同一性画素完全。2026-07-21ユーザー発案「ゆらゆら・上下・変形だけならAI不要では」) / 0.10.46: 四肢二重化対策 (biped_legs=参照の上げた脚を「動く2本のうちの1本」と正宣言 / quadruped_bone=手2つ膝2つの正宣言+crawl腕振り0.55→0.35で骨格と参照の手の権威距離を縮小。2026-07-21実走FB「手が分裂・脚が増える」) / 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+# 0.11.31: AniSora公式型の疎画像条件を任意stride (sparse24等)へ拡張。
+# 0.11.30: 二条件HighのPose/画像比をフレーム別に指定可能にした。
+# 0.11.29: 蒸留AniSoraの生成step下限を管理画面どおり4へ接続。
+# 4--7を指定しても内部で8へ戻していた隠れクランプを除去。
+# 0.11.28: 回転+歩行同時プローブ用に、二条件Highの画像側へ
+# anisora_image_guidance_frames_b64の方向別画像列を別入力できるように。
+# 0.11.27: 固定のキャラbbox maskを撤廃し、元絵の実シルエット+
+# 各時刻のPose周囲だけを開ける動的maskへ。生成余白の黒い帯を根治。
+# 0.11.26: 実走で歩いた二条件forwardを工房ai本線へ接続。
+# frame0=全面元絵固定、以後=顔/背景固定+体純ノイズ、High=
+# OpenPose25%+画像75%の別forward、Low=通常I2V。やりなおしも同経路。
+# 0.11.25: 二条件HighのPose画像で黒背景を中立灰へ置換。
+# 黒地が骨情報と25%混ざり、体mask全体を黒ずませる実走修正。
+# 0.11.24: AniSoraの骨条件と画像条件を同じ36chへ交互に
+# 詰めず、Highの同一stepを別forwardしてノイズ予測だけを
+# 合成するanisora_dual_condition実験を追加。Lowは通常I2V画像条件。
+# 0.11.23: Pose解放後のLow条件で、未知の体域に元絵
+# latentを残さず中立灰にする。mask=0でも条件latentの形が
+# 参照され、毎フレーム元姿勢へ引き戻していた実走への修正。
+# 0.11.22: 空間インペイントの既知/未知maskをWanの
+# 36ch条件側にも接続。frame0=全面元絵既知、以後=顔と背景は
+# 元絵既知・体はPose条件+未知とし、Low解放後も同じ
+# 空間maskを維持する。latent側の体は純ノイズのまま。
+# 0.11.21: latent_spatial_start_at_high_edgeを追加。σ1.0からでは
+# なく、スケジュール上の最後のHigh-noise expert 1stepから開始し、
+# 体=純ノイズのまま骨を1回効かせた直後にLowで人物化する。
+# 0.11.20: 生成領域を純ノイズにすると衣装/四肢の所在を失い、
+# マスク形の紫ノイズに収束する実走への比較用に、元latentを薄く
+# 残すlatent_spatial_source_mix(0.0既定、0.15実験)を追加。
+# 0.11.19: HighのPose条件/Low解放を空間latentインペイントへ接続。
+# 生成領域=純ノイズ、顔と背景=参照latent軌道の毎step固定を
+# 保ったまま、Highにだけ歩行骨を見せてLowで通常条件へ戻す。
+# 0.11.18: V3.2のHighだけPose条件、Lowは通常I2V条件へ解放する
+# anisora_guidance_release_low実験を追加。骨で大きな姿勢を決めた後、
+# Low側に骨線を描かせず先頭絵+文章で仕上げる。
+# 0.11.17: AniSora V3/V3.2公式の任意時刻画像条件を忠実移植。
+# 全骨フレームを連続動画としてVAEへ入れるのではなく、8フレーム
+# ごとの指定時刻だけゼロ動画へ配置し、同じ時刻のmaskを1にする。
+# V3 image2video_any.pyとV3.2 image2video.pyで同一の条件構成を確認済み。
+# 0.11.16: Multimodal Poseの条件マスクを選択可能に。公式デモ入力は
+# frame0=実画像、frame1以降=OpenPose動画なので、firstモードでは
+# 条件latentは全時刻保持しつつmask4chは先頭slotだけ1・以後0にする。
+# 0.11.15: V3公式configは旧WanModel形式(in_dim)のためDiffusersが既定
+# 16chで初期化して36ch重みを拒否する差を修正。Wan2.1 I2V基盤の
+# transformer/config.json (in_channels=36)を明示して読み込む。
+# 0.11.14: README実演対象そのもののAniSora V3 (Wan2.1系) を読み、
+# V3.2と同じ全フレームPose潜在で比較する隔離アダプタを追加。
+# 0.11.13: AniSora公式READMEのMultimodal Guidance実配線を検証する
+# 隔離プローブ。extra.anisora_guidance_frames_b64へPose/Depth/Line動画を
+# 渡した場合だけ、全フレームをVAE encodeして通常I2Vの20ch条件
+# (mask4+latent16)へ一括注入する。工房本線からは未使用。
+# 0.11.12: Wan-Animate実験の斜め前で、AniSora/VACE用の「正面寄り
+# 立ち絵なら顔骨だけ0度へ戻す」ヨー救済が誤発火していたのを分離。
+# 正面絵1枚から全方位を作る本経路は参照絵の実測ヨーを使わず、頭・胴とも
+# DIR_YAWの公称角度（斜め=45度）を厳守する。
+# 0.11.11: 正面立ち絵1枚から、45度刻み8方向×各2歩行周期を1本の
+# Wan-Animate動画として生成するdirection_sequence実験を追加。49f区間を
+# 1fずつ重ねて385f/8セグメントとし、方向間の同一性を時間軸で共有する。
+# 0.11.10: Wan2.2-Animate実験にface_mode=blankを追加。正面立ち絵1枚へ
+# 背面骨を与える検証で、静止正面顔のmotion条件が背面化を妨げないようにする。
+# 0.11.9: Wan2.2-Animateの前向き歩行を本番経路から隔離して実走できる
+# 実験アダプタを追加。工房のOpenPose歩容を直接pose動画にし、顔入力は
+# 静止クロップを反復して「歩くか」をプロンプト頼みでなく切り分ける。
 # 0.11.8: 管理ノブの0を未設定扱いする共通読取バグを修正。
 # head_release_steps=0が既定5へ戻り、head_bob=0も既定1へ戻っていた。
 # None/欠落だけを既定へ落とし、数値0はそのままエンジンへ通す。
@@ -70,7 +133,7 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.8"
+__version__ = "0.11.31"
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -1342,7 +1405,8 @@ def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float,
 
 
 def _spatial_inpaint_latents(x0, noise, sigma: float, fixed_mask=None,
-                             empty_generate: bool = False):
+                             empty_generate: bool = False,
+                             generate_source_mix: float = 0.0):
     """AniSoraリファインの初期潜在を作る。
 
     fixed_maskは [Hlat,Wlat] または [Tlat,Hlat,Wlat] bool、True=固定。通常は従来の
@@ -1363,7 +1427,9 @@ def _spatial_inpaint_latents(x0, noise, sigma: float, fixed_mask=None,
         m = m.view(1, 1, *m.shape)
     else:
         raise ValueError("spatial maskは[H,W]または[T,H,W]が必要")
-    return torch.where(m, ref, noise)
+    mix = max(0.0, min(0.5, float(generate_source_mix)))
+    generated = noise if mix <= 0 else mix * x0 + (1.0 - mix) * noise
+    return torch.where(m, ref, generated)
 
 
 def _pixel_lock_spatial_frames(frames, reference, generate_mask):
@@ -2088,6 +2154,195 @@ class _WanA14BBase(VideoAdapter):
             log(f"中間キーフレーム注入: pos={float(pos):.2f} -> "
                 f"画素フレーム{m} (latent {lm}/{t_lat})")
 
+    def _inject_guidance_video(self, condition, frames, num_frames,
+                               w, h, log, mask_mode="known",
+                               generate_masks=None, fixed_frames=None,
+                               neutralize_black=False):
+        """Pose/Depth/Line等の全フレーム条件をI2V条件latentへ入れる。
+
+        AniSora V3の公開チェックポイントは通常Wan I2Vと同じ36ch入力
+        (noise16 + mask4 + condition latent16)で、専用ControlNetを持たない。
+        公式READMEのMultimodal Guidanceがこの条件動画を学習済みかを
+        実機で判定するための隔離プローブ。通常生成では呼ばれない。
+
+        キーフレームを1枚ずつencodeすると時間畳み込みの文脈が失われるため、
+        公式anymask実装と同様に動画全体を一度にVAEへ通す。
+        """
+        import torch
+
+        if not frames:
+            raise ValueError("AniSora guidance動画が空です")
+        pipe = self.pipe
+        if len(frames) != num_frames:
+            got = len(frames)
+            idx = [round(i * (got - 1) / max(1, num_frames - 1))
+                   for i in range(num_frames)]
+            frames = [frames[i] for i in idx]
+            log(f"AniSora guidanceフレーム数を調整: {got} -> {num_frames}")
+
+        # 空間インペイント条件。Wan I2Vの36ch入力は
+        # mask4 + condition latent16を持つため、後段callbackで
+        # latentを描き戻すだけでなく、モデル側にも「固定画素/
+        # 未知画素」を明示する。generate_masksは255=生成/0=固定。
+        spatial = bool(generate_masks and fixed_frames)
+        spatial_masks = []
+        if spatial:
+            from PIL import Image as _ImgGuide
+
+            def _resample(items):
+                items = list(items)
+                if not items:
+                    raise ValueError("AniSora空間条件が空です")
+                if len(items) == 1:
+                    return items * num_frames
+                if len(items) == num_frames:
+                    return items
+                got = len(items)
+                ids = [round(i * (got - 1) / max(1, num_frames - 1))
+                       for i in range(num_frames)]
+                return [items[i] for i in ids]
+
+            spatial_masks = _resample(generate_masks)
+            fixed_frames = _resample(fixed_frames)
+            composed = []
+            for guide, ref, gen_mask in zip(
+                    frames, fixed_frames, spatial_masks):
+                guide = (guide if guide.size == (w, h)
+                         else _fit_image(guide, w, h)).convert("RGB")
+                if neutralize_black:
+                    # OpenPoseの黒背景は「空の条件」ではなく
+                    # 黒い面の描画指示として予測に混ざる。RGB全て
+                    # 32未満の画素だけ正規化後0付近の中立灰へ。
+                    import numpy as _npneutral
+                    _ga = _npneutral.asarray(guide).copy()
+                    _ga[_ga.max(axis=2) < 32] = 128
+                    guide = _ImgGuide.fromarray(_ga, "RGB")
+                ref = (ref if ref.size == (w, h)
+                       else _fit_image(ref, w, h)).convert("RGB")
+                gm = gen_mask.convert("L").resize(
+                    (w, h), resample=_ImgGuide.Resampling.NEAREST)
+                # 白(生成)にPose、黒(固定)にframe0由来の元絵。
+                composed.append(_ImgGuide.composite(guide, ref, gm))
+            frames = composed
+
+        mode = str(mask_mode or "known").strip().lower()
+        sparse = (mode in ("official", "official_sparse", "sparse")
+                  or mode.startswith("sparse"))
+        sparse_stride = 8
+        if sparse and mode.startswith("sparse"):
+            try:
+                sparse_stride = max(1, int(mode[len("sparse"):]))
+            except ValueError:
+                sparse_stride = 8
+        selected = list(range(0, num_frames, sparse_stride))
+        if selected[-1] != num_frames - 1:
+            selected.append(num_frames - 1)
+
+        if sparse:
+            # 公式 V3 image2video_any.py / V3.2 image2video.py と同型。
+            # 未指定時刻は正規化後の0(中間灰)のままで、指定時刻
+            # だけ画像を書き込む。連続Pose動画をVAE encodeすると
+            # 「出力すべき画素」と解釈され、骨がそのまま再生される。
+            video = torch.zeros(
+                (1, 3, num_frames, h, w), device=condition.device,
+                dtype=pipe.vae.dtype)
+            for frame_id in selected:
+                image = frames[frame_id]
+                image = (image if image.size == (w, h)
+                         else _fit_image(image, w, h))
+                item = pipe.video_processor.preprocess(
+                    image, height=h, width=w).unsqueeze(2)
+                video[:, :, frame_id:frame_id + 1] = item.to(
+                    device=condition.device, dtype=pipe.vae.dtype)
+        else:
+            chunks = []
+            for image in frames:
+                image = (image if image.size == (w, h)
+                         else _fit_image(image, w, h))
+                chunks.append(pipe.video_processor.preprocess(
+                    image, height=h, width=w).unsqueeze(2))
+            video = torch.cat(chunks, dim=2).to(
+                device=condition.device, dtype=pipe.vae.dtype)
+        enc = pipe.vae.encode(video)
+        lat = (enc.latent_dist.mode() if hasattr(enc, "latent_dist")
+               else enc.latents)
+        lat = lat.to(device=condition.device, dtype=condition.dtype)
+        lm_mean = torch.tensor(pipe.vae.config.latents_mean).view(
+            1, -1, 1, 1, 1).to(condition.device, condition.dtype)
+        lm_std = 1.0 / torch.tensor(pipe.vae.config.latents_std).view(
+            1, -1, 1, 1, 1).to(condition.device, condition.dtype)
+        lat = (lat - lm_mean) * lm_std
+
+        mask_ch = condition.shape[1] - int(pipe.vae.config.z_dim)
+        if tuple(lat.shape[2:]) != tuple(condition.shape[2:]):
+            raise RuntimeError(
+                "AniSora guidance latent形状が一致しません: "
+                f"guidance={tuple(lat.shape)} / condition={tuple(condition.shape)}")
+        condition[:, mask_ch:] = lat
+        if spatial:
+            # 画素時間軸の既知maskを、Wan公式と同じ
+            # first-frame x4 + 4フレーム束の4ch形式へ畳む。
+            # frame0の全黒生成maskは、ここで全画素既知になる。
+            import numpy as _npguide
+            known = []
+            lh, lw = condition.shape[3], condition.shape[4]
+            for gen_mask in spatial_masks:
+                gm = gen_mask.convert("L").resize(
+                    (lw, lh), resample=_ImgGuide.Resampling.NEAREST)
+                known.append(torch.from_numpy(
+                    (_npguide.asarray(gm) < 128).astype("float32")))
+            px_mask = torch.stack(known, dim=0).unsqueeze(0).to(
+                device=condition.device, dtype=condition.dtype)
+            px_mask = torch.cat((
+                px_mask[:, 0:1].repeat_interleave(4, dim=1),
+                px_mask[:, 1:]), dim=1)
+            px_mask = px_mask.view(
+                1, px_mask.shape[1] // 4, 4, lh, lw).transpose(1, 2)
+            if tuple(px_mask.shape) != tuple(condition[:, :mask_ch].shape):
+                raise RuntimeError(
+                    "AniSora空間mask形状が一致しません: "
+                    f"mask={tuple(px_mask.shape)} / "
+                    f"condition={tuple(condition[:, :mask_ch].shape)}")
+            condition[:, :mask_ch] = px_mask
+            mode = "spatial_known"
+        elif sparse:
+            # 公式は画素時間軸でmaskを作り、先頭を4回反復して
+            # VAEの4フレーム時間圧縮に合わせる。この形はlatent slot
+            # だけを1にする近似ではなく、公式テンソルそのもの。
+            px_mask = torch.zeros(
+                (1, num_frames, condition.shape[3], condition.shape[4]),
+                device=condition.device, dtype=condition.dtype)
+            for frame_id in selected:
+                px_mask[:, frame_id:frame_id + 1] = 1.0
+            px_mask = torch.cat((
+                px_mask[:, 0:1].repeat_interleave(4, dim=1),
+                px_mask[:, 1:]), dim=1)
+            px_mask = px_mask.view(
+                1, px_mask.shape[1] // 4, 4,
+                condition.shape[3], condition.shape[4]).transpose(1, 2)
+            if tuple(px_mask.shape) != tuple(condition[:, :mask_ch].shape):
+                raise RuntimeError(
+                    "AniSora公式mask形状が一致しません: "
+                    f"mask={tuple(px_mask.shape)} / "
+                    f"condition={tuple(condition[:, :mask_ch].shape)}")
+            condition[:, :mask_ch] = px_mask
+            mode = f"official_sparse{sparse_stride}"
+        elif mode in ("first", "first_frame", "pose"):
+            # READMEのPoseデモ入力: frame0だけ元絵、以後は骨動画。
+            # 骨latentを消さず、通常画素としての既知指定だけを外す。
+            condition[:, :mask_ch] = 0.0
+            condition[:, :mask_ch, 0] = 1.0
+            mode = "first"
+        elif mode in ("unknown", "control", "zero", "0"):
+            condition[:, :mask_ch] = 0.0
+            mode = "unknown"
+        else:
+            condition[:, :mask_ch] = 1.0
+            mode = "known"
+        log("AniSora multimodal probe: guidanceを20ch I2V条件へ注入 "
+            f"({num_frames}f -> latent {condition.shape[2]}f, mask={mode}"
+            f"{', anchors=' + str(selected) if sparse else ''})")
+
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         import torch
         w = _snap(req.width, 16, 240)
@@ -2114,6 +2369,10 @@ class _WanA14BBase(VideoAdapter):
         if len(req.images) >= 2:
             kw["last_image"] = _fit_image(req.images[-1], w, h)
             log("終端画像アンカー: 始点と同じポーズで終わるよう拘束")
+        # 公式READMEのMultimodal Guidance検証: 通常UI/工房からは送られない
+        # 実験キー。骨/深度/線画動画を通常I2Vの条件latentへ一括注入する。
+        guide_raw = list(req.extra.get("anisora_guidance_frames_b64") or [])
+        guide_frames = load_images_b64(guide_raw) if guide_raw else []
         # 中間キーフレーム (images[1:-1]): prepare_latents をフックして
         # 条件テンソルに直接注入する。失敗しても先頭/終端拘束で続行。
         mids = [_fit_image(im, w, h) for im in req.images[1:-1]]
@@ -2122,19 +2381,73 @@ class _WanA14BBase(VideoAdapter):
                    else [(i + 1) / (len(mids) + 1)
                          for i in range(len(mids))])
         orig_prep = None
-        if mids:
+        base_condition = {}
+        if mids or guide_frames:
             orig_prep = self.pipe.prepare_latents
 
             def _patched(*a, **k):
                 latents, condition = orig_prep(*a, **k)
                 try:
-                    self._inject_mid_keyframes(condition, mids, mid_pos,
-                                               n, w, h, log)
+                    if guide_frames:
+                        # High=Pose / Low=通常I2Vを切り替える際の復帰元。
+                        # _inject_guidance_videoはconditionをin-place更新するため
+                        # 先に独立copyを保持する。
+                        base_condition["value"] = condition.detach().clone()
+                        self._inject_guidance_video(
+                            condition, guide_frames, n, w, h, log,
+                            req.extra.get("anisora_guidance_mask", "known"))
+                    else:
+                        self._inject_mid_keyframes(condition, mids, mid_pos,
+                                                   n, w, h, log)
                 except Exception as e:   # noqa: BLE001
+                    if guide_frames:
+                        raise RuntimeError(
+                            "AniSora multimodal guidance注入に失敗: "
+                            f"{str(e)[:300]}") from e
                     log(f"中間キーフレーム注入に失敗 (先頭/終端のみで"
                         f"続行): {str(e)[:200]}")
                 return latents, condition
             self.pipe.prepare_latents = _patched
+
+        # V3.2の二段デノイズを利用し、High-noise expertだけに
+        # Pose条件を見せる。Low-noise expertの入力36chは
+        # [noise16 + condition20]なので、後半20chをprepare_latents時に
+        # 保存した通常の先頭画像条件へ戻す。これによりHighの
+        # 大形を残しつつ、Lowが骨のRGB線を模写するのを防ぐ。
+        low_model = getattr(self.pipe, "transformer_2", None)
+        release_low = bool(
+            guide_frames and req.extra.get("anisora_guidance_release_low"))
+        orig_low_forward = None
+        if release_low and low_model is not None:
+            orig_low_forward = low_model.forward
+            zdim = int(self.pipe.vae.config.z_dim)
+            logged_release = [False]
+
+            def _low_forward(*a, **k):
+                base = base_condition.get("value")
+                hidden = k.get("hidden_states")
+                from_args = hidden is None and bool(a)
+                if from_args:
+                    hidden = a[0]
+                if (base is not None and hidden is not None
+                        and hidden.shape[1] >= zdim + base.shape[1]):
+                    replaced = hidden.clone()
+                    replaced[:, zdim:zdim + base.shape[1]] = base.to(
+                        device=hidden.device, dtype=hidden.dtype)
+                    if from_args:
+                        a = (replaced,) + tuple(a[1:])
+                    else:
+                        k["hidden_states"] = replaced
+                    if not logged_release[0]:
+                        log("AniSora Pose条件をHighのみに限定: "
+                            "Lowは通常の先頭絵I2V条件へ解放")
+                        logged_release[0] = True
+                return orig_low_forward(*a, **k)
+
+            low_model.forward = _low_forward
+        elif release_low:
+            log("PoseのLow解放を指定しましたが、二段モデルでは"
+                "ないため通常条件のまま続行")
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance}")
         try:
             out = _call_with_optional_kwargs(
@@ -2142,6 +2455,8 @@ class _WanA14BBase(VideoAdapter):
         finally:
             if orig_prep is not None:
                 self.pipe.prepare_latents = orig_prep
+            if orig_low_forward is not None:
+                low_model.forward = orig_low_forward
         progress(0.92)
         return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
 
@@ -2562,7 +2877,9 @@ class AniSoraAdapter(_WanA14BBase):
         # σ1.0から全スケジュールを走らせる。この経路ではrefineノブより
         # 「体に元潜在を混ぜない」契約を優先する。
         strength = 1.0 if spatial_empty else max(0.10, min(0.90, strength))
-        steps = max(8, int(req.steps))          # スケジュール解像度(既定24)
+        # AniSora V3.2は蒸留モデル。管理画面の契約どおり4--12を通し、
+        # 4--7を黙って8へ戻さない（レガシー経路は呼出側の既定24のまま）。
+        steps = max(4, int(req.steps))
         dev = pipe._execution_device
 
         def _dev_of(m):
@@ -2669,12 +2986,29 @@ class AniSoraAdapter(_WanA14BBase):
         sched = pipe.scheduler
         orig_set = sched.set_timesteps
         box = {}
+        _start_at_high_edge = bool(
+            req.extra.get("latent_spatial_start_at_high_edge"))
+        orig_guide_prep = None
+        orig_guide_high_forward = None
+        orig_guide_low_forward = None
+        guide_high_model = None
+        guide_low_model = None
 
         def _set_ts(nsteps, device=None, **kw3):
             orig_set(nsteps, device=device, **kw3)
             sig = sched.sigmas                    # CPU float32, 末尾に終端σ
-            hit = (sig[:-1] <= strength).nonzero()
-            idx = int(hit[0]) if len(hit) else int(len(sig) - 2)
+            if _start_at_high_edge:
+                try:
+                    _bt = (float(pipe.config.boundary_ratio)
+                           * float(sched.config.num_train_timesteps))
+                    _high = (sched.timesteps >= _bt).nonzero()
+                    idx = (int(_high[-1]) if len(_high)
+                           else 0)
+                except (AttributeError, TypeError, ValueError):
+                    idx = 0
+            else:
+                hit = (sig[:-1] <= strength).nonzero()
+                idx = int(hit[0]) if len(hit) else int(len(sig) - 2)
             idx = max(0, min(idx, len(sig) - 2))
             sched.timesteps = sched.timesteps[idx:]
             sched.sigmas = sched.sigmas[idx:]
@@ -2762,8 +3096,11 @@ class AniSoraAdapter(_WanA14BBase):
             if spatial_empty and _smask is None:
                 raise RuntimeError(
                     "latent_spatial_emptyにはlatent_spatial_mask_b64が必要です")
+            _source_mix = max(0.0, min(0.5, float(
+                req.extra.get("latent_spatial_source_mix") or 0.0)))
             x_t = _spatial_inpaint_latents(
-                x0, noise, s0, _smask, empty_generate=spatial_empty)
+                x0, noise, s0, _smask, empty_generate=spatial_empty,
+                generate_source_mix=_source_mix)
             if spatial_empty:
                 try:
                     _br = float(pipe.config.boundary_ratio)
@@ -2781,9 +3118,14 @@ class AniSoraAdapter(_WanA14BBase):
                                 f"背景固定 / Low={tail - _hi}stepは背景のみ固定")
                 except (AttributeError, TypeError, ValueError):
                     pass
-                log(f"空間インペイント: 生成領域=純ノイズ / "
+                log("空間インペイント: 生成領域="
+                    + ("純ノイズ" if _source_mix <= 0 else
+                       f"元latent {_source_mix:.0%} + ノイズ {1-_source_mix:.0%}")
+                    + " / "
                     f"固定領域=時系列参照軌道 / σ0={s0:.2f} "
-                    f"実行{tail}/{steps}step")
+                    f"実行{tail}/{steps}step"
+                    + (" (High最終1stepから開始)"
+                       if _start_at_high_edge else ""))
             else:
                 log(f"リファイン: {len(frames)}f σ0={s0:.2f} "
                     f"実行{tail}/{steps}step (全stepがLow=ディテール側)")
@@ -2829,6 +3171,199 @@ class AniSoraAdapter(_WanA14BBase):
             kw.update(self._prompt_kwargs(self._build_prompt(req, log),
                                           req.negative or None,
                                           req.guidance, log))
+            # 空間インペイントとPoseを同時使用する。x_tと
+            # callbackは画像空間の固定/生成領域を担当し、この
+            # hookはモデルへ渡す36ch条件だけを切り替える。
+            _guide_raw = list(
+                req.extra.get("anisora_guidance_frames_b64") or [])
+            _guide_frames = (load_images_b64(_guide_raw)
+                             if _guide_raw else [])
+            _image_guide_raw = list(
+                req.extra.get("anisora_image_guidance_frames_b64") or [])
+            _image_guide_frames = (load_images_b64(_image_guide_raw)
+                                   if _image_guide_raw else [])
+            if _guide_frames:
+                orig_guide_prep = pipe.prepare_latents
+                _base_condition = {}
+                _spatial_guide = bool(
+                    req.extra.get("anisora_guidance_spatial_condition")
+                    and _smask_image is not None)
+                _dual_guide = bool(
+                    req.extra.get("anisora_dual_condition"))
+                _spatial_masks = (_smask_image
+                                  if isinstance(_smask_image, list)
+                                  else [_smask_image])
+                _fixed_guide_frames = (frames if frames else [cond_img])
+
+                def _guide_prep(*a4, **k4):
+                    _lat, _cond = orig_guide_prep(*a4, **k4)
+                    _plain = _cond.detach().clone()
+                    if _image_guide_frames:
+                        # Poseと同じ16chに画像を混ぜず、画像forward
+                        # 専用の条件列を作る。回転プローブでは
+                        # 8方向の立ち絵列を入れ、Pose列と別予測する。
+                        self._inject_guidance_video(
+                            _plain, _image_guide_frames, n, w, h, log,
+                            req.extra.get(
+                                "anisora_image_guidance_mask", "first"))
+                    self._inject_guidance_video(
+                        _cond, _guide_frames, n, w, h, log,
+                        req.extra.get("anisora_guidance_mask", "known"),
+                        generate_masks=(_spatial_masks
+                                        if _spatial_guide else None),
+                        fixed_frames=(_fixed_guide_frames
+                                      if _spatial_guide else None),
+                        neutralize_black=bool(req.extra.get(
+                            "anisora_guidance_neutralize_black")))
+                    if _dual_guide:
+                        # 二条件forwardの画像側とLowは、通常の
+                        # first-frame I2V条件をそのまま使う。Poseと同じ
+                        # 16chに詰め合わせないことがこの経路の契約。
+                        _base_condition["value"] = _plain
+                    elif (_spatial_guide
+                            and req.extra.get("anisora_guidance_release_low")):
+                        # Lowでは骨を外すが、Highと同じ空間既知
+                        # maskは残す。mask=0でも条件latentの像は
+                        # 弱く参照されるため、体に元絵を繰り返さず、
+                        # 画像正規化後の0にほぼ相当する中立灰を入れる。
+                        _low = _plain.detach().clone()
+                        from PIL import Image as _ImgLowGuide
+                        _neutral = [_ImgLowGuide.new(
+                            "RGB", (w, h), (128, 128, 128))]
+                        self._inject_guidance_video(
+                            _low, _neutral, n, w, h, log,
+                            "known", generate_masks=_spatial_masks,
+                            fixed_frames=_fixed_guide_frames)
+                        _base_condition["value"] = _low
+                    else:
+                        _base_condition["value"] = _plain
+                    return _lat, _cond
+
+                pipe.prepare_latents = _guide_prep
+                if _dual_guide:
+                    guide_high_model = getattr(pipe, "transformer", None)
+                    if guide_high_model is not None:
+                        orig_guide_high_forward = guide_high_model.forward
+                        _zdim_high = int(pipe.vae.config.z_dim)
+                        _image_weight = max(0.0, min(0.75, float(
+                            req.extra.get(
+                                "anisora_dual_condition_image_weight", 0.25))))
+                        _image_weights_raw = req.extra.get(
+                            "anisora_dual_condition_image_weights")
+                        _image_weights = None
+                        if (isinstance(_image_weights_raw, list)
+                                and _image_weights_raw):
+                            try:
+                                _image_weights = [max(0.0, min(0.75, float(x)))
+                                                  for x in _image_weights_raw]
+                            except (TypeError, ValueError):
+                                _image_weights = None
+                        _dual_logged = [False]
+
+                        def _dual_high_forward(*a4, **k4):
+                            # 1) Pose条件のHigh予測
+                            _pose_out = orig_guide_high_forward(*a4, **k4)
+                            _plain = _base_condition.get("value")
+                            _hidden = k4.get("hidden_states")
+                            _from_args = _hidden is None and bool(a4)
+                            if _from_args:
+                                _hidden = a4[0]
+                            if (_plain is None or _hidden is None
+                                    or _hidden.shape[1] < (
+                                        _zdim_high + _plain.shape[1])):
+                                return _pose_out
+
+                            # 2) 同じnoisy latentに通常画像条件を与えた
+                            #    別forward。Pose画像はこちらに入らない。
+                            _image_hidden = _hidden.clone()
+                            _image_hidden[
+                                :, _zdim_high:_zdim_high + _plain.shape[1]] = (
+                                    _plain.to(device=_hidden.device,
+                                              dtype=_hidden.dtype))
+                            if _from_args:
+                                _ia = (_image_hidden,) + tuple(a4[1:])
+                                _ik = dict(k4)
+                            else:
+                                _ia = a4
+                                _ik = dict(k4)
+                                _ik["hidden_states"] = _image_hidden
+                            _image_out = orig_guide_high_forward(*_ia, **_ik)
+                            _weight = _image_weight
+                            if (_image_weights is not None
+                                    and _pose_out[0].ndim >= 3):
+                                # Wanのnoise predictionはB,C,T,H,W。入力の
+                                # 画素フレーム列をlatent時刻へ最近傍対応し、
+                                # 安定歩行と旋回でPose/画像比を変えられるようにする。
+                                import torch as _torch_dual
+                                _t = int(_pose_out[0].shape[2])
+                                _src_n = len(_image_weights)
+                                if _t <= 1:
+                                    _idx = _torch_dual.zeros(
+                                        1, dtype=_torch_dual.long,
+                                        device=_pose_out[0].device)
+                                else:
+                                    _idx = _torch_dual.linspace(
+                                        0, _src_n - 1, _t,
+                                        device=_pose_out[0].device
+                                    ).round().long()
+                                _weight = _torch_dual.tensor(
+                                    _image_weights,
+                                    device=_pose_out[0].device,
+                                    dtype=_pose_out[0].dtype
+                                )[_idx].view(1, 1, _t, 1, 1)
+                            _mixed = ((1.0 - _weight) * _pose_out[0]
+                                      + _weight * _image_out[0])
+                            if not _dual_logged[0]:
+                                if _image_weights is None:
+                                    log("AniSora二条件High: Poseと画像を別forward "
+                                        f"(Pose {1-_image_weight:.0%} / "
+                                        f"画像 {_image_weight:.0%})")
+                                else:
+                                    log("AniSora二条件High: Poseと画像を別forward "
+                                        "(フレーム別配分: 画像 "
+                                        f"{min(_image_weights):.0%}--"
+                                        f"{max(_image_weights):.0%})")
+                                _dual_logged[0] = True
+                            return (_mixed,) + tuple(_pose_out[1:])
+
+                        guide_high_model.forward = _dual_high_forward
+                    else:
+                        log("AniSora二条件HighはHighモデルが無いため"
+                            "スキップ")
+                if req.extra.get("anisora_guidance_release_low"):
+                    guide_low_model = getattr(pipe, "transformer_2", None)
+                    if guide_low_model is not None:
+                        orig_guide_low_forward = guide_low_model.forward
+                        _zdim = int(pipe.vae.config.z_dim)
+                        _release_logged = [False]
+
+                        def _guide_low_forward(*a4, **k4):
+                            _base = _base_condition.get("value")
+                            _hidden = k4.get("hidden_states")
+                            _from_args = _hidden is None and bool(a4)
+                            if _from_args:
+                                _hidden = a4[0]
+                            if (_base is not None and _hidden is not None
+                                    and _hidden.shape[1] >= (
+                                        _zdim + _base.shape[1])):
+                                _replaced = _hidden.clone()
+                                _replaced[:, _zdim:_zdim + _base.shape[1]] = (
+                                    _base.to(device=_hidden.device,
+                                             dtype=_hidden.dtype))
+                                if _from_args:
+                                    a4 = (_replaced,) + tuple(a4[1:])
+                                else:
+                                    k4["hidden_states"] = _replaced
+                                if not _release_logged[0]:
+                                    log("Pose空間インペイント: Highは"
+                                        "歩行骨 / Lowは通常I2V条件")
+                                    _release_logged[0] = True
+                            return orig_guide_low_forward(*a4, **k4)
+
+                        guide_low_model.forward = _guide_low_forward
+                    else:
+                        log("PoseのLow解放は二段モデル専用のため"
+                            "このモデルではスキップ")
             # latents未対応の古いdiffusersなら明示エラーにする (黙って
             # 落とすと「1段目を無視した素の生成」が静かに走る偽PASS)。
             # latent固定が要求されているときは callback_on_step_end も
@@ -2839,6 +3374,14 @@ class AniSoraAdapter(_WanA14BBase):
                 else ["callback_on_step_end"], log)
         finally:
             sched.set_timesteps = orig_set
+            if orig_guide_prep is not None:
+                pipe.prepare_latents = orig_guide_prep
+            if (orig_guide_high_forward is not None
+                    and guide_high_model is not None):
+                guide_high_model.forward = orig_guide_high_forward
+            if (orig_guide_low_forward is not None
+                    and guide_low_model is not None):
+                guide_low_model.forward = orig_guide_low_forward
             if not had_tiling:
                 try:
                     pipe.vae.disable_tiling()
@@ -4227,6 +4770,290 @@ class Wan22A14BAdapter(_WanA14BBase):
         return super().generate(req, workdir, log, progress)
 
 
+@register
+class AniSoraV3MultimodalPilotAdapter(_WanA14BBase):
+    """公式READMEのPose guidanceを、公開V3重みそのもので検証する。
+
+    V3とV3.2の公式ソースは、指定時刻だけ画像を置いたゼロ動画と
+    同時刻マスクを同じ方式で作る。Wan2.1ベースのV3公開重みで
+    公式Poseデモの条件構成を比較する隔離パイロット。
+    工房本線や通常モデル一覧から自動選択されない隔離パイロット。
+    """
+    id = "anisora_v3_multimodal_pilot"
+    label = "AniSora V3 Multimodal Guidance (公式Pose検証)"
+    desc = ("公式READMEのPose/Depth/Line guidanceを公開V3重みで検証する"
+            "隔離経路。extra.anisora_guidance_frames_b64必須。工房本線では"
+            "未使用。")
+    requires = "GPU 48GB+推奨・公式V3一式の初回DL約45GB"
+    repo = "IndexTeam/Index-anisora"
+    model_file = "V3/diffusion_pytorch_model.safetensors"
+    base_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+    cache_repos = (repo, base_repo)
+    disk_gb = 55
+    prompt_suffix = ("aesthetic score: 6.0. motion score: {motion:.1f}. "
+                     "There is no text in the video.")
+    defaults = {"width": 480, "height": 864, "num_frames": 81, "fps": 16,
+                "steps": 8, "guidance": 1.0}
+
+    def _ensure_loaded_impl(self, log):
+        _require_deps(log)
+        from diffusers import WanImageToVideoPipeline, WanTransformer3DModel
+
+        extra = getattr(self, "_next_extra", {}) or {}
+        log("AniSora V3公式重みを取得 (README Multimodal Guidance検証)")
+        weight = _hf_download(self.repo, self.model_file, log)
+        _hf_download(self.repo, "V3/config.json", log)  # 公式配置の健全性確認
+        base = _snapshot_local(self.base_repo, log)
+        model_gb = _gguf_gb(weight)
+        if model_gb >= 1.0:
+            _ram_gate(log, model_gb + 12 + 8,
+                      "AniSora V3 multimodal pilot読み込み")
+        log("AniSora V3 DiT読み込み (Wan2.1・単一expert)")
+        transformer = WanTransformer3DModel.from_single_file(
+            weight, config=base, subfolder="transformer",
+            torch_dtype=_pick_dtype())
+        log(f"Wan2.1 I2V共通部品を読み込み: {base}")
+        self.pipe = WanImageToVideoPipeline.from_pretrained(
+            base, transformer=transformer, torch_dtype=_pick_dtype())
+        self._te_from = base
+        self._dit_gb = model_gb or 28.0
+        offload = str(extra.get("offload") or "").lower()
+        self._finalize_pipe(
+            log, offload=offload, footprint_gb=self._dit_gb + 17,
+            vae_tiling=True)
+        self.loaded = True
+        log("AniSora V3 multimodal pilot準備完了")
+
+    def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
+        if not req.extra.get("anisora_guidance_frames_b64"):
+            raise RuntimeError(
+                "V3 multimodal pilotには "
+                "extra.anisora_guidance_frames_b64 が必要です")
+        if not self.loaded:
+            self._next_extra = dict(req.extra or {})
+            self.ensure_loaded(log)
+        return _WanA14BBase.generate(self, req, workdir, log, progress)
+
+
+def _wan_animate_face_crop(image, pose_module):
+    """静止表情用に参照立ち絵の頭部を正方形クロップする。
+
+    Wan-Animate公式前処理のface動画は駆動動画の顔クロップ列である。工房の
+    歩行では表情を動かさないので、参照の頭部を1枚だけ切り出して全時刻へ
+    反復する。前景検出はpose_videoと共有し、失敗時だけ四隅色差へ退避する。
+    """
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    im = image.convert("RGB")
+    arr = np.asarray(im)
+    try:
+        fg = pose_module._fg_mask(im)
+    except Exception:
+        border = np.concatenate((arr[0], arr[-1], arr[:, 0], arr[:, -1]))
+        bgv = np.median(border.astype(np.float32), axis=0)
+        fg = np.linalg.norm(arr.astype(np.float32) - bgv, axis=2) > 32.0
+    ys, xs = np.where(fg)
+    if len(xs) < 40:
+        return ImageOps.fit(im, (512, 512), method=Image.Resampling.LANCZOS)
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    char_h = y1 - y0 + 1
+    char_w = x1 - x0 + 1
+    # 巨頭チビを含め、頭髪・耳・顎まで入る上部約48%。肩より下は除く。
+    side = max(32, round(max(char_w * 1.08, char_h * 0.48)))
+    side = min(side, im.width)
+    cx = (x0 + x1) / 2.0
+    left = max(0, min(im.width - side, round(cx - side / 2)))
+    top = max(0, min(im.height - side, round(y0 - char_h * 0.025)))
+    crop = im.crop((left, top, left + side, top + side))
+    bg = tuple(int(x) for x in np.median(
+        np.concatenate((arr[0], arr[-1], arr[:, 0], arr[:, -1])),
+        axis=0))
+    return ImageOps.pad(crop, (512, 512), method=Image.Resampling.LANCZOS,
+                        color=bg, centering=(0.5, 0.5))
+
+
+@register
+class Wan22AnimatePilotAdapter(VideoAdapter):
+    """Wan2.2-Animateの歩容追従を判定する隔離実験アダプタ。
+
+    現行AniSora経路や工房の4択からは呼ばない。直接 /api/generate へ
+    model=wan22animate_pilot を指定した検証だけが到達する。
+    """
+    id = "wan22animate_pilot"
+    label = "実験: Wan2.2-Animate-14B (姿勢動画で歩行)"
+    desc = ("工房の連続OpenPose歩容と静止顔動画をWan-Animateへ直接入力する"
+            "隔離試験。現行AniSora生成には影響しない。")
+    requires = "96GB GPU推奨 / DL約77GB / 公式標準20step"
+    modes = ("i2v",)
+    repo = "Wan-AI/Wan2.2-Animate-14B-Diffusers"
+    cache_repos = (repo,)
+    disk_gb = 77
+    defaults = {"width": 480, "height": 864, "num_frames": 77,
+                "fps": 16, "steps": 20, "guidance": 1.0}
+
+    def __init__(self):
+        super().__init__()
+        self.pipe = None
+
+    def ensure_loaded(self, log):
+        _require_deps(log)
+        import torch
+        from diffusers import WanAnimatePipeline
+        log(f"読み込み開始: {self.repo} (bf16・初回DL約77GB)")
+        self.pipe = WanAnimatePipeline.from_pretrained(
+            self.repo, torch_dtype=_pick_dtype(), low_cpu_mem_usage=True)
+        _apply_offload(self.pipe, log)
+        self.loaded = True
+
+    def unload(self, log):
+        self.pipe = None
+        self.loaded = False
+
+    @staticmethod
+    def _save_control_video(frames, fps: int, workdir: Path, log):
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return
+        pdir = workdir / "control_pose_frames"
+        pdir.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(frames):
+            frame.save(pdir / f"{i:05d}.png")
+        encode_mp4(ffmpeg, pdir, fps, workdir / "control_pose.mp4")
+        log("検証用の姿勢制御動画を保存: control_pose.mp4")
+
+    def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
+        import torch
+
+        if not req.images:
+            raise RuntimeError("Wan-Animateには参照キャラ画像が必要です")
+        w = _snap(req.width, 16, 256)
+        h = _snap(req.height, 16, 256)
+        steps = max(4, min(30, int(req.steps or 20)))
+        if steps < 20:
+            log(f"注意: Wan-Animateは非蒸留。公式20stepより少ない{steps}stepで実行")
+        direction = str(req.extra.get("direction") or "front")
+        raw_sequence = req.extra.get("direction_sequence")
+        if isinstance(raw_sequence, str):
+            directions = [x.strip() for x in raw_sequence.split(",")
+                          if x.strip()]
+        elif isinstance(raw_sequence, (list, tuple)):
+            directions = [str(x).strip() for x in raw_sequence if str(x).strip()]
+        else:
+            directions = []
+
+        eng = _engine()
+        pv = eng["pose_video"]
+        check_dirs = directions or [direction]
+        bad_dirs = [d for d in check_dirs if d not in pv.DIR_YAW]
+        if bad_dirs:
+            raise RuntimeError(f"未対応の方向です: {', '.join(bad_dirs)}")
+        ref = req.images[0].convert("RGB")
+        pose_kwargs = {
+            "ref_image": ref,
+            "arm_swing": float(req.extra.get("arm_swing", 1.0)),
+            "leg_swing": float(req.extra.get("leg_swing", 1.0)),
+            "bob": float(req.extra.get("bob", 1.0)),
+            "leg_cross": float(req.extra.get("leg_cross", 1.0)),
+            "face68": False,
+            # この実験は正面参照1枚を全方向へ共用する。既存のヨー追従は
+            # 斜め方向の「自方向立ち絵」を測る前提なので、正面絵を渡すと
+            # 顔正面化(auto)が発火して頭だけ0度になる。Wan-Animateでは
+            # 操作骨を真の8方位にするため、頭も胴も公称DIR_YAWへ固定する。
+            "yaw_adapt": False,
+        }
+        if directions:
+            segment_frames = max(9, int(req.extra.get("segment_frames", 49)))
+            if segment_frames % 4 != 1:
+                old = segment_frames
+                segment_frames = ((segment_frames - 1) // 4) * 4 + 1
+                log(f"区間フレーム制約4k+1へ丸め: {old} -> {segment_frames}")
+            pose_frames = []
+            for i, d in enumerate(directions):
+                part = pv.build_walk_pose_frames(
+                    d, segment_frames, w, h, **pose_kwargs)
+                # Wan-Animateの次区間は前区間末尾1fを条件として共有する。
+                pose_frames.extend(part if i == 0 else part[1:])
+            n = len(pose_frames)
+            direction = "sequence"
+            log(f"8方向連結姿勢動画: {' → '.join(directions)} / "
+                f"{segment_frames}f区間(1f重複) / 合計{n}f")
+        else:
+            n = max(5, int(req.num_frames))
+            if n % 4 != 1:
+                old = n
+                n = ((n - 1) // 4) * 4 + 1
+                log(f"フレーム制約4k+1へ丸め: {old} -> {n}")
+            segment_frames = n
+            log(f"姿勢動画生成: {direction} / {w}x{h} / {n}f")
+            pose_frames = pv.build_walk_pose_frames(
+                direction, n, w, h, **pose_kwargs)
+        default_face = "blank" if directions else "reference"
+        face_mode = str(req.extra.get("face_mode") or default_face).lower()
+        if face_mode == "blank":
+            from PIL import Image
+            face = Image.new("RGB", (512, 512), (0, 0, 0))
+            log("顔モーション条件: blank (背面化と正面顔の競合を除外)")
+        else:
+            face_mode = "reference"
+            face = _wan_animate_face_crop(ref, pv)
+            log("顔モーション条件: 静止参照クロップ")
+        face.save(workdir / "control_face.png")
+        face_frames = [face.copy() for _ in range(n)]
+        self._save_control_video(pose_frames, req.fps, workdir, log)
+        progress(0.04)
+
+        prompt = req.prompt.strip() or (
+            "Full-body chibi anime game character, exactly the same character, "
+            "costume, colors and proportions as the reference image. The character "
+            "walks in place facing directly forward with clear alternating left and "
+            "right steps, natural opposite arm swings and visible foot contact. The "
+            "torso and head remain facing forward. Fixed camera, fixed framing, flat "
+            "solid magenta background, no added objects, smooth cyclic motion.")
+        if abs(float(req.guidance) - 1.0) > 1e-6:
+            log("Wan-Animate公式設定に合わせguidanceを1.0へ固定")
+        gen_device = "cuda" if torch.cuda.is_available() else "cpu"
+        generator = torch.Generator(device=gen_device).manual_seed(int(req.seed))
+        segment_count = len(directions) if directions else 1
+        callback_count = [0]
+
+        def _progress_cb(pipe, step_index, timestep, callback_kwargs):
+            callback_count[0] += 1
+            total = max(1, steps * segment_count)
+            progress(0.05 + 0.85 * min(1.0, callback_count[0] / total))
+            return callback_kwargs
+
+        log(f"Wan-Animate生成開始: {steps}step x {segment_count}区間 / "
+            f"CFG 1.0 / seed {req.seed}")
+        result = self.pipe(
+            image=ref, pose_video=pose_frames, face_video=face_frames,
+            prompt=prompt, negative_prompt=req.negative or None,
+            height=h, width=w, segment_frame_length=segment_frames,
+            prev_segment_conditioning_frames=1,
+            num_inference_steps=steps, mode="animate", guidance_scale=1.0,
+            motion_encode_batch_size=max(1, min(16, int(
+                req.extra.get("motion_encode_batch_size", 8)))),
+            generator=generator, output_type="np",
+            callback_on_step_end=_progress_cb,
+            callback_on_step_end_tensor_inputs=["latents"])
+        frames = result.frames[0]
+        progress(0.94)
+        meta = {"model": self.repo, "direction": direction,
+                "direction_sequence": directions or None,
+                "segment_frames": segment_frames, "width": w,
+                "height": h, "frames": n, "fps": req.fps, "steps": steps,
+                "seed": req.seed, "guidance": 1.0,
+                "face_motion": ("blank" if face_mode == "blank" else
+                                "static_reference_head_crop")}
+        (workdir / "pilot_settings.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        out = _frames_to_mp4(list(frames), req.fps, workdir, log)
+        _free_cuda(log)
+        return out
+
+
 # ---------------------------------------------------------------- ジョブ管理
 JOBS: dict[str, dict] = {}
 JOB_ORDER: list[str] = []
@@ -5148,6 +5975,67 @@ def _wp_bobbing_fixed_refs(canvas_rgb, generate_mask, head_keep, layout,
         masks_out[-1].save(buf, format="PNG")
         masks_b64.append(_b64.b64encode(buf.getvalue()).decode("ascii"))
     return refs_out, masks_out, masks_b64
+
+
+def _wp_dynamic_pose_masks(canvas_rgb, allowed_generate_mask, pose_frames,
+                           nf: int, source_radius: int = 4,
+                           pose_radius: int = 24):
+    """frame0は全面固定、以後は実シルエット+骨周囲だけ生成。
+
+    旧A型maskはキャラbboxの長方形を開け、腕の高さの背景まで
+    AIに描き直させていた。その余白が暗い帯になるため、
+    元絵のマゼンタキー実シルエットと、各時刻のPose線を
+    太らせた移動先のみを開ける。allowed_generate_maskの外(顔/
+    背景)は必ず固定。戻り値=(PIL L列, base64 PNG列)。"""
+    import base64 as _b64
+    import io as _io
+    import numpy as np
+    from PIL import Image
+
+    base_rgb = np.asarray(canvas_rgb.convert("RGB"), dtype=np.int16)
+    allowed = np.asarray(allowed_generate_mask, dtype=np.uint8) >= 128
+    if allowed.shape != base_rgb.shape[:2]:
+        raise ValueError("動的Pose maskの寸法がcanvasと不一致")
+
+    def _box_dilate(mask, radius):
+        """SciPy依存なしのO(HW)矩形膨張 (積分画像)。"""
+        r = max(0, int(radius))
+        if r <= 0:
+            return mask.astype(bool, copy=True)
+        src = np.pad(mask.astype(np.uint8), ((r, r), (r, r)))
+        ii = np.pad(src, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+        k = 2 * r + 1
+        win = ii[k:, k:] - ii[:-k, k:] - ii[k:, :-k] + ii[:-k, :-k]
+        return win > 0
+
+    # 工房キーと同じ min(R,B)-G>=70 を背景と見なす。
+    fg = ((np.minimum(base_rgb[..., 0], base_rgb[..., 2])
+           - base_rgb[..., 1]) < 70)
+    source_body = _box_dilate(fg & allowed, source_radius) & allowed
+    poses = list(pose_frames or [])
+    if not poses:
+        raise ValueError("動的Pose maskにPoseフレームがありません")
+    if len(poses) != int(nf):
+        ids = [round(i * (len(poses) - 1) / max(1, int(nf) - 1))
+               for i in range(int(nf))]
+        poses = [poses[i] for i in ids]
+
+    images, encoded = [], []
+    for k, pose in enumerate(poses):
+        if k == 0:
+            dyn = np.zeros(allowed.shape, dtype=bool)
+        else:
+            pa = np.asarray((pose if pose.size == canvas_rgb.size
+                             else pose.resize(canvas_rgb.size)).convert("RGB"))
+            ink = pa.max(axis=2) >= 40
+            pose_env = _box_dilate(ink & allowed, pose_radius) & allowed
+            dyn = source_body | pose_env
+        image = Image.fromarray((dyn.astype(np.uint8) * 255), "L")
+        buf = _io.BytesIO()
+        image.save(buf, format="PNG")
+        images.append(image)
+        encoded.append(_b64.b64encode(buf.getvalue()).decode("ascii"))
+    return images, encoded
 
 
 def _wp_motion_prompt(pack: Path) -> str:
@@ -6544,15 +7432,18 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         _settings_steps = _wp_knob_int(
             _kn, "refine_total", 8, 4, 12)
         _settings_release = min(_settings_steps, _wp_knob_int(
-            _kn, "head_release_steps", 5, 0, 12))
+            _kn, "head_release_steps", 0, 0, 12))
+        _settings_pose = _wp_knob_float(
+            _kn, "pose_weight", 0.25, 0.05, 0.50)
         j["_generation_settings"] = {
             "engine": "anisora",
             "directions": len(_WP_DIRS),
             "steps": _settings_steps,
             "motion": _wp_knob_float(_kn, "motion", 3.0, 2.0, 4.0),
-            "head_bob": _wp_knob_float(_kn, "head_bob", 1.0, 0.0, 2.0),
+            "pose_weight": _settings_pose,
+            "image_weight": 1.0 - _settings_pose,
             "head_release_steps": _settings_release,
-            "inpaint": "timed_face_release",
+            "inpaint": "frame0_fixed_dual_condition",
             "pixel_paste": False,
             "server_version": __version__,
         }
@@ -6711,6 +7602,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             except Exception:                 # noqa: BLE001
                 pass
             log(f"[{tag}] 実験line_puppet: 線画パペット制御 (骨で線を駆動)")
+        elif plan_raw == "ai":
+            # 新本線AIも姿勢情報はOpenPose列として作る。
+            # VACEには渡さず、anisora_inpaint分岐のHigh側
+            # 二条件forwardにだけ使う。
+            frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
+            log(f"[{tag}] AI生成: AniSora High用OpenPose歩行列")
         elif plan == "biped":
             _fp_save = os.environ.get("SM_POSE_FACE_POINTS")
             _bp_save = os.environ.get("SM_POSE_BODY_PARTS")
@@ -7039,11 +7936,12 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _msk2, _mb64, _head2 = _wp_face_keep_mask(
                     canvas, layout, w, h,
                     face_boxes=_fbx2, refs=refs, return_head_keep=True)
-                _head_bob2 = _wp_knob_float(
-                    _kn, "head_bob", 1.0, 0.0, 2.0)
-                _art2, _masks2, _mb64s = _wp_bobbing_fixed_refs(
-                    canvas, _msk2, _head2, layout,
-                    nf, idle_n, gait_end, bob_scale=_head_bob2)
+                # 今回確定した契約: 固定側は常にframe0由来。
+                # 顔参照やmaskをボブ移動させず、体の動きは
+                # HighのPose条件だけが担う。
+                _art2 = [canvas.convert("RGB").copy() for _ in range(nf)]
+                _masks2 = None
+                _mb64s = [_mb64] * nf
                 # Lowでは顔/頭部だけ開放し、bbox外背景のlatent固定は継続。
                 # 最終画素貼り戻しはしないので、境界をLowが自然に描ける。
                 import base64 as _b64LOW
@@ -7064,17 +7962,19 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _masks2 = None
                 _mb64s = [_mb64] * nf
                 _low_mb64 = None
+            # frame0=全面固定、以後=元絵の実シルエット+
+            # その時刻のPose周囲だけ生成。bbox長方形の余白を
+            # AIに背景再描画させない。
+            _masks2, _mb64s = _wp_dynamic_pose_masks(
+                canvas, _msk2, frames, nf)
             try:
                 _art2[0].save(out / f"control_{tag}_staticbase.png")
                 from PIL import Image as _ImgAI
                 _ImgAI.fromarray(_msk2, "L").save(
                     out / f"control_{tag}_spatialmask.png")
-                if _masks2:
-                    _peak2 = idle_n + max(1, (gait_end - idle_n) // 8)
-                    _art2[_peak2].save(
-                        out / f"control_{tag}_headbob_ref.png")
-                    _masks2[_peak2].save(
-                        out / f"control_{tag}_headbob_mask.png")
+                _peak2 = idle_n + max(1, (gait_end - idle_n) // 4)
+                _masks2[min(nf - 1, _peak2)].save(
+                    out / f"control_{tag}_dynamicmask.png")
             except Exception:                 # noqa: BLE001
                 pass
             j["detail"] = f"[{tag}] AniSora単体インペイント"
@@ -7085,10 +7985,14 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # 半球2枚×24stepに近い総予算のまま、注意を1体へ集中できる。
             _st_ai = _wp_knob_int(_kn, "refine_total", 8, 4, 12)
             _release_ai = min(_st_ai, _wp_knob_int(
-                _kn, "head_release_steps", 5, 0, 12))
-            log(f"[{tag}] anisora_inpaint mode={_im_mode}: 頭部ボブ追従参照+"
+                _kn, "head_release_steps", 0, 0, 12))
+            _pose_weight_ai = _wp_knob_float(
+                _kn, "pose_weight", 0.25, 0.05, 0.50)
+            _guide2 = [canvas.convert("RGB").copy()] + list(frames[1:])
+            log(f"[{tag}] anisora_inpaint mode={_im_mode}: frame0全固定+"
                 "体領域純ノイズ (AniSora単体・VACE不使用、"
-                f"開始σ={_sg2} steps={_st_ai} head_bob={_head_bob2} "
+                f"開始σ={_sg2} steps={_st_ai} "
+                f"Pose={_pose_weight_ai:.0%}/画像={1-_pose_weight_ai:.0%} "
                 f"頭部固定={_st_ai - _release_ai}step/"
                 f"終盤開放={_release_ai}step)")
             extra2 = {"refine_frames_b64": pv.encode_frames_b64(_art2),
@@ -7096,7 +8000,17 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                       "refine_cond_still": True,
                       "latent_spatial_mask_b64": _mb64s,
                       "latent_spatial_empty": True,
+                      "latent_spatial_source_mix": 0.0,
                       "latent_spatial_release_last_steps": _release_ai,
+                      "anisora_guidance_frames_b64":
+                          pv.encode_frames_b64(_guide2),
+                      "anisora_guidance_mask": "first",
+                      "anisora_guidance_release_low": True,
+                      "anisora_guidance_spatial_condition": True,
+                      "anisora_guidance_neutralize_black": True,
+                      "anisora_dual_condition": True,
+                      "anisora_dual_condition_image_weight":
+                          1.0 - _pose_weight_ai,
                       "motion_score": _wp_knob_float(
                           _kn, "motion", 3.0, 2.0, 4.0)}
             if _low_mb64:
