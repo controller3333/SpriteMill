@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.54"  # 0.10.54: キャラ別モーション文 (母艦Codexが依頼の日本語コンセプトを英語モーション記述へ翻案→pack同梱→動画プロンプト末尾へ注入。「日本語がモデルに届かない」問題の正面解決) / 0.10.53: A型インペイント既定化 (ユーザー図解「Aにしないと体は動かない」— 凍結=顔窓+bbox外背景・生成=体全体。B型=下部帯は inpaint_mode:"bottom" で残置) / 0.10.52: インペイント系マスクを顔認識対応 (切断線=実測顔ボックス下端+4%より下にクランプ。赤さんAI通過の瞬き実障害: 巨頭チビはbbox比率の切断線が顔を横切る)。pipelineは*_ai依頼で顔ボックスをVLM実測しshare_packが同梱 / 0.10.51: 体格12択のAI通過 (*_ai=anisora_inpaint既定・体格別frac。素のやわらか値は母艦の手続き経路へ=このサーバには来ない) / 0.10.50: biped_legsの正式経路にlegs_mask=0.55を既定組込 (r3昇格: 忍者実走で黒い塊=参照の上げた脚の残存が完全消滅・上半身は実画素凍結・脚2本のストライド健全) / 0.10.49: 実験r3=legs_mask (VACEマスク同居: 上半身=実画素凍結・脚領域=骨格入り生成・idle/静止=全身実画素。忍者の「参照の上げた脚が第3の脚として残存」の構造的排除) / 0.10.48: 実験r2=anisora_inpaint (手続きアニメ土台+空間latent固定=RePaint式。凍結領域は手続き運動ごと画素完全、四肢だけAniSoraがσ再加工。VACE不使用=ユーザー発案「固定はマスク済みならAniSora単体で完結」) / 0.10.47: 実験r=region_mask (キャラ下部だけ空の潜在=標準インペイントで部分生成、上部=実画素保持) + 実験p=procedural (参照絵へ手続き運動を直接適用・生成なし=同一性画素完全。2026-07-21ユーザー発案「ゆらゆら・上下・変形だけならAI不要では」) / 0.10.46: 四肢二重化対策 (biped_legs=参照の上げた脚を「動く2本のうちの1本」と正宣言 / quadruped_bone=手2つ膝2つの正宣言+crawl腕振り0.55→0.35で骨格と参照の手の権威距離を縮小。2026-07-21実走FB「手が分裂・脚が増える」) / 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07-21ユーザー裁定「体型という名前は撤退。二足歩行や四足歩行も含めてVACE依存を完全に捨て、動画AI処理は共通してAniSoraのみの頭部固定インペイント方式に」— 新値ai=AI生成(既定)をanisora_inpaint A型へ、stretch_v/stretch_h/move_vはGPU到達時も手続き完結。VACE骨格系(biped等)はレガシー互換で残置=旧依頼のpack_ready戻し専用。★同時に実穴修正: share_packのpack metaにエイリアス解決後のベース体格しか載らず、*_aiのGPU自動ルーティングが実配線では一度も発火していなかった — run_configにbody_plan_rawを永続化しmetaは生値を書く) / 0.10.56: 背面の頭部固定 (A型インペイント: 顔ボックス無し方向=背面系は従来bbox全体生成で頭部が無防備=振り向き顔の発明を許していた。実測方向の顔帯中央値から頭部帯を推定して凍結・横幅=シルエット実測。2026-07-21ユーザー指摘「こっち向く危険」) / 0.10.55: 管理ノブσ/再加工stepsをAI通過(anisora_inpaint)経路へ配線 (σ=0.85・steps=24ハードコードの死にノブ解消。「AI通過の動き量レバー=σとmotion」が両方とも管理GUIから回せるように。優先順位=API明示>管理ノブ>経路既定0.85) / 0.10.54: キャラ別モーション文 (母艦Codexが依頼の日本語コンセプトを英語モーション記述へ翻案→pack同梱→動画プロンプト末尾へ注入。「日本語がモデルに届かない」問題の正面解決) / 0.10.53: A型インペイント既定化 (ユーザー図解「Aにしないと体は動かない」— 凍結=顔窓+bbox外背景・生成=体全体。B型=下部帯は inpaint_mode:"bottom" で残置) / 0.10.52: インペイント系マスクを顔認識対応 (切断線=実測顔ボックス下端+4%より下にクランプ。赤さんAI通過の瞬き実障害: 巨頭チビはbbox比率の切断線が顔を横切る)。pipelineは*_ai依頼で顔ボックスをVLM実測しshare_packが同梱 / 0.10.51: 体格12択のAI通過 (*_ai=anisora_inpaint既定・体格別frac。素のやわらか値は母艦の手続き経路へ=このサーバには来ない) / 0.10.50: biped_legsの正式経路にlegs_mask=0.55を既定組込 (r3昇格: 忍者実走で黒い塊=参照の上げた脚の残存が完全消滅・上半身は実画素凍結・脚2本のストライド健全) / 0.10.49: 実験r3=legs_mask (VACEマスク同居: 上半身=実画素凍結・脚領域=骨格入り生成・idle/静止=全身実画素。忍者の「参照の上げた脚が第3の脚として残存」の構造的排除) / 0.10.48: 実験r2=anisora_inpaint (手続きアニメ土台+空間latent固定=RePaint式。凍結領域は手続き運動ごと画素完全、四肢だけAniSoraがσ再加工。VACE不使用=ユーザー発案「固定はマスク済みならAniSora単体で完結」) / 0.10.47: 実験r=region_mask (キャラ下部だけ空の潜在=標準インペイントで部分生成、上部=実画素保持) + 実験p=procedural (参照絵へ手続き運動を直接適用・生成なし=同一性画素完全。2026-07-21ユーザー発案「ゆらゆら・上下・変形だけならAI不要では」) / 0.10.46: 四肢二重化対策 (biped_legs=参照の上げた脚を「動く2本のうちの1本」と正宣言 / quadruped_bone=手2つ膝2つの正宣言+crawl腕振り0.55→0.35で骨格と参照の手の権威距離を縮小。2026-07-21実走FB「手が分裂・脚が増える」) / 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -4707,8 +4707,15 @@ def _wp_move_params(plan: str, ph: float, cw: int, ch: int):
                 1.8 * s, 1.0, 1.0)
     if plan == "serpentine":
         return (round(cw * 0.02 * s), 0, 0.0, 1.0, 1.0)
-    if plan == "amorphous":
+    if plan in ("amorphous", "stretch_v"):
+        # 上下伸縮 (動きの型4択のstretch_v=amorphousと同式のスカッシュ)
         return (0, 0, 0.0, 1.0 + 0.04 * s, 1.0 - 0.06 * s)
+    if plan == "stretch_h":
+        # 左右伸縮 (動きの型4択 2026-07-21): x主体の伸縮+yで体積補償
+        return (0, 0, 0.0, 1.0 + 0.06 * s, 1.0 - 0.04 * s)
+    if plan == "move_v":
+        # 上下移動 (動きの型4択): flyingと同式の上下ボブ
+        return (0, round(-abs(ch * 0.012) * s), 0.0, 1.0, 1.0)
     return (0, round(-ch * 0.008 * abs(s)), 0.0, 1.0, 1.0)   # other
 
 
@@ -4775,6 +4782,18 @@ def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
     msk = np.zeros(arr.shape[:2], dtype=np.uint8)
     cols_n, rows_n, dirs_n = layout
     cwc, chc = w // cols_n, h // rows_n
+    # 背面の頭部固定 (2026-07-21ユーザー指摘「後ろ向きは頭部が無防備で
+    # こっち向く危険」): 顔ボックスの無い方向 (背面系) は従来bbox全体が
+    # 生成領域=頭部ごとAIに渡り、振り向き顔の発明を許していた。実測済み
+    # 方向の顔ボックス高さ帯の中央値から「顔が出うる帯」を推定して凍結
+    # する (立ち絵8方向は同一フォーマットなので相対高さは方向間で移送
+    # 可能)。全方向未実測なら推定不能=従来どおり
+    band = None
+    fb_vals = list((face_boxes or {}).values())
+    if fb_vals:
+        _ys0 = sorted(v[1] for v in fb_vals)
+        _ys1 = sorted(v[3] for v in fb_vals)
+        band = (_ys0[len(_ys0) // 2], _ys1[len(_ys1) // 2])
     for ci, dn in enumerate(dirs_n):
         if dn is None:
             continue
@@ -4804,6 +4823,27 @@ def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
                 gy1 = int(offy + fy1 * ih * s + py) + 1
                 msk[y0 + max(0, gy0):y0 + min(chc, gy1),
                     x0 + max(0, gx0):x0 + min(cwc, gx1)] = 0
+            except Exception:                 # noqa: BLE001
+                pass
+        elif band is not None and refs and dn in refs:
+            # 顔なしセル (背面系) の頭部帯凍結: 高さ=推定帯を上へ30%延長
+            # (額・生え際まで)、横幅=帯内のシルエット実測 (髪ごと)。
+            # 四足のおしり等、帯の外の芝居は生成領域のまま残る
+            try:
+                iw, ih = Image.open(refs[dn]).size
+                s = min(cwc / iw, chc / ih)
+                offy = (chc - ih * s) / 2.0
+                bh = (band[1] - band[0]) * ih * s
+                gy0 = max(0, int(offy + band[0] * ih * s - bh * 0.30))
+                gy1 = min(chc, int(offy + band[1] * ih * s
+                                   + bh * pad) + 1)
+                rows = sub[gy0:gy1, :]
+                xs_b = np.nonzero(rows.any(axis=0))[0]
+                if xs_b.size:
+                    mx = max(2, int(cwc * 0.02))
+                    hx0 = max(0, int(xs_b.min()) - mx)
+                    hx1 = min(cwc, int(xs_b.max()) + 1 + mx)
+                    msk[y0 + gy0:y0 + gy1, x0 + hx0:x0 + hx1] = 0
             except Exception:                 # noqa: BLE001
                 pass
     buf = _io.BytesIO()
@@ -6080,8 +6120,17 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             "quadruped_bone": "quadruped",
             "quadruped_ai": "quadruped", "flying_ai": "flying",
             "amorphous_ai": "amorphous",
-            "serpentine_ai": "serpentine"}.get(plan_raw, plan_raw)
-    if plan_raw == "biped_legs":
+            "serpentine_ai": "serpentine",
+            # 動きの型4択 (0.11.0、2026-07-21ユーザー裁定「体型という
+            # 名前は撤退・AI経路はAniSora頭部固定インペイントに一本化」):
+            # ai=AI生成は中立のotherとして扱う (経路はanisora_inpaintが
+            # 支配するので骨格系の分岐には入らない)。stretch_v/stretch_h/
+            # move_vは素通し=手続き式で分岐 (通常は母艦完結でここに来ない)
+            "ai": "other"}.get(plan_raw, plan_raw)
+    if plan_raw == "ai":
+        _wp_print("[walkpack] 動きの型=AI生成: AniSora頭部固定インペイント"
+                  " (VACE不使用)")
+    elif plan_raw == "biped_legs":
         _wp_print("[walkpack] body_plan=biped_legs: 骨格=脚のみ "
                   "(上半身の姿勢は参照立ち絵に委ねる)")
     elif plan_raw == "quadruped_bone":
@@ -6115,13 +6164,20 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
-    if plan_raw.endswith("_ai"):
-        # 体格12択の「AI通過」(2026-07-21ユーザー裁定): インペイント式=
-        # 手続き土台+空間latent固定 (実験r2の正式化)。fracは体格別
-        # (flying/serpentineのAI通過は実走未検証 — 初回依頼で要目視)
+    if plan_raw.endswith("_ai") or plan_raw == "ai":
+        # AI経路の一本化 (0.11.0ユーザー裁定「動画AI処理は共通して
+        # AniSoraのみの頭部固定インペイント方式」): 動きの型4択の
+        # ai=AI生成 (既定) と、旧12択の *_ai=AI通過 (レガシー) の両方が
+        # ここへ来る。インペイント式=手続き土台+空間latent固定 (実験r2の
+        # 正式化)。fracは旧体格別値を温存 (face既定では未使用)
         _exp.setdefault("anisora_inpaint", {
             "quadruped_ai": 0.6, "amorphous_ai": 0.55,
             "serpentine_ai": 0.6, "flying_ai": 0.5}.get(plan_raw, 0.55))
+    if plan_raw in ("stretch_v", "stretch_h", "move_v"):
+        # 動きの型4択の加工系: 通常は母艦の手続きアニメで完結しGPUには
+        # 来ないが、pack_ready戻し (歩行だけ再生成する管理手順) で来た
+        # ときも同じ画素完全の手続きで作る (VACE/骨格には流さない)
+        _exp.setdefault("procedural", True)
     if plan_raw == "biped_legs":
         # 体格メニューの正式経路: 骨格=脚のみ+姿勢維持文面+legs_mask
         # (実験h→r3の昇格 2026-07-21: 文面の正宣言だけでは参照の上げた脚が
@@ -6619,9 +6675,16 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 # A型 (2026-07-21ユーザー図解): 凍結=顔窓+背景、体は全部
                 # AIに渡す — B型 (下部帯のみ生成) は顔より上の胴まで凍結
                 # してしまい、芝居が下のひと帯に限られていた
+                _fbx2 = _wp_face_boxes(pack)
+                if not _fbx2:
+                    # 頭部固定はface_boxes.jsonに全面依存 — 不在のまま生成
+                    # すると頭部が無防備 (振り向き顔の発明リスク)。落とさず
+                    # 続行するが、目視検証で気づけるよう大きく残す
+                    log(f"[{tag}] ★face_boxes不在: 頭部固定なしで生成 "
+                        "(パックの顔ボックス実測を確認すること)")
                 _msk2, _mb64 = _wp_face_keep_mask(
                     canvas, layout, w, h,
-                    face_boxes=_wp_face_boxes(pack), refs=refs)
+                    face_boxes=_fbx2, refs=refs)
             else:
                 _msk2, _mb64 = _wp_bottom_mask(
                     canvas, layout, w, h, _frac2,
@@ -6635,11 +6698,18 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             except Exception:                 # noqa: BLE001
                 pass
             j["detail"] = f"[{tag}] AniSora単体インペイント"
+            # σ/stepsは管理ノブを尊重する (2026-07-21監査: 管理GUIのσと
+            # 再加工stepsがこの経路だけ0.85/24ハードコードで一切届かない
+            # 死にノブだった — キー錨経路の監査案Fと同型)。優先順位は
+            # 本線stage2と同じ: API明示 > 管理ノブ(env) > 経路既定0.85
+            _env_sg = os.environ.get("SM_VACE_LR_REFINE", "").strip()
+            _sg2 = float(_exp.get("refine") or _env_sg or 0.85)
+            _st_ai = _wp_knob_int(_kn, "refine_total", 24, 4, 40)
             log(f"[{tag}] anisora_inpaint mode={_im_mode}: 手続き土台+"
                 "空間latent固定 (VACE不使用、face=顔窓凍結/体生成・"
-                "bottom=下部帯のみ生成)")
+                f"bottom=下部帯のみ生成) σ={_sg2} steps={_st_ai}")
             extra2 = {"refine_frames_b64": pv.encode_frames_b64(_art2),
-                      "refine_strength": float(_exp.get("refine") or 0.85),
+                      "refine_strength": _sg2,
                       "refine_cond_still": True,
                       "latent_spatial_mask_b64": _mb64,
                       "motion_score": _wp_knob_float(
@@ -6650,7 +6720,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             jid2 = submit_job(_wmAI, GenRequest(
                 mode="i2v", prompt=prompt, images=[canvas],
                 width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
-                steps=24, seed=seed, guidance=1.0, extra=extra2))
+                steps=_st_ai, seed=seed, guidance=1.0, extra=extra2))
             sj2 = _wp_wait(j, jid2, s1lo, s2hi)
             cvid = out / f"canvas_{tag}.mp4"
             shutil.copy2(sj2["path"], cvid)
