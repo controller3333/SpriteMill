@@ -351,9 +351,12 @@ def _crawl_J(fig: Figure, angles: dict) -> dict:
         J[f"knee_{tag}"] = knee
         J[f"ankle_{tag}"] = ankle
         J[f"toe_{tag}"] = toe
-    # 腕=前脚: 肩(前方)から真下へ、振り角で前後スイング。手が接地点
+    # 腕=前脚: 肩(前方)から真下へ、振り角で前後スイング。手が接地点。
+    # ★振り係数0.55→0.35 (2026-07-21実走: 骨格の手が参照の接地した手から
+    # 離れるほど「両方の権威」で手が二重化する — 振幅を縮めて権威の
+    # 距離を縮める。脚は0.55のまま=膝の位置ズレは実害が出ていない)
     for side, tag in ((+1, "R"), (-1, "L")):
-        psi = _m.radians(float(angles.get(f"sh{tag}", 0.0)) * 0.55)
+        psi = _m.radians(float(angles.get(f"sh{tag}", 0.0)) * 0.35)
         sh = (side * fig.sh_x, 0.42 * T, 0.18 * T)
         elbow = (sh[0], sh[1] - 0.22 * T * _m.cos(psi),
                  sh[2] + 0.22 * T * _m.sin(psi))

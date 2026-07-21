@@ -46,7 +46,7 @@ from pathlib import Path, PurePosixPath
 # CUDAの断片化緩和(torchの初回import前に効かせる必要があるためここで設定)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-__version__ = "0.10.45"  # 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+__version__ = "0.10.50"  # 0.10.50: biped_legsの正式経路にlegs_mask=0.55を既定組込 (r3昇格: 忍者実走で黒い塊=参照の上げた脚の残存が完全消滅・上半身は実画素凍結・脚2本のストライド健全) / 0.10.49: 実験r3=legs_mask (VACEマスク同居: 上半身=実画素凍結・脚領域=骨格入り生成・idle/静止=全身実画素。忍者の「参照の上げた脚が第3の脚として残存」の構造的排除) / 0.10.48: 実験r2=anisora_inpaint (手続きアニメ土台+空間latent固定=RePaint式。凍結領域は手続き運動ごと画素完全、四肢だけAniSoraがσ再加工。VACE不使用=ユーザー発案「固定はマスク済みならAniSora単体で完結」) / 0.10.47: 実験r=region_mask (キャラ下部だけ空の潜在=標準インペイントで部分生成、上部=実画素保持) + 実験p=procedural (参照絵へ手続き運動を直接適用・生成なし=同一性画素完全。2026-07-21ユーザー発案「ゆらゆら・上下・変形だけならAI不要では」) / 0.10.46: 四肢二重化対策 (biped_legs=参照の上げた脚を「動く2本のうちの1本」と正宣言 / quadruped_bone=手2つ膝2つの正宣言+crawl腕振り0.55→0.35で骨格と参照の手の権威距離を縮小。2026-07-21実走FB「手が分裂・脚が増える」) / 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -1242,7 +1242,8 @@ def _latent_pin_slots(frames, t_dim: int) -> list:
     return sorted(out)
 
 
-def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float):
+def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float,
+                       smask=None):
     """リファインの毎step後、固定スロットを (1-σ)x0 + σε へ描き戻す。
 
     SDEdit再デノイズは全フレームを自由に動かすため、歩行周期の位相が
@@ -1250,7 +1251,13 @@ def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float):
     描き戻しは初期化と同じ noise を使い、固定スロットにflow matchingの
     直線補間路そのものを歩かせる — モデルから見て軌道上の点なので予測が
     暴れず、終端σ=0で厳密にstage1へ着地する。release>0 ならσ<release の
-    終盤stepは描き戻しを止め、質感の馴染ませに開放する。"""
+    終盤stepは描き戻しを止め、質感の馴染ませに開放する。
+
+    smask (2026-07-21ユーザー発案「固定すべきところはマスク済みなら
+    AniSoraのみで完結できるのでは」): 空間方向のlatent固定 (RePaint式)。
+    bool tensor [Hlat, Wlat]、True=固定 (全フレームでベース動画の軌道に
+    束縛)。VACEのマスク条件付けに依存しないインペイントがstage2単体で
+    成立する。"""
     def cb(pipe, step_index, timestep, callback_kwargs):
         callback_kwargs = (inner(pipe, step_index, timestep, callback_kwargs)
                            or callback_kwargs)
@@ -1264,6 +1271,11 @@ def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float):
         ref = (1.0 - s) * x0 + s * noise
         for sl in slots:
             lat[:, :, sl] = ref[:, :, sl].to(lat.device, lat.dtype)
+        if smask is not None:
+            import torch as _t
+            m = smask.to(lat.device)              # [Hlat, Wlat] bool
+            refl = ref.to(lat.device, lat.dtype)
+            lat = _t.where(m.view(1, 1, 1, *m.shape), refl, lat)
         callback_kwargs["latents"] = lat
         return callback_kwargs
     return cb
@@ -2569,10 +2581,27 @@ class AniSoraAdapter(_WanA14BBase):
                 cond_img = _fit_image(req.images[0], w, h)
                 log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
                     "させないための参照注入)")
+            _smb = req.extra.get("latent_spatial_mask_b64")
+            _smask = None
+            if _smb:
+                # 空間latent固定 (2026-07-21ユーザー発案): Lマスク
+                # (255=生成/0=固定) をlatent格子 (1/8) に落とし、固定側を
+                # ベース動画の補間路へ束縛。VACE抜きのインペイント
+                from PIL import Image as _ImgSL
+                import base64 as _b64sl
+                import io as _iosl
+                _mi = (_ImgSL.open(_iosl.BytesIO(_b64sl.b64decode(_smb)))
+                       .convert("L").resize((x0.shape[-1], x0.shape[-2])))
+                import numpy as _npsl
+                _smask = torch.from_numpy(
+                    _npsl.asarray(_mi) < 128)     # True=固定
+                log(f"空間latent固定: {int(_smask.sum())}/"
+                    f"{_smask.numel()}セルを固定 (255=生成/0=固定)")
             cb = _step_callback(progress, tail)
-            if pin_slots:
+            if pin_slots or _smask is not None:
                 cb = _pin_step_callback(cb, sched, x0, noise,
-                                        pin_slots, pin_release)
+                                        pin_slots, pin_release,
+                                        smask=_smask)
             kw = dict(image=cond_img,
                       width=w, height=h, num_frames=n,
                       num_inference_steps=steps,
@@ -3241,6 +3270,24 @@ class VACEAdapter(_WanA14BBase):
                 for i in range(n)]
             log(f"キーフレーム補間: 保持{sorted(_keep)[:8]}"
                 f"{'…' if len(_keep) > 8 else ''} / 他{n - len(_keep)}fを生成")
+        _smask = req.extra.get("vace_mask_b64")
+        if _smask:
+            # 空間マスク (2026-07-21ユーザー発案「動かしたい部分だけマスク
+            # して空の潜在で埋める」— オランウータン例と同じ標準インペイント
+            # 用法): 各フレーム同形のLマスク (0=videoの実画素を保持 /
+            # 255=生成)。1枚だけ渡せば全フレームに適用
+            from PIL import Image as _ImgSM
+            import base64 as _b64s
+            import io as _ios
+            _mimgs = [
+                _ImgSM.open(_ios.BytesIO(_b64s.b64decode(b)))
+                .convert("L").resize((w, h))
+                for b in (_smask if isinstance(_smask, list) else [_smask])]
+            kw["mask"] = ([_mimgs[i % len(_mimgs)] for i in range(n)]
+                          if len(_mimgs) > 1
+                          else [_mimgs[0]] * n)
+            log(f"空間マスク: {len(_mimgs)}枚を{n}fへ適用 "
+                "(0=実画素保持/255=生成)")
         log(f"生成開始: {w}x{h} {n}f steps={steps} cfg={req.guidance} "
             f"骨格制御{len(control)}f cond={kw['conditioning_scale']}"
             + (" [latent直出し]" if emit_latent else ""))
@@ -4665,6 +4712,36 @@ def _wp_move_params(plan: str, ph: float, cw: int, ch: int):
     return (0, round(-ch * 0.008 * abs(s)), 0.0, 1.0, 1.0)   # other
 
 
+def _wp_bottom_mask(canvas_rgb, layout, w: int, h: int, frac: float):
+    """セルごとにキャラbbox下部fracを255=生成、他を0=固定にしたLマスク。
+
+    実験r (VACE空間マスク) と実験r2 (AniSora空間latent固定) の共通部品。
+    戻り値 = (ndarray uint8 [h, w], base64 PNG)。"""
+    import base64 as _b64
+    import io as _io
+    import numpy as np
+    from PIL import Image
+    arr = np.array(canvas_rgb.convert("RGB"))
+    mg = ((arr[..., 0] > 200) & (arr[..., 2] > 200) & (arr[..., 1] < 120))
+    msk = np.zeros(arr.shape[:2], dtype=np.uint8)
+    cols_n, rows_n, dirs_n = layout
+    cwc, chc = w // cols_n, h // rows_n
+    for ci, dn in enumerate(dirs_n):
+        if dn is None:
+            continue
+        x0, y0 = (ci % cols_n) * cwc, (ci // cols_n) * chc
+        sub = ~mg[y0:y0 + chc, x0:x0 + cwc]
+        ys, xs = np.nonzero(sub)
+        if ys.size < 50:
+            continue
+        cut = int(ys.max() - (ys.max() - ys.min() + 1) * frac)
+        msk[y0 + cut:y0 + ys.max() + 1,
+            x0 + xs.min():x0 + xs.max() + 1] = 255
+    buf = _io.BytesIO()
+    Image.fromarray(msk, "L").save(buf, format="PNG")
+    return msk, _b64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def _wp_face_boxes(pack: Path) -> dict:
     """pack/01_generation/face_boxes.json を読む (実験g3の顔限定線画用)。
 
@@ -4718,10 +4795,17 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
     from PIL import Image
     import tempfile as _tf
     base_refs = {}
+    _fill = (255, 0, 255) if mode == "art" else 0
     for d, rp in refs.items():
         im = Image.open(rp)
-        ref = (_wp_depth_ref(im) if mode == "depth"
-               else _wp_edge_ref(im))    # line=a-2のキャラ限定線画
+        if mode == "art":
+            # 実験p (手続きアニメ): 参照絵そのものを動かす。背景=マゼンタ
+            keyed = _wp_key(im)
+            ref = Image.new("RGB", keyed.size, (255, 0, 255))
+            ref.paste(keyed, (0, 0), keyed)
+        else:
+            ref = (_wp_depth_ref(im) if mode == "depth"
+                   else _wp_edge_ref(im))    # line=a-2のキャラ限定線画
         if face_boxes is not None:
             # 実験g3: 顔ボックスだけ残す (無い方向=背面等は全黒=制御なし)
             ref = (_wp_face_mask_ref(ref, face_boxes[d])
@@ -4750,28 +4834,31 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
                 if rot or sx != 1.0 or sy != 1.0:
                     ow, oh = out.size
                     out = out.rotate(rot, resample=Image.BILINEAR,
-                                     center=(ow / 2, oh * 0.9))
+                                     center=(ow / 2, oh * 0.9),
+                                     fillcolor=_fill)
                     if sx != 1.0 or sy != 1.0:
                         nw, nh = max(1, round(ow * sx)), max(1, round(oh * sy))
                         scaled = out.resize((nw, nh), Image.BILINEAR)
-                        out = Image.new(dim.mode, (ow, oh), 0)
+                        out = Image.new(dim.mode, (ow, oh), _fill)
                         # 足元 (下端中央) を基準に貼る=接地維持
                         out.paste(scaled, ((ow - nw) // 2, oh - nh))
                 if dx or dy:
-                    sh = Image.new(out.mode, out.size, 0)
+                    sh = Image.new(out.mode, out.size, _fill)
                     sh.paste(out, (dx, dy))
                     out = sh
             p = tmp / f"{d}_{hash(key) & 0xffffff:x}.png"
             out.save(p)
             drefs[d] = p
         fr = cv_mod.compose_reference(drefs, w, h, layout).convert("RGB")
-        # ★セル間隙・レターボックスのマゼンタを黒へ正規化 (a-2と同じ教訓:
-        # 骨格キャンバスは全面黒地=マゼンタ混じりの制御は分布外)
-        import numpy as _npM
-        fa = _npM.asarray(fr).astype(_npM.int16)
-        mg = (_npM.minimum(fa[..., 0], fa[..., 2]) - fa[..., 1]) >= 70
-        fa[mg] = 0
-        fr = Image.fromarray(fa.astype("uint8"), "RGB")
+        if mode != "art":
+            # ★セル間隙・レターボックスのマゼンタを黒へ正規化 (a-2と同じ
+            # 教訓: 骨格キャンバスは全面黒地=マゼンタ混じりの制御は分布外)。
+            # artモード (手続きアニメ) は成果物そのものなのでマゼンタ維持
+            import numpy as _npM
+            fa = _npM.asarray(fr).astype(_npM.int16)
+            mg = (_npM.minimum(fa[..., 0], fa[..., 2]) - fa[..., 1]) >= 70
+            fa[mg] = 0
+            fr = Image.fromarray(fa.astype("uint8"), "RGB")
         cache[key] = fr
         frames.append(fr)
     return frames
@@ -5265,7 +5352,8 @@ _WP_NO_PROPS = (
 
 def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
                plan: str = "biped", gait_run: bool = False,
-               keep_posture: bool = False) -> str:
+               keep_posture: bool = False,
+               crawl_bone: bool = False) -> str:
     """CANVAS_PROMPT + NO_WIND + (スカート/末尾静止節) + 方向明文。
 
     顔正面化/体ヨー追従の発動判定は compass_vace._run_layout と同じく
@@ -5287,13 +5375,23 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
         prompt += cv.NO_WIND
         if keep_posture:
             # biped_legs (体格メニュー「二足歩行(脚のみ固定)」): 上半身の
-            # 姿勢権威は参照立ち絵。歩様は参照ポーズが示すリズムに委ねる
+            # 姿勢権威は参照立ち絵。歩様は参照ポーズが示すリズムに委ねる。
+            # ★四肢の数を正宣言 (2026-07-21実走: 参照の「上げた脚」が
+            # 第3の脚として残存し骨格の2本と共存した — guidance=1.0で
+            # ネガ無効のため「参照の脚=動いている2本のうちの1本」と
+            # 正面から同一化する)
             prompt += (" The torso, head and arms of every figure keep "
                        "exactly the posture shown in the reference art "
                        "through the whole cycle -- only the legs move, "
                        "cycling in the rhythm the reference pose implies "
                        "(a walk, or a fast run if the pose is a running "
-                       "stance).")
+                       "stance). Every figure has exactly TWO legs and "
+                       "TWO arms at every moment: the lifted or bent leg "
+                       "seen in the reference art is simply one of these "
+                       "two legs in mid-stride, so it keeps cycling as a "
+                       "leg -- it never remains behind as a separate "
+                       "dark shape, and no limb ever splits or "
+                       "duplicates.")
         if gait_run:
             # 実験h (2026-07-21「走る忍者」): 依頼が走りの動き。guidance=1.0
             # でネガ無効のため正宣言のみ。上半身は参照姿勢の維持を明言する
@@ -5311,6 +5409,15 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
         prompt += cv.NO_WIND.replace("the walking motion itself",
                                      "the character's own movement")
         prompt += _WP_NO_PROPS
+        if crawl_bone:
+            # quadruped_bone (四つん這い骨格): 手の二重化対策の正宣言
+            # (2026-07-21実走: 骨格の手と参照の接地した手の位置ズレで
+            # 前に出した手が二重になった)
+            prompt += (" The creature has exactly TWO hands and TWO "
+                       "knees on the ground: the planted hands in the "
+                       "reference art are the same two hands seen "
+                       "mid-crawl, reaching forward one at a time -- "
+                       "no hand or leg ever splits into two.")
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     try:
         fr = refs.get("front")
@@ -5915,9 +6022,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
     if plan_raw == "biped_legs":
-        # 体格メニューの正式経路 (実験hの昇格): 骨格=脚のみ+姿勢維持文面
+        # 体格メニューの正式経路: 骨格=脚のみ+姿勢維持文面+legs_mask
+        # (実験h→r3の昇格 2026-07-21: 文面の正宣言だけでは参照の上げた脚が
+        # 「第3の脚」として残存した — VACEマスク同居で上半身=実画素凍結・
+        # 脚領域=骨格入り生成にすると構造的に排除される。忍者実走で確定)
         _exp.setdefault("legs_only", True)
         _exp.setdefault("keep_posture", True)
+        _exp.setdefault("legs_mask", 0.55)
     if (plan in (("flying",) + _WP_NAT_PLANS) and not _exp
             and plan_raw != "quadruped_bone"):
         # ★飛行の既定=キー錨方式 (2026-07-19ユーザー発案→イーリス/ドラゴン
@@ -5982,7 +6093,29 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                        .strip().lower() not in ("off", "0", "false", "no"))
                       and not (_exp.get("edge_idle") or _exp.get("edge_head")
                                or _exp.get("no_pose")))
-        if plan == "biped" and _exp.get("key_interp"):
+        if _exp.get("region_mask"):
+            # 実験r (2026-07-21ユーザー発案「動かしたい部分だけマスクして
+            # 空の潜在で埋める」— 標準インペイント用法): video=参照キャンバス
+            # の実画素 (完全な同一性)、キャラbbox下部 frac をセルごとに
+            # 灰色=空の潜在にし、そこだけ生成させる。骨格・線画は出さない
+            # (動きは文面とインペイント文脈に委ねる)
+            import numpy as _npRM
+            from PIL import Image as _ImgRM
+            _frac = max(0.2, min(0.8, float(_exp["region_mask"])))
+            _cv0 = cv.compose_reference(refs, w, h, layout).convert("RGB")
+            _msk, _exp["_region_mask_b64"] = _wp_bottom_mask(
+                _cv0, layout, w, h, _frac)
+            _arr2 = _npRM.array(_cv0)
+            _arr2[_msk > 0] = 127
+            _vf = _ImgRM.fromarray(_arr2)
+            frames = [_vf] * nf
+            try:
+                _vf.save(out / f"control_{tag}_regionmask.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            log(f"[{tag}] 実験region_mask={_frac}: キャラ下部を空の潜在で"
+                "生成 (上部=実画素保持)")
+        elif plan == "biped" and _exp.get("key_interp"):
             # 実験e (2026-07-20ユーザー発案・VACE-Fun Extension/Loop同型):
             # 実画像 (参照キャンバス=立ち絵コラージュ) をアンカーフレーム
             # (直立窓・周期境界・末尾静止) に置き、間は灰色=空の潜在。
@@ -6217,7 +6350,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         # 「骨格=抽象記号だから間引ける」系の裁定を共有する
         _bone = (plan == "biped" or plan_raw == "quadruped_bone")
         _free = _exp.get("free_idle")
-        if _free is None:
+        if (_exp.get("region_mask") or _exp.get("procedural")
+                or _exp.get("anisora_inpaint")):
+            _free = False        # 実画素/手続き経路に骨格系の後処理は無縁
+        elif _free is None:
             # ★既定ON (2026-07-20昇格): idle/末尾静止窓の骨格制御を出さず、
             # 立ち絵自身に姿勢を委ねる。静止フレームに「参照の姿勢」と
             # 「骨格の標準姿勢」が同時に権利主張する重ね合わせが四肢増産の
@@ -6249,8 +6385,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         # 実験g2 (2026-07-21): 非人型 (線画制御) はAPI明示のときだけ間引き
         # 可 — 既定は毎フレーム線画のまま (間引き昇格はA/B判定後)。
         # flyingは対象外 (ボブ骨格が動きの源で、間引くと静止化リスク)
-        _pe_on = (_bone
-                  or (_pe_exp > 1 and plan in _WP_NAT_PLANS))
+        _pe_on = ((_bone
+                   or (_pe_exp > 1 and plan in _WP_NAT_PLANS))
+                  and not _exp.get("region_mask")
+                  and not _exp.get("procedural")
+                  and not _exp.get("anisora_inpaint"))
         if _pev > 1 and _pe_on:
             # 実験f (2026-07-20ユーザー発案「3フレームごとくらいに制御して
             # 間を中割させる」→同日、神爺さん/裏ファール/岡田の3体A/Bで
@@ -6313,13 +6452,132 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験edge_idle v2: キャラ限定エッジ (セル枠なし)")
         prompt = _wp_prompt(eng, refs, layout, nf, plan=plan,
                             gait_run=bool(_exp.get("gait_run")),
-                            keep_posture=bool(_exp.get("keep_posture")))
+                            keep_posture=bool(_exp.get("keep_posture")),
+                            crawl_bone=(plan_raw == "quadruped_bone"))
+        if _exp.get("legs_mask"):
+            # 実験r3 (2026-07-21、忍者の黒い塊の決定打): VACEマスクの正規
+            # 用法で「上半身=実画素で凍結 (mask=0・video=参照キャンバス) /
+            # 脚領域=骨格入りで生成 (mask=255・video=脚骨格)」を1本に同居。
+            # 参照の上げた脚は凍結領域から物理的に排除され、脚領域には
+            # 骨格という動きの源が残る (実験rの静止化も回避)。
+            # idle/末尾静止はマスク全0=全身実画素 (完璧な静止コマ)
+            import numpy as _npLM
+            from PIL import Image as _ImgLM
+            _fracL = max(0.2, min(0.8, float(_exp["legs_mask"])))
+            _mskL, _mbL = _wp_bottom_mask(canvas, layout, w, h, _fracL)
+            _cvA = _npLM.array(canvas.convert("RGB"))
+            _mB = _mskL > 0
+            _blank = _ImgLM.new("L", (w, h), 0)
+            import io as _ioLM
+            import base64 as _b64LM
+            _bufB = _ioLM.BytesIO()
+            _blank.save(_bufB, format="PNG")
+            _mb_keep = _b64LM.b64encode(_bufB.getvalue()).decode("ascii")
+            _masks = []
+            _vid = []
+            for k, fr in enumerate(frames):
+                if k < idle_n or k > gait_end:
+                    _vid.append(canvas.convert("RGB"))
+                    _masks.append(_mb_keep)
+                else:
+                    _fa = _npLM.array(fr.convert("RGB"))
+                    _cmp = _npLM.where(_mB[..., None], _fa, _cvA)
+                    _vid.append(_ImgLM.fromarray(_cmp.astype("uint8")))
+                    _masks.append(_mbL)
+            frames = _vid
+            _exp["_legs_masks_b64"] = _masks
+            try:
+                frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                    out / f"control_{tag}_legsmask.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            log(f"[{tag}] 実験legs_mask={_fracL}: 上=実画素凍結 / "
+                "下=脚骨格入り生成 (idle/静止=全身実画素)")
+        if _exp.get("anisora_inpaint"):
+            # 実験r2 (2026-07-21ユーザー発案「固定すべきところはマスク済み
+            # ならVACE抜き・AniSora単体で完結できるのでは」): 土台=手続き
+            # アニメ (実験p) — 手続き運動が身体を運び (凍結領域も動いて
+            # いるのに画素完全)、空間latent固定 (RePaint式) で上部を凍結、
+            # 下部 (四肢) だけAniSoraがσ再加工で芝居をつける。VACE不使用
+            _frac2 = max(0.2, min(0.8, float(_exp["anisora_inpaint"])))
+            _art2 = _wp_moving_frames(cv, refs, plan, nf, idle_n, gait_end,
+                                      w, h, layout, mode="art")
+            _msk2, _mb64 = _wp_bottom_mask(canvas, layout, w, h, _frac2)
+            try:
+                _art2[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                    out / f"control_{tag}_procbase.png")
+                from PIL import Image as _ImgAI
+                _ImgAI.fromarray(_msk2, "L").save(
+                    out / f"control_{tag}_spatialmask.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            j["detail"] = f"[{tag}] AniSora単体インペイント"
+            log(f"[{tag}] 実験anisora_inpaint={_frac2}: 手続き土台+"
+                "空間latent固定 (VACE不使用・下部のみ生成)")
+            extra2 = {"refine_frames_b64": pv.encode_frames_b64(_art2),
+                      "refine_strength": float(_exp.get("refine") or 0.85),
+                      "refine_cond_still": True,
+                      "latent_spatial_mask_b64": _mb64,
+                      "motion_score": _wp_knob_float(
+                          _kn, "motion", 3.0, 2.0, 4.0)}
+            if offload:
+                extra2["offload"] = offload
+            _wmAI = "mock" if j.get("_wp_mock") else "anisora"
+            jid2 = submit_job(_wmAI, GenRequest(
+                mode="i2v", prompt=prompt, images=[canvas],
+                width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+                steps=24, seed=seed, guidance=1.0, extra=extra2))
+            sj2 = _wp_wait(j, jid2, s1lo, s2hi)
+            cvid = out / f"canvas_{tag}.mp4"
+            shutil.copy2(sj2["path"], cvid)
+            try:
+                (out / f"prompt_{tag}.txt").write_text(prompt,
+                                                       encoding="utf-8")
+                canvas.save(out / f"refcanvas_{tag}.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            j["detail"] = f"[{tag}] セル分割"
+            _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                      idle_n, gait_end if tail else None, log,
+                      canvas_w=w, canvas_h=h)
+            return
+        if _exp.get("procedural"):
+            # 実験p (2026-07-21ユーザー発案「ゆらゆら・上下・変形だけなら
+            # AIを使う必要すらない」): 参照絵そのものへ体格別の手続き運動を
+            # かけ、生成なしでcanvas動画を組む。同一性=画素完全・生成コスト
+            # ゼロ・数秒で完成
+            j["detail"] = f"[{tag}] 手続きアニメ (生成なし)"
+            _art = _wp_moving_frames(cv, refs, plan, nf, idle_n, gait_end,
+                                     w, h, layout, mode="art")
+            import tempfile as _tfP
+            _fdir = Path(_tfP.mkdtemp(prefix="proc_frames_"))
+            for _i, _fr in enumerate(_art):
+                _fr.save(_fdir / f"{_i:05d}.png")
+            cvid = out / f"canvas_{tag}.mp4"
+            encode_mp4(ffmpeg, _fdir, WALKPACK_FPS, cvid)
+            log(f"[{tag}] 手続きアニメ: {plan}の変形を参照絵へ直接適用 "
+                f"({nf}f、生成なし)")
+            try:
+                (out / f"prompt_{tag}.txt").write_text("(procedural)",
+                                                       encoding="utf-8")
+                canvas.save(out / f"refcanvas_{tag}.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            j["detail"] = f"[{tag}] セル分割"
+            _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                      idle_n, gait_end if tail else None, log,
+                      canvas_w=w, canvas_h=h)
+            return
         extra1 = {"pose_frames_b64": pv.encode_frames_b64(frames),
                   "conditioning_scale": 1.0, "motion_score": 3.0,
                   "vace_base": "fun", "vace_lora": "lightning",
                   "emit_latent": 1}
         if _exp.get("_keep_frames"):
             extra1["vace_keep_frames"] = _exp["_keep_frames"]
+        if _exp.get("_region_mask_b64"):
+            extra1["vace_mask_b64"] = [_exp["_region_mask_b64"]]
+        if _exp.get("_legs_masks_b64"):
+            extra1["vace_mask_b64"] = _exp["_legs_masks_b64"]
         if offload:
             extra1["offload"] = offload
         j["detail"] = f"[{tag}] 生成1/2: VACEフル骨格"
@@ -7618,6 +7876,29 @@ def build_app(token: str | None):
             exp["legs_only"] = True
         if (body or {}).get("gait_run"):
             exp["gait_run"] = True     # 実験h: 文面を走りサイクル宣言に
+        try:
+            if (body or {}).get("region_mask") is not None:
+                # 実験r: キャラ下部fracを空の潜在にして部分生成
+                exp["region_mask"] = max(
+                    0.2, min(0.8, float(body["region_mask"])))
+        except (TypeError, ValueError):
+            pass
+        if (body or {}).get("procedural"):
+            exp["procedural"] = True   # 実験p: 生成なしの手続きアニメ
+        try:
+            if (body or {}).get("legs_mask") is not None:
+                # 実験r3: 上=実画素凍結+下=脚骨格入り生成 (VACEマスク同居)
+                exp["legs_mask"] = max(
+                    0.2, min(0.8, float(body["legs_mask"])))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if (body or {}).get("anisora_inpaint") is not None:
+                # 実験r2: 手続き土台+空間latent固定 (VACE抜き)
+                exp["anisora_inpaint"] = max(
+                    0.2, min(0.8, float(body["anisora_inpaint"])))
+        except (TypeError, ValueError):
+            pass
         try:
             if (body or {}).get("key_interp_pose") is not None:
                 # 実験e2: N フレームに1回だけ骨格ドットの道しるべを置く
