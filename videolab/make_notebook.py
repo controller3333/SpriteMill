@@ -26,8 +26,10 @@ def _cell(kind: str, src: str) -> dict:
 
 def main() -> None:
     code = SERVER.read_text(encoding="utf-8")
-    m = re.search(r'^__version__\s*=\s*"([^"]+)"', code, re.M)
-    version = m.group(1) if m else "?"
+    # 旧版の長い変更履歴直後に初期版番号が残り、その後で実効版を上書きする
+    # サーバーファイルもある。Pythonと同じく最後の代入を正として表示する。
+    versions = re.findall(r'^__version__\s*=\s*"([^"]+)"', code, re.M)
+    version = versions[-1] if versions else "?"
     # サーバ本体から Colab 用 pip 行を拾う(COLAB_PIP = [...] を定義しておく)
     mp = re.search(r"^COLAB_PIP\s*=\s*(\[[^\]]*\])", code, re.M | re.S)
     pip_lines = "\n".join(f"!pip -q install {x}" for x in eval(mp.group(1))) if mp else \

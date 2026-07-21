@@ -47,6 +47,27 @@ from pathlib import Path, PurePosixPath
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07-21ユーザー裁定「体型という名前は撤退。二足歩行や四足歩行も含めてVACE依存を完全に捨て、動画AI処理は共通してAniSoraのみの頭部固定インペイント方式に」— 新値ai=AI生成(既定)をanisora_inpaint A型へ、stretch_v/stretch_h/move_vはGPU到達時も手続き完結。VACE骨格系(biped等)はレガシー互換で残置=旧依頼のpack_ready戻し専用。★同時に実穴修正: share_packのpack metaにエイリアス解決後のベース体格しか載らず、*_aiのGPU自動ルーティングが実配線では一度も発火していなかった — run_configにbody_plan_rawを永続化しmetaは生値を書く) / 0.10.56: 背面の頭部固定 (A型インペイント: 顔ボックス無し方向=背面系は従来bbox全体生成で頭部が無防備=振り向き顔の発明を許していた。実測方向の顔帯中央値から頭部帯を推定して凍結・横幅=シルエット実測。2026-07-21ユーザー指摘「こっち向く危険」) / 0.10.55: 管理ノブσ/再加工stepsをAI通過(anisora_inpaint)経路へ配線 (σ=0.85・steps=24ハードコードの死にノブ解消。「AI通過の動き量レバー=σとmotion」が両方とも管理GUIから回せるように。優先順位=API明示>管理ノブ>経路既定0.85) / 0.10.54: キャラ別モーション文 (母艦Codexが依頼の日本語コンセプトを英語モーション記述へ翻案→pack同梱→動画プロンプト末尾へ注入。「日本語がモデルに届かない」問題の正面解決) / 0.10.53: A型インペイント既定化 (ユーザー図解「Aにしないと体は動かない」— 凍結=顔窓+bbox外背景・生成=体全体。B型=下部帯は inpaint_mode:"bottom" で残置) / 0.10.52: インペイント系マスクを顔認識対応 (切断線=実測顔ボックス下端+4%より下にクランプ。赤さんAI通過の瞬き実障害: 巨頭チビはbbox比率の切断線が顔を横切る)。pipelineは*_ai依頼で顔ボックスをVLM実測しshare_packが同梱 / 0.10.51: 体格12択のAI通過 (*_ai=anisora_inpaint既定・体格別frac。素のやわらか値は母艦の手続き経路へ=このサーバには来ない) / 0.10.50: biped_legsの正式経路にlegs_mask=0.55を既定組込 (r3昇格: 忍者実走で黒い塊=参照の上げた脚の残存が完全消滅・上半身は実画素凍結・脚2本のストライド健全) / 0.10.49: 実験r3=legs_mask (VACEマスク同居: 上半身=実画素凍結・脚領域=骨格入り生成・idle/静止=全身実画素。忍者の「参照の上げた脚が第3の脚として残存」の構造的排除) / 0.10.48: 実験r2=anisora_inpaint (手続きアニメ土台+空間latent固定=RePaint式。凍結領域は手続き運動ごと画素完全、四肢だけAniSoraがσ再加工。VACE不使用=ユーザー発案「固定はマスク済みならAniSora単体で完結」) / 0.10.47: 実験r=region_mask (キャラ下部だけ空の潜在=標準インペイントで部分生成、上部=実画素保持) + 実験p=procedural (参照絵へ手続き運動を直接適用・生成なし=同一性画素完全。2026-07-21ユーザー発案「ゆらゆら・上下・変形だけならAI不要では」) / 0.10.46: 四肢二重化対策 (biped_legs=参照の上げた脚を「動く2本のうちの1本」と正宣言 / quadruped_bone=手2つ膝2つの正宣言+crawl腕振り0.55→0.35で骨格と参照の手の権威距離を縮小。2026-07-21実走FB「手が分裂・脚が増える」) / 0.10.45: 体格メニュー8種 (biped_legs=脚のみ骨格+姿勢維持文面の正式化 / quadruped_bone=四つん這い骨格(SM_POSE_GAIT=crawl)+骨格系ゲート共有 / other=キー錨+文面のみへ変更。2026-07-21ユーザー裁定) / 0.10.44: 実験h=legs_only+gait_run (走る忍者実障害: 参照が走り姿勢の依頼に直立歩行骨格の上半身が全面矛盾→二重人格化。骨格=脚(8-13)のみ+走りサイクル正宣言で上半身の姿勢権威を参照へ返す) / 0.10.43: 実験g3=face_line (非人型の間引きギャップに顔限定線画。VLM実測face_boxes.jsonの顔ボックスで線画リファレンスをマスクし、同じ手続き運動に追従させる。顔=見た目の権威を毎フレーム維持しつつ体の中割をVACEに委ねる) / 0.10.42: 実験g2=非人型のpose_every (線画制御の間引き。API明示のみ・既定は毎フレーム線画のまま・flying対象外) / 0.10.41: pose_everyを既定昇格+管理ノブ化 (既定3=3フレームごと骨格・間はVACE中割。1=従来フル制御。優先順位: API明示>管理ノブ>SM_WP_POSE_EVERY>既定。神爺さん/裏ファール/岡田の3体A/Bで中割実動・同一性向上を確認) / 0.10.40: 実験f=pose_every (純制御モードのまま骨格をNフレームごと間引き・間=黒。中割をVACEに委ねる) / 0.10.39: 実験e2=key_interp_pose (実画像アンカー+Nフレームに1回の骨格道しるべ+空潜在) / 0.10.38: 実験e=key_interp (実画像アンカー+灰色空潜在のVACE補間、maskでアンカー保持。VACE-Fun Extension/Loop同型) / 0.10.37: 実験d=scribble_mix (頭=立ち絵線画ボブ追従+体=白棒人間スクリブル。服のヒダを変形させないポーズ指示) / 0.10.36: 頭部完全固定(0.10.35)を撤回=頭はボブ追従へ戻す (ユーザー裁定「上下移動はしてほしい」) / 0.10.34: パペットの後頭部割れ対策 (首より上=頭の無条件所有+頭距離0.5バイアス) / 0.10.33: 実験c=line_puppet (骨格キーポイントで線画をパーツ分割・ボーン相似変換で駆動=キャラ自身の線が歩く制御。二足の骨格代替候補) / 0.10.32: 非二足の既定を線画制御へ反転 (ユーザー目視判定: 深度=ディテール崩れ・線画=完璧維持。スライム娘の前髪で実証) / 0.10.31: 管理ノブnat_control (非二足の制御方式 depth/line/none をGUIから切替) / 0.10.30: 非二足の既定を深度制御へ昇格 (赤さんr2/r3の3-way同条件比較で確定: キー錨のみ=静止 vs depth=這行維持+実動+発明ゼロ)。SM_WP_NAT_CONTROL=none/lineで切替可 / 0.10.29: depth/line_moveの制御からマゼンタを黒正規化 (分布外対策)+姿勢ゲート1.5→1.35 (チビ直立すり抜け対策) / 0.10.28: 実験b=depth_move/line_move (立ち絵実測の疑似深度/線画を体格別の手続き運動で動かして制御へ。骨格語彙に依存しない任意形状対応の布石) / 0.10.27: 顔エッジv2 — 二足はnoeyes (目とface68だけ消し鼻耳=頭アンカー維持=猫背対策)・flyingはボブ骨格維持のままエッジ同期重ね (静止化対策)。既定はoffのまま=SM_WP_EDGE_FACE=onで検証 / 0.10.26: 発明抑制第1弾 — 骨格なし経路に「空白は空白のまま」節 (_WP_NO_PROPS、guidance=1.0でネガ無効のため正宣言)+NO_WINDの歩行前提文を体格整合+motion scoreを管理ノブ化 (既定3.0=V3.2公式標準・レンジ2.0-4.0)+キー錨σの管理ノブ死活修正 / 0.10.25: 顔エッジ固定を既定off (実走で二足=猫背回帰・flying=静止化。動き量適正化と一体で再設計) / 0.10.24: 顔エッジ固定の既定昇格 (骨格の顔点が目を外して顔を壊す対策 — 二足=体のみ骨格+歩行窓に頭部キャニー、flying/非二足=骨格なし+全域頭部キャニー(flyingはsinボブ同期)。SM_WP_EDGE_FACE=offで旧動作) / 0.10.23: 管理ノブ (受付台/adminのGCS config/walkpack_knobs.jsonを依頼ごとに読む=再起動不要。σ/steps/振り/latent固定) / 0.10.22: 非二足の自然移動ルート (赤さん実障害「ハイハイを無理やり二足歩行に」) — quadruped/serpentine/amorphous/otherは二足骨格を出さず、キー錨既定+体格別文面で誘導 / 0.10.21: 隣セル見切れ欠片の除去 / 0.10.20: 取り残し根治3点 (ハートビート・SIGTERM請負解放・停止TOCTOU封じ)
+# 0.11.7: 頭部固定を外す時点を「最後のNステップ」で管理ノブ化。
+# 背景固定は終端まで維持し、0=頭部も最後まで固定、既定5=従来の
+# 8step時High 3step固定→終盤5step開放と同じ。作品manifestにも実効値を保存。
+# 0.11.6: 完成manifestへ実生成設定のスナップショットを保存。管理ノブを
+# 後から変えても、作品詳細には生成時のsteps/motion/head_bob/方式が残る。
+# 0.11.5: 現行AI生成の管理ノブを整理し、頭部マスクの上下追従量
+# (head_bob、既定1.0)を実配線。管理画面はsteps/motion/head_bobだけで
+# 新方式を調整できる。
+# 0.11.4: High/Low段階別インペイント。Highでは歩行ボブ追従の顔/頭部+
+# 背景を参照潜在へ固定し、Lowでは顔/頭部だけ開放して境界を描き切らせる。
+# 背景のlatent固定は継続し、decode後の矩形画素貼り戻しは行わない。
+# 0.11.3: 顔/背面頭部の固定画素と固定マスクを歩行ボブへ追従させる。
+# 静止した顔窓と動く胴の境界だけが伸縮する「うみょん」現象を除去。
+# 時間可変マスクをVAE latent時間スロットまで運び、デコード後も各時刻の
+# 移動済み原画で画素固定する。
+# 0.11.2: AI生成を1方向ずつ8回・各8stepへ分離。複数キャラを同じ
+# キャンバスへ置いたときの注意分散をなくし、連続歩行の文面へ変更。
+# 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
+# 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
+# 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
+__version__ = "0.11.7"
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -1243,7 +1264,8 @@ def _latent_pin_slots(frames, t_dim: int) -> list:
 
 
 def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float,
-                       smask=None):
+                       smask=None, smask_low=None,
+                       smask_release_last_steps=None):
     """リファインの毎step後、固定スロットを (1-σ)x0 + σε へ描き戻す。
 
     SDEdit再デノイズは全フレームを自由に動かすため、歩行周期の位相が
@@ -1255,9 +1277,13 @@ def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float,
 
     smask (2026-07-21ユーザー発案「固定すべきところはマスク済みなら
     AniSoraのみで完結できるのでは」): 空間方向のlatent固定 (RePaint式)。
-    bool tensor [Hlat, Wlat]、True=固定 (全フレームでベース動画の軌道に
-    束縛)。VACEのマスク条件付けに依存しないインペイントがstage2単体で
-    成立する。"""
+    bool tensor [Hlat, Wlat] (全時刻共通) または [Tlat,Hlat,Wlat]
+    (時刻別)、True=固定。VACEのマスク条件付けに依存しない
+    インペイントがstage2単体で成立する。
+
+    smask_lowを渡した場合、smask_release_last_steps=Nなら末尾N stepだけ
+    smask_lowへ切り替える。0なら終端までsmaskを維持する。値を省略した旧依頼は
+    Wan2.2のboundary_ratioでHigh=smask / Low=smask_lowを選ぶ互換動作。"""
     def cb(pipe, step_index, timestep, callback_kwargs):
         callback_kwargs = (inner(pipe, step_index, timestep, callback_kwargs)
                            or callback_kwargs)
@@ -1271,14 +1297,109 @@ def _pin_step_callback(inner, sched, x0, noise, slots: list, release: float,
         ref = (1.0 - s) * x0 + s * noise
         for sl in slots:
             lat[:, :, sl] = ref[:, :, sl].to(lat.device, lat.dtype)
-        if smask is not None:
+        stage_mask = smask
+        if smask_low is not None:
+            if smask_release_last_steps is not None:
+                try:
+                    total_steps = len(sched.timesteps)
+                    release_steps = max(0, min(
+                        total_steps, int(smask_release_last_steps)))
+                    if (release_steps > 0
+                            and step_index >= total_steps - release_steps):
+                        stage_mask = smask_low
+                except (TypeError, ValueError):
+                    # 不正値は安全側=頭部を含む全固定を維持。
+                    stage_mask = smask
+            else:
+                try:
+                    boundary_ratio = float(pipe.config.boundary_ratio)
+                    boundary_t = (boundary_ratio
+                                  * float(sched.config.num_train_timesteps))
+                    if float(timestep) < boundary_t:
+                        stage_mask = smask_low
+                except (AttributeError, TypeError, ValueError):
+                    # boundary情報が無い旧pipeでは安全側=全固定を維持。
+                    stage_mask = smask
+        if stage_mask is not None:
             import torch as _t
-            m = smask.to(lat.device)              # [Hlat, Wlat] bool
+            m = stage_mask.to(lat.device)
+            if m.ndim == 2:
+                m = m.view(1, 1, 1, *m.shape)
+            elif m.ndim == 3:
+                if m.shape[0] != lat.shape[2]:
+                    raise ValueError("時間可変maskのT次元がlatentと不一致")
+                m = m.view(1, 1, *m.shape)
+            else:
+                raise ValueError("spatial maskは[H,W]または[T,H,W]が必要")
             refl = ref.to(lat.device, lat.dtype)
-            lat = _t.where(m.view(1, 1, 1, *m.shape), refl, lat)
+            lat = _t.where(m, refl, lat)
         callback_kwargs["latents"] = lat
         return callback_kwargs
     return cb
+
+
+def _spatial_inpaint_latents(x0, noise, sigma: float, fixed_mask=None,
+                             empty_generate: bool = False):
+    """AniSoraリファインの初期潜在を作る。
+
+    fixed_maskは [Hlat,Wlat] または [Tlat,Hlat,Wlat] bool、True=固定。通常は従来の
+    SDEdit初期化。empty_generate=Trueの空間インペイントでは、
+    生成領域に x0 を一切混ぜず純ノイズを置く。固定領域は
+    flow-matchingの参照軌道 (1-σ)x0+σε から始める。"""
+    import torch
+    s = float(sigma)
+    ref = (1.0 - s) * x0 + s * noise
+    if not empty_generate or fixed_mask is None:
+        return ref
+    m = fixed_mask.to(x0.device)
+    if m.ndim == 2:
+        m = m.view(1, 1, 1, *m.shape)
+    elif m.ndim == 3:
+        if m.shape[0] != x0.shape[2]:
+            raise ValueError("時間可変maskのT次元がlatentと不一致")
+        m = m.view(1, 1, *m.shape)
+    else:
+        raise ValueError("spatial maskは[H,W]または[T,H,W]が必要")
+    return torch.where(m, ref, noise)
+
+
+def _pixel_lock_spatial_frames(frames, reference, generate_mask):
+    """デコード後もマスク外を参照画素へ戻す。
+
+    latent固定だけではVAEの受容野跨ぎで顔/背景が数画素流れる
+    余地がある。標準的なインペイントと同じく、0=固定側を
+    最後に元画像で合成し、凍結の意味を画素側でも保証する。"""
+    import numpy as np
+    from PIL import Image
+    refs = ([reference] if isinstance(reference, Image.Image)
+            else list(reference))
+    masks = ([generate_mask]
+             if isinstance(generate_mask, (Image.Image, np.ndarray))
+             else list(generate_mask))
+    if len(refs) not in (1, len(frames)) or len(masks) not in (1, len(frames)):
+        raise ValueError("pixel lockの参照/mask枚数が動画フレーム数と不一致")
+    locked = []
+    for i, frame in enumerate(frames):
+        ref = refs[0 if len(refs) == 1 else i].convert("RGB")
+        size = ref.size
+        raw_mi = masks[0 if len(masks) == 1 else i]
+        if isinstance(raw_mi, Image.Image):
+            mi = raw_mi.convert("L")
+        else:
+            mi = Image.fromarray(
+                np.asarray(raw_mi).astype("uint8"), "L")
+        if mi.size != size:
+            mi = mi.resize(size, resample=Image.Resampling.NEAREST)
+        keep = np.asarray(mi) < 128
+        ref_u8 = np.asarray(ref, dtype=np.uint8)
+        arr = np.asarray(frame).copy()
+        if arr.shape[:2] != (size[1], size[0]):
+            raise ValueError("pixel lockのフレーム寸法が参照と不一致")
+        ref_arr = (ref_u8 if arr.dtype == np.uint8
+                   else ref_u8.astype(arr.dtype) / 255.0)
+        arr[keep] = ref_arr[keep]
+        locked.append(arr)
+    return locked
 
 
 # ------------------------------------------------ LTX-2.3 (diffusers)
@@ -2260,6 +2381,10 @@ class AniSoraAdapter(_WanA14BBase):
                 "off", "0", "false", "no"):
             return False
         e = extra or {}
+        # 空間インペイントはσ1.0から始め、boundary以上の
+        # High側ステップも必ず通る。Low単体ロードは不可。
+        if e.get("latent_spatial_empty"):
+            return False
         return bool(e.get("latent_from") or e.get("refine_frames_b64"))
 
     def _ensure_loaded_impl(self, log):
@@ -2427,8 +2552,13 @@ class AniSoraAdapter(_WanA14BBase):
             frames = frames[:n]
             frames = [f if f.size == (w, h) else _fit_image(f, w, h)
                       for f in frames]
+        spatial_empty = bool(req.extra.get("latent_spatial_empty"))
         strength = float(req.extra.get("refine_strength", 0.45))
-        strength = max(0.10, min(0.90, strength))
+        # 体を「空の潜在」にする本線は中途σからのSDEditでは
+        # ない。純ノイズの分布とスケジューラを整合させるため必ず
+        # σ1.0から全スケジュールを走らせる。この経路ではrefineノブより
+        # 「体に元潜在を混ぜない」契約を優先する。
+        strength = 1.0 if spatial_empty else max(0.10, min(0.90, strength))
         steps = max(8, int(req.steps))          # スケジュール解像度(既定24)
         dev = pipe._execution_device
 
@@ -2445,7 +2575,8 @@ class AniSoraAdapter(_WanA14BBase):
         # encodeスパイク9-12GBで39.5GBの天井に激突した) ----
         moved_back = []
         hi_t = getattr(pipe, "transformer", None)
-        if (hi_t is not None
+        if (not spatial_empty
+                and hi_t is not None
                 and hi_t is not getattr(pipe, "transformer_2", None)
                 # ↑Low単体(lite)ロードではtransformer=transformer_2の別名。
                 #  退避するとLow本体まで消える (v0.9.12)
@@ -2555,9 +2686,104 @@ class AniSoraAdapter(_WanA14BBase):
             g = torch.Generator("cpu").manual_seed(req.seed)
             noise = torch.randn(x0.shape, generator=g).to(
                 x0.device, torch.float32)
-            x_t = (1.0 - s0) * x0 + s0 * noise
-            log(f"リファイン: {len(frames)}f σ0={s0:.2f} 実行{tail}/{steps}"
-                "step (全stepがLow=ディテール側)")
+            _smb = req.extra.get("latent_spatial_mask_b64")
+            _smb_low = req.extra.get("latent_spatial_low_mask_b64")
+            _smask_release_last_steps = None
+            if "latent_spatial_release_last_steps" in req.extra:
+                try:
+                    _smask_release_last_steps = max(0, min(
+                        tail, int(round(float(req.extra[
+                            "latent_spatial_release_last_steps"])))))
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "latent_spatial_release_last_stepsは整数が必要です")
+            _smask = None
+            _smask_low = None
+            _smask_image = None
+            if _smb:
+                # Lマスク (255=生成/0=固定) をlatent格子へ。
+                # NEARESTを明示し、顔窓の境界に中間値を発生させない。
+                from PIL import Image as _ImgSL
+                import base64 as _b64sl
+                import io as _iosl
+                import numpy as _npsl
+                _smbs = list(_smb) if isinstance(_smb, (list, tuple)) else [_smb]
+                _smask_images = [_ImgSL.open(_iosl.BytesIO(
+                    _b64sl.b64decode(v))).convert("L") for v in _smbs]
+                if len(_smask_images) not in (1, n):
+                    raise RuntimeError(
+                        "時間可変latent_spatial_mask_b64は1枚または"
+                        f"動画と同じ{n}枚が必要です")
+
+                def _latent_mask_at(frame_index):
+                    src = _smask_images[0 if len(_smask_images) == 1
+                                        else frame_index]
+                    mi = src.resize((x0.shape[-1], x0.shape[-2]),
+                                    resample=_ImgSL.Resampling.NEAREST)
+                    return torch.from_numpy(_npsl.asarray(mi) < 128)
+
+                if len(_smask_images) == 1:
+                    _smask = _latent_mask_at(0)
+                    _smask_image = _smask_images[0]
+                else:
+                    # Wan VAEはslot0=frame0、以降は4枚単位。各slotの
+                    # 中央寄りフレームの移動maskをlatent固定位置に使う。
+                    _smask = torch.stack([
+                        _latent_mask_at(0 if s == 0 else min(n - 1, 4 * s - 1))
+                        for s in range(x0.shape[2])])
+                    _smask_image = _smask_images
+                log(f"空間latent固定: {int(_smask.sum())}/"
+                    f"{_smask.numel()}セルを固定 (255=生成/0=固定、"
+                    + ("時刻別)" if _smask.ndim == 3 else "全時刻共通)"))
+            if _smb_low:
+                # Low側の持続固定mask。現行工房では背景だけを0=固定、
+                # 顔/頭部は255=開放にした1枚を送る。
+                if isinstance(_smb_low, (list, tuple)):
+                    if len(_smb_low) != 1:
+                        raise RuntimeError(
+                            "latent_spatial_low_mask_b64は1枚が必要です")
+                    _smb_low = _smb_low[0]
+                from PIL import Image as _ImgLow
+                import base64 as _b64low
+                import io as _iolow
+                import numpy as _nplow
+                _low_img = _ImgLow.open(_iolow.BytesIO(
+                    _b64low.b64decode(_smb_low))).convert("L")
+                _low_img = _low_img.resize(
+                    (x0.shape[-1], x0.shape[-2]),
+                    resample=_ImgLow.Resampling.NEAREST)
+                _smask_low = torch.from_numpy(
+                    _nplow.asarray(_low_img) < 128)
+                log(f"Low段階固定: 背景{int(_smask_low.sum())}/"
+                    f"{_smask_low.numel()}セルを継続固定、顔/頭部は開放")
+            if spatial_empty and _smask is None:
+                raise RuntimeError(
+                    "latent_spatial_emptyにはlatent_spatial_mask_b64が必要です")
+            x_t = _spatial_inpaint_latents(
+                x0, noise, s0, _smask, empty_generate=spatial_empty)
+            if spatial_empty:
+                try:
+                    _br = float(pipe.config.boundary_ratio)
+                    _bt = _br * float(sched.config.num_train_timesteps)
+                    _hi = sum(float(t) >= _bt for t in sched.timesteps)
+                    if _smask_low is not None:
+                        if _smask_release_last_steps is not None:
+                            _fixed_n = tail - _smask_release_last_steps
+                            log(f"時点指定インペイント: 最初の{_fixed_n}stepは"
+                                "顔/頭部+背景固定 / "
+                                f"最後の{_smask_release_last_steps}stepは"
+                                "顔/頭部開放・背景のみ固定")
+                        else:
+                            log(f"段階別インペイント: High={_hi}stepは顔/頭部+"
+                                f"背景固定 / Low={tail - _hi}stepは背景のみ固定")
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                log(f"空間インペイント: 生成領域=純ノイズ / "
+                    f"固定領域=時系列参照軌道 / σ0={s0:.2f} "
+                    f"実行{tail}/{steps}step")
+            else:
+                log(f"リファイン: {len(frames)}f σ0={s0:.2f} "
+                    f"実行{tail}/{steps}step (全stepがLow=ディテール側)")
             pin_frames = req.extra.get("latent_pin_frames") or []
             pin_slots = _latent_pin_slots(pin_frames, x0.shape[2])
             pin_release = float(req.extra.get("latent_pin_release") or 0.0)
@@ -2581,27 +2807,14 @@ class AniSoraAdapter(_WanA14BBase):
                 cond_img = _fit_image(req.images[0], w, h)
                 log("リファイン条件画像: 原画立ち絵 (粘土を正常と誤認"
                     "させないための参照注入)")
-            _smb = req.extra.get("latent_spatial_mask_b64")
-            _smask = None
-            if _smb:
-                # 空間latent固定 (2026-07-21ユーザー発案): Lマスク
-                # (255=生成/0=固定) をlatent格子 (1/8) に落とし、固定側を
-                # ベース動画の補間路へ束縛。VACE抜きのインペイント
-                from PIL import Image as _ImgSL
-                import base64 as _b64sl
-                import io as _iosl
-                _mi = (_ImgSL.open(_iosl.BytesIO(_b64sl.b64decode(_smb)))
-                       .convert("L").resize((x0.shape[-1], x0.shape[-2])))
-                import numpy as _npsl
-                _smask = torch.from_numpy(
-                    _npsl.asarray(_mi) < 128)     # True=固定
-                log(f"空間latent固定: {int(_smask.sum())}/"
-                    f"{_smask.numel()}セルを固定 (255=生成/0=固定)")
             cb = _step_callback(progress, tail)
             if pin_slots or _smask is not None:
                 cb = _pin_step_callback(cb, sched, x0, noise,
                                         pin_slots, pin_release,
-                                        smask=_smask)
+                                        smask=_smask,
+                                        smask_low=_smask_low,
+                                        smask_release_last_steps=(
+                                            _smask_release_last_steps))
             kw = dict(image=cond_img,
                       width=w, height=h, num_frames=n,
                       num_inference_steps=steps,
@@ -2619,7 +2832,8 @@ class AniSoraAdapter(_WanA14BBase):
             # 必須扱い — 黙って外すと「固定なしの再加工」が静かに走る
             out = _call_with_optional_kwargs(
                 self.pipe, kw,
-                [] if pin_slots else ["callback_on_step_end"], log)
+                [] if (pin_slots or _smask is not None)
+                else ["callback_on_step_end"], log)
         finally:
             sched.set_timesteps = orig_set
             if not had_tiling:
@@ -2641,7 +2855,16 @@ class AniSoraAdapter(_WanA14BBase):
                     log(f"High側の復帰に失敗 (次ジョブで再ロード): {e}")
                     self.unload(log)
         progress(0.92)
-        return _frames_to_mp4(list(out[0][0]), req.fps, workdir, log)
+        out_frames = list(out[0][0])
+        if (req.extra.get("latent_spatial_pixel_lock")
+                and _smask_image is not None):
+            out_frames = _pixel_lock_spatial_frames(
+                out_frames,
+                frames if isinstance(_smask_image, list) else cond_img,
+                _smask_image)
+            log("空間画素固定: デコード後の顔/頭部帯/背景を"
+                "各時刻の参照画素へ復元")
+        return _frames_to_mp4(out_frames, req.fps, workdir, log)
 
 
 _GGML_BF16 = 30      # gguf.GGMLQuantizationType.BF16 (ggml固定値)
@@ -4767,12 +4990,14 @@ def _wp_bottom_mask(canvas_rgb, layout, w: int, h: int, frac: float,
 
 def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
                        face_boxes: dict | None, refs: dict | None,
-                       pad: float = 0.06):
+                       pad: float = 0.06, return_head_keep: bool = False):
     """A型インペイントマスク (2026-07-21ユーザー図解「Aにしないと体は
     動かない」): 凍結=顔ボックスの窓だけ+キャラbbox外の背景、
     生成=キャラの体全体。B型 (下部帯だけ生成) は顔より上の胴まで凍結して
     しまい、AIの芝居が下のひと帯に限られていた。
-    戻り値 = (ndarray uint8 [h, w] 255=生成, base64 PNG)。"""
+    戻り値 = (ndarray uint8 [h, w] 255=生成, base64 PNG)。
+    return_head_keep=Trueでは第3値に、歩行ボブへ追従させる顔/頭部の
+    固定島 (255=追従固定) も返す。"""
     import base64 as _b64
     import io as _io
     import numpy as np
@@ -4780,6 +5005,7 @@ def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
     arr = np.array(canvas_rgb.convert("RGB"))
     mg = ((arr[..., 0] > 200) & (arr[..., 2] > 200) & (arr[..., 1] < 120))
     msk = np.zeros(arr.shape[:2], dtype=np.uint8)
+    head_keep = np.zeros(arr.shape[:2], dtype=np.uint8)
     cols_n, rows_n, dirs_n = layout
     cwc, chc = w // cols_n, h // rows_n
     # 背面の頭部固定 (2026-07-21ユーザー指摘「後ろ向きは頭部が無防備で
@@ -4821,8 +5047,10 @@ def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
                 gy0 = int(offy + fy0 * ih * s - py)
                 gx1 = int(offx + fx1 * iw * s + px) + 1
                 gy1 = int(offy + fy1 * ih * s + py) + 1
-                msk[y0 + max(0, gy0):y0 + min(chc, gy1),
-                    x0 + max(0, gx0):x0 + min(cwc, gx1)] = 0
+                _fy0, _fy1 = y0 + max(0, gy0), y0 + min(chc, gy1)
+                _fx0, _fx1 = x0 + max(0, gx0), x0 + min(cwc, gx1)
+                msk[_fy0:_fy1, _fx0:_fx1] = 0
+                head_keep[_fy0:_fy1, _fx0:_fx1] = 255
             except Exception:                 # noqa: BLE001
                 pass
         elif band is not None and refs and dn in refs:
@@ -4843,12 +5071,78 @@ def _wp_face_keep_mask(canvas_rgb, layout, w: int, h: int,
                     mx = max(2, int(cwc * 0.02))
                     hx0 = max(0, int(xs_b.min()) - mx)
                     hx1 = min(cwc, int(xs_b.max()) + 1 + mx)
-                    msk[y0 + gy0:y0 + gy1, x0 + hx0:x0 + hx1] = 0
+                    _hy0, _hy1 = y0 + gy0, y0 + gy1
+                    _hx0, _hx1 = x0 + hx0, x0 + hx1
+                    msk[_hy0:_hy1, _hx0:_hx1] = 0
+                    head_keep[_hy0:_hy1, _hx0:_hx1] = 255
             except Exception:                 # noqa: BLE001
                 pass
     buf = _io.BytesIO()
     Image.fromarray(msk, "L").save(buf, format="PNG")
-    return msk, _b64.b64encode(buf.getvalue()).decode("ascii")
+    result = (msk, _b64.b64encode(buf.getvalue()).decode("ascii"))
+    return result + (head_keep,) if return_head_keep else result
+
+
+def _wp_bobbing_fixed_refs(canvas_rgb, generate_mask, head_keep, layout,
+                            nf: int, idle_n: int, gait_end: int,
+                            bob_scale: float = 1.0):
+    """顔/背面頭部の原画と固定島を、歩行の上下ボブへ一緒に追従させる。
+
+    bbox外背景は静止固定のまま。固定島だけを各セル内で上へ平行移動し、
+    元位置は生成領域へ返す。歩行窓では既存の二足ボブ式と同位相
+    (2周期中に4回、セル高の0.8%上昇)、先頭/末尾は元位置へ戻す。
+    bob_scaleは管理ノブhead_bob (0.0--2.0、既定1.0)。
+    戻り値=(時刻別RGB参照, 時刻別L生成mask, maskのbase64 PNG列)。"""
+    import base64 as _b64
+    import io as _io
+    import numpy as np
+    from PIL import Image
+    base = np.asarray(canvas_rgb.convert("RGB"), dtype=np.uint8)
+    gm = np.asarray(generate_mask, dtype=np.uint8)
+    hk = np.asarray(head_keep, dtype=np.uint8) > 0
+    if gm.shape != base.shape[:2] or hk.shape != base.shape[:2]:
+        raise ValueError("歩行ボブmaskの寸法がcanvasと不一致")
+    static_fixed = (gm < 128) & ~hk
+    cols_n, rows_n, _dirs_n = layout
+    cwc, chc = base.shape[1] // cols_n, base.shape[0] // rows_n
+    win = max(1, gait_end - idle_n + 1)
+    bob_scale = max(0.0, min(2.0, float(bob_scale)))
+    refs_out, masks_out, masks_b64 = [], [], []
+    for k in range(int(nf)):
+        if k < idle_n or k > gait_end:
+            dy = 0
+        else:
+            # other/bipedの既存式と一致: 4回の接地で頭が上がり、元へ戻る。
+            dy = int(round(_wp_move_params(
+                "other", (k - idle_n) / win, cwc, chc)[1] * bob_scale))
+        shifted_head = np.zeros_like(hk)
+        shifted_pixels = np.zeros_like(base)
+        for ci in range(cols_n * rows_n):
+            x0, y0 = (ci % cols_n) * cwc, (ci // cols_n) * chc
+            x1, y1 = x0 + cwc, y0 + chc
+            cell_h = hk[y0:y1, x0:x1]
+            cell_p = base[y0:y1, x0:x1]
+            if dy <= 0:
+                take = chc + dy
+                if take > 0:
+                    shifted_head[y0:y0 + take, x0:x1] = cell_h[-dy:]
+                    shifted_pixels[y0:y0 + take, x0:x1] = cell_p[-dy:]
+            else:
+                take = chc - dy
+                if take > 0:
+                    shifted_head[y0 + dy:y1, x0:x1] = cell_h[:take]
+                    shifted_pixels[y0 + dy:y1, x0:x1] = cell_p[:take]
+        ref_arr = base.copy()
+        ref_arr[shifted_head] = shifted_pixels[shifted_head]
+        mask_arr = np.full(gm.shape, 255, dtype=np.uint8)
+        mask_arr[static_fixed] = 0
+        mask_arr[shifted_head] = 0
+        refs_out.append(Image.fromarray(ref_arr, "RGB"))
+        masks_out.append(Image.fromarray(mask_arr, "L"))
+        buf = _io.BytesIO()
+        masks_out[-1].save(buf, format="PNG")
+        masks_b64.append(_b64.b64encode(buf.getvalue()).decode("ascii"))
+    return refs_out, masks_out, masks_b64
 
 
 def _wp_motion_prompt(pack: Path) -> str:
@@ -5425,6 +5719,31 @@ _WP_HOVER_PROMPT = (
     "animation."
 )
 
+# 新本線 ai の専用文面。体領域は純ノイズからAniSoraが
+# 作るため、「subtle」「exact posture/silhouette」のような元姿勢の
+# 再建を促す語は入れない。キャラ別の具体的な動きは母艦Codexの
+# motion_promptが後置で完成させる。
+_WP_AI_PROMPT = (
+    "A game character animation. The character performs continuous, clear, "
+    "readable in-place locomotion for the entire video. Complete at least "
+    "two full locomotion cycles without pausing: one side of the body leads, "
+    "then the opposite side leads, with unmistakably different poses at the "
+    "quarter points of each cycle. Limbs or equivalent body parts articulate, "
+    "weight visibly shifts, and the torso responds naturally. This is a real "
+    "animation cycle, never a still image, pose morph, or barely moving idle. "
+    "The motion continues rhythmically from start to finish. Keep "
+    "the character's identity, outfit, colors, proportions, and number of "
+    "limbs consistent throughout the cycle."
+)
+
+_WP_AI_CELL_LOCK = (
+    " Every figure stays centered in its own cell and keeps facing its own "
+    "fixed direction for the entire animation; neither the body nor the "
+    "head turns toward another direction. Static locked-off tripod camera, "
+    "fixed frame, no camera movement, no pan, no zoom, no orbit. Plain flat "
+    "magenta background, smooth seamless looping animation."
+)
+
 # 共通拘束 (セル固定・向き固定・カメラ固定・マゼンタ背景)。体格別文面の
 # 語尾に連結する (2026-07-20 赤さん実障害: quadrupedにも歩行文面が出て
 # ハイハイが直立歩行に化けた)
@@ -5496,7 +5815,9 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
     pv = eng["pose_video"]
     cw = eng["canvas_walk"]
     cv = eng["compass_vace"]
-    if plan == "flying":
+    if plan == "ai":
+        prompt = _WP_AI_PROMPT + _WP_AI_CELL_LOCK
+    elif plan == "flying":
         prompt = _WP_HOVER_PROMPT
     elif plan in _WP_NAT_PLANS:
         prompt = _WP_PLAN_PROMPTS[plan] + _WP_CELL_LOCK
@@ -5560,7 +5881,7 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
                        "appear below the hem while walking.")
     except Exception:                     # noqa: BLE001
         pass
-    if tail:
+    if tail and plan != "ai":
         if plan == "flying":
             prompt += (" At the very end of the video every figure stops "
                        "bobbing and hovers perfectly still at the same "
@@ -6123,10 +6444,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             "serpentine_ai": "serpentine",
             # 動きの型4択 (0.11.0、2026-07-21ユーザー裁定「体型という
             # 名前は撤退・AI経路はAniSora頭部固定インペイントに一本化」):
-            # ai=AI生成は中立のotherとして扱う (経路はanisora_inpaintが
-            # 支配するので骨格系の分岐には入らない)。stretch_v/stretch_h/
+            # ai=AI生成は専用のAniSora空間インペイントとして
+            # 生値を保つ。otherに落とすと「姿勢とシルエットを変えるな」
+            # という旧制約がCodexの歩行文と衝突する。stretch_v/stretch_h/
             # move_vは素通し=手続き式で分岐 (通常は母艦完結でここに来ない)
-            "ai": "other"}.get(plan_raw, plan_raw)
+            }.get(plan_raw, plan_raw)
     if plan_raw == "ai":
         _wp_print("[walkpack] 動きの型=AI生成: AniSora頭部固定インペイント"
                   " (VACE不使用)")
@@ -6210,6 +6532,33 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     _kn = j.get("_wp_knobs") or {}       # 管理GUIのノブ (受付台/adminで設定)
     if _kn:
         _wp_print(f"[walkpack] 管理ノブ適用: {_kn}")
+    # 作品詳細へ残す「実際に使った値」。GCS workerが完成manifestへ写す。
+    # 生の管理JSONではなく既定補完+クランプ後を記録し、後日の設定変更で
+    # 過去作品の表示が変わらないようにする。
+    if _exp.get("anisora_inpaint"):
+        _settings_steps = _wp_knob_int(
+            _kn, "refine_total", 8, 4, 12)
+        _settings_release = min(_settings_steps, _wp_knob_int(
+            _kn, "head_release_steps", 5, 0, 12))
+        j["_generation_settings"] = {
+            "engine": "anisora",
+            "directions": len(_WP_DIRS),
+            "steps": _settings_steps,
+            "motion": _wp_knob_float(_kn, "motion", 3.0, 2.0, 4.0),
+            "head_bob": _wp_knob_float(_kn, "head_bob", 1.0, 0.0, 2.0),
+            "head_release_steps": _settings_release,
+            "inpaint": "timed_face_release",
+            "pixel_paste": False,
+            "server_version": __version__,
+        }
+    elif _exp.get("procedural"):
+        j["_generation_settings"] = {
+            "engine": "procedural", "directions": len(_WP_DIRS),
+            "server_version": __version__}
+    else:
+        j["_generation_settings"] = {
+            "engine": "legacy", "directions": len(_WP_DIRS),
+            "server_version": __version__}
     pins = cv._lr_pin_frames(nf, str(
         _exp.get("pin_conf")
         or ("off" if _kn.get("latent_pin") is False else "on")))
@@ -6221,6 +6570,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     # 進捗スパン: F4 (0.02-0.45) -> B4 (0.50-0.88) -> 組み立て (0.90-)
     spans = {"F4": (0.02, 0.24, 0.24, 0.45), "B4": (0.50, 0.70, 0.70, 0.88),
              "C9": (0.02, 0.45, 0.45, 0.88)}
+    # 新本線aiは1方向=1キャンバス。8回の進捗を均等に割り当てる。
+    for _di, _dd in enumerate(_WP_DIRS):
+        _lo = 0.02 + 0.86 * _di / len(_WP_DIRS)
+        _hi = 0.02 + 0.86 * (_di + 1) / len(_WP_DIRS)
+        spans[f"D{_di + 1:02d}_{_dd}"] = (_lo, _lo, _lo, _hi)
     def _gen_hemisphere(tag: str, layout, seed: int = 42) -> None:
         """半球1つ分 (骨格グリッド→VACE→AniSora再加工→セル分割)。
 
@@ -6434,7 +6788,7 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # SM_WP_NAT_CONTROL=depth/none、管理ノブnat_controlで切替可。
             _nat_ctl = os.environ.get(
                 "SM_WP_NAT_CONTROL", "line").strip().lower()
-            if plan == "other":
+            if plan in ("other", "ai"):
                 # 2026-07-21ユーザー裁定 (体格メニュー8種): その他=
                 # 「動画AIに動きを委ねる」— 手続き運動を出さず、
                 # キー錨+文面のみで誘導する
@@ -6662,14 +7016,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験legs_mask={_fracL}: 上=実画素凍結 / "
                 "下=脚骨格入り生成 (idle/静止=全身実画素)")
         if _exp.get("anisora_inpaint"):
-            # 実験r2 (2026-07-21ユーザー発案「固定すべきところはマスク済み
-            # ならVACE抜き・AniSora単体で完結できるのでは」): 土台=手続き
-            # アニメ (実験p) — 手続き運動が身体を運び (凍結領域も動いて
-            # いるのに画素完全)、空間latent固定 (RePaint式) で上部を凍結、
-            # 下部 (四肢) だけAniSoraがσ再加工で芝居をつける。VACE不使用
+            # 本線AI (0.11.1): 手続き動画をSDEditの土台にしない。
+            # 固定側の頭部原画+maskは歩行ボブへ追従し、bbox外背景だけ静止。
+            # 体マスク内はσ1.0の純ノイズからAniSoraに歩行を埋めさせる。
+            # VACE不使用。
             _frac2 = max(0.2, min(0.8, float(_exp["anisora_inpaint"])))
-            _art2 = _wp_moving_frames(cv, refs, plan, nf, idle_n, gait_end,
-                                      w, h, layout, mode="art")
             _im_mode = str(_exp.get("inpaint_mode") or "face").lower()
             if _im_mode == "face":
                 # A型 (2026-07-21ユーザー図解): 凍結=顔窓+背景、体は全部
@@ -6677,43 +7028,74 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 # してしまい、芝居が下のひと帯に限られていた
                 _fbx2 = _wp_face_boxes(pack)
                 if not _fbx2:
-                    # 頭部固定はface_boxes.jsonに全面依存 — 不在のまま生成
-                    # すると頭部が無防備 (振り向き顔の発明リスク)。落とさず
-                    # 続行するが、目視検証で気づけるよう大きく残す
-                    log(f"[{tag}] ★face_boxes不在: 頭部固定なしで生成 "
-                        "(パックの顔ボックス実測を確認すること)")
-                _msk2, _mb64 = _wp_face_keep_mask(
+                    raise RuntimeError(
+                        f"[{tag}] AI生成に必要なface_boxes.jsonがありません "
+                        "(顔/背面頭部を凍結できないため生成を中止)")
+                _msk2, _mb64, _head2 = _wp_face_keep_mask(
                     canvas, layout, w, h,
-                    face_boxes=_fbx2, refs=refs)
+                    face_boxes=_fbx2, refs=refs, return_head_keep=True)
+                _head_bob2 = _wp_knob_float(
+                    _kn, "head_bob", 1.0, 0.0, 2.0)
+                _art2, _masks2, _mb64s = _wp_bobbing_fixed_refs(
+                    canvas, _msk2, _head2, layout,
+                    nf, idle_n, gait_end, bob_scale=_head_bob2)
+                # Lowでは顔/頭部だけ開放し、bbox外背景のlatent固定は継続。
+                # 最終画素貼り戻しはしないので、境界をLowが自然に描ける。
+                import base64 as _b64LOW
+                import io as _ioLOW
+                import numpy as _npLOW
+                from PIL import Image as _ImgLOW
+                _low_m = _npLOW.full(_msk2.shape, 255, dtype=_npLOW.uint8)
+                _low_m[(_msk2 < 128) & ~(_head2 > 0)] = 0
+                _low_buf = _ioLOW.BytesIO()
+                _ImgLOW.fromarray(_low_m, "L").save(_low_buf, format="PNG")
+                _low_mb64 = _b64LOW.b64encode(
+                    _low_buf.getvalue()).decode("ascii")
             else:
                 _msk2, _mb64 = _wp_bottom_mask(
                     canvas, layout, w, h, _frac2,
                     face_boxes=_wp_face_boxes(pack), refs=refs)
+                _art2 = [canvas.convert("RGB").copy() for _ in range(nf)]
+                _masks2 = None
+                _mb64s = [_mb64] * nf
+                _low_mb64 = None
             try:
-                _art2[idle_n + max(1, (gait_end - idle_n) // 4)].save(
-                    out / f"control_{tag}_procbase.png")
+                _art2[0].save(out / f"control_{tag}_staticbase.png")
                 from PIL import Image as _ImgAI
                 _ImgAI.fromarray(_msk2, "L").save(
                     out / f"control_{tag}_spatialmask.png")
+                if _masks2:
+                    _peak2 = idle_n + max(1, (gait_end - idle_n) // 8)
+                    _art2[_peak2].save(
+                        out / f"control_{tag}_headbob_ref.png")
+                    _masks2[_peak2].save(
+                        out / f"control_{tag}_headbob_mask.png")
             except Exception:                 # noqa: BLE001
                 pass
             j["detail"] = f"[{tag}] AniSora単体インペイント"
-            # σ/stepsは管理ノブを尊重する (2026-07-21監査: 管理GUIのσと
-            # 再加工stepsがこの経路だけ0.85/24ハードコードで一切届かない
-            # 死にノブだった — キー錨経路の監査案Fと同型)。優先順位は
-            # 本線stage2と同じ: API明示 > 管理ノブ(env) > 経路既定0.85
-            _env_sg = os.environ.get("SM_VACE_LR_REFINE", "").strip()
-            _sg2 = float(_exp.get("refine") or _env_sg or 0.85)
-            _st_ai = _wp_knob_int(_kn, "refine_total", 24, 4, 40)
-            log(f"[{tag}] anisora_inpaint mode={_im_mode}: 手続き土台+"
-                "空間latent固定 (VACE不使用、face=顔窓凍結/体生成・"
-                f"bottom=下部帯のみ生成) σ={_sg2} steps={_st_ai}")
+            # 空潜在の契約を守るため開始σは1.0固定。中途σに下げると
+            # 「純ノイズを途中のノイズレベルへ投入」となり分布が矛盾する。
+            _sg2 = 1.0
+            # 1方向ずつ8回へ分離したため各方向は8stepを既定にする。
+            # 半球2枚×24stepに近い総予算のまま、注意を1体へ集中できる。
+            _st_ai = _wp_knob_int(_kn, "refine_total", 8, 4, 12)
+            _release_ai = min(_st_ai, _wp_knob_int(
+                _kn, "head_release_steps", 5, 0, 12))
+            log(f"[{tag}] anisora_inpaint mode={_im_mode}: 頭部ボブ追従参照+"
+                "体領域純ノイズ (AniSora単体・VACE不使用、"
+                f"開始σ={_sg2} steps={_st_ai} head_bob={_head_bob2} "
+                f"頭部固定={_st_ai - _release_ai}step/"
+                f"終盤開放={_release_ai}step)")
             extra2 = {"refine_frames_b64": pv.encode_frames_b64(_art2),
                       "refine_strength": _sg2,
                       "refine_cond_still": True,
-                      "latent_spatial_mask_b64": _mb64,
+                      "latent_spatial_mask_b64": _mb64s,
+                      "latent_spatial_empty": True,
+                      "latent_spatial_release_last_steps": _release_ai,
                       "motion_score": _wp_knob_float(
                           _kn, "motion", 3.0, 2.0, 4.0)}
+            if _low_mb64:
+                extra2["latent_spatial_low_mask_b64"] = _low_mb64
             if offload:
                 extra2["offload"] = offload
             _wmAI = "mock" if j.get("_wp_mock") else "anisora"
@@ -6875,6 +7257,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                   canvas_w=w, canvas_h=h)
 
     _lay_req = str(_exp.get("layout") or "").strip()
+    _use_single = (plan_raw == "ai" and not _lay_req) or _lay_req in (
+        "single", "individual", "8dir")
     if _lay_req == "compass":
         _use_c9 = True
     elif _lay_req in ("hemi", "4x2"):
@@ -6896,12 +7280,21 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _use_c9 = _tot >= 40 * (1 << 30)
         except Exception:                     # noqa: BLE001
             pass
-    if _use_c9 and _lay_req != "compass":
+    if _use_single:
+        _use_c9 = False
+        _wp_print("[walkpack] AIレイアウト: 1方向ずつ8回 "
+                  "(各8step・注意集中)")
+    elif _use_c9 and _lay_req != "compass":
         _wp_print("[walkpack] レイアウト: コンパス3x3 (VRAM充足・既定)")
     if _use_c9:
         w, h = (WALKPACK_W // 2) * 3, (WALKPACK_H // 2) * 3
-    _layouts = ((("C9", cw.LAYOUT_COMPASS),) if _use_c9
-                else (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)))
+    if _use_single:
+        _layouts = tuple(
+            (f"D{i + 1:02d}_{d}", (1, 1, [d]))
+            for i, d in enumerate(_WP_DIRS))
+    else:
+        _layouts = ((("C9", cw.LAYOUT_COMPASS),) if _use_c9
+                    else (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)))
     for tag, layout in _layouts:
         _gen_hemisphere(tag, layout)
         # 顔が写るのは前半球だけ (B4は後ろ姿3方向+横顔) なので、ゲートは
@@ -7427,7 +7820,8 @@ def _gcs_process_one(req: dict, wait: bool = True):
             files.append({"name": p.name, "size": p.stat().st_size, "kind": k})
     order = {"preview": 0, "mp4": 1, "sheet": 2, "pixel": 3}
     files.sort(key=lambda f: (order.get(f["kind"], 9), f["name"]))
-    manifest = {"pack_id": pid, "files": files, "finished": time.time()}
+    manifest = {"pack_id": pid, "files": files, "finished": time.time(),
+                "generation": j.get("_generation_settings") or {}}
     _gcs_write(f"outputs/{rid}/manifest.json",
                json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
                "application/json")
@@ -8035,6 +8429,9 @@ def build_app(token: str | None):
             # 翼がbackへ吸われる疑い): 3x3コンパス配置 (隣=隣接角度) で
             # 同条件生成して比較する
             exp["layout"] = "compass"
+        if str((body or {}).get("layout") or "").strip() in (
+                "single", "individual", "8dir"):
+            exp["layout"] = "single"
         if "free_idle" in (body or {}):
             exp["free_idle"] = bool(body["free_idle"])
         if (body or {}).get("edge_face"):
