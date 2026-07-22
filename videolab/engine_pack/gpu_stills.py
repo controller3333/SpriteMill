@@ -54,6 +54,14 @@ DIR_INDEX = {
 }
 MAGENTA = (255, 0, 255)
 
+# 立ち絵に注文する背景色。**マゼンタと言ってはいけない** — 2026-07-22/23の
+# 実走で、キャラの肌・服まで背景と同じ紅色に塗られ、キーアウトで body ごと
+# 消える事故が2回起きた (色名がパレット全体を引っ張る)。切り抜きは
+# key_to_magenta が「縁の中央値と近い画素」を落とす方式で背景色を選ばない
+# ので、注文するのは「均一であること」だけでよい。
+BG_TAG = "plain flat solid light gray background"
+BG_NEG = "gray clothes, gray skin, gradient background, scenery, floor"
+
 TURNTABLE_PROMPT = (
     "Full-body turntable animation of exactly the same single anime "
     "character as the reference. Starting from the straight front view, "
@@ -120,10 +128,43 @@ def proportion_tags(leg_scale) -> tuple:
 
 
 def stills_negative(meta: dict, base: str = "") -> str:
-    """立ち絵用ネガティブ = アダプタ既定 + 頭身の否定タグ。"""
-    neg = proportion_tags((meta or {}).get("leg_scale"))[1]
+    """立ち絵用ネガティブ = アダプタ既定 + 頭身の否定 + 背景同化の否定。"""
+    neg = proportion_tags((meta or {}).get("leg_scale"))[1] + ", " + BG_NEG
     base = (base or "").strip().rstrip(",")
     return f"{base}, {neg}" if base else neg
+
+
+def subject_coverage(img) -> tuple:
+    """キー済み立ち絵の被写体量 (面積比, 縦の占有比)。
+
+    背景と同化した絵を「立ち絵」として通さないための実測。2026-07-23の
+    実走で、背景色をプロンプトで名指ししたせいで体まで同色に塗られ、
+    キーアウト後に髪と目しか残らない絵がそのまま歩行段まで流れた。"""
+    import numpy as np
+    a = np.asarray(img.convert("RGB")).astype(int)
+    dist = (np.abs(a[..., 0] - MAGENTA[0]) + np.abs(a[..., 1] - MAGENTA[1])
+            + np.abs(a[..., 2] - MAGENTA[2]))
+    fg = dist >= 70
+    h, w = fg.shape
+    if not fg.any():
+        return 0.0, 0.0
+    ys = np.where(fg.any(axis=1))[0]
+    return float(fg.sum()) / float(h * w), float(
+        ys.max() - ys.min() + 1) / float(h)
+
+
+def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45) -> tuple:
+    """立ち絵として使えるか (ok, 理由)。閾値はキー後の実測に対する下限。
+
+    正面立ち絵は縦長キャンバスの上下いっぱいに立つのが正常
+    (骨格CNが全高0.86を占める)。髪だけが残った事故絵は面積0.02級・
+    縦0.3級に落ちるので、この2つで十分に弾ける。"""
+    area, height = subject_coverage(img)
+    if area < min_area:
+        return False, f"被写体が小さすぎます (面積{area * 100:.1f}%)"
+    if height < min_height:
+        return False, f"全身が写っていません (縦{height * 100:.0f}%)"
+    return True, f"面積{area * 100:.1f}% 縦{height * 100:.0f}%"
 
 
 def concept_to_illustrious_prompt(meta: dict) -> str:
@@ -133,7 +174,7 @@ def concept_to_illustrious_prompt(meta: dict) -> str:
     tags = str(m.get("illustrious_tags") or (
         f"masterpiece, best quality, {prop}, full body, standing, "
         "front view, front lighting, flat color, simple background, "
-        "magenta background")).strip()
+        f"{BG_TAG}")).strip()
     concept = str(m.get("concept_en") or m.get("concept") or "").strip()
     palette = str(m.get("palette_en") or m.get("palette") or "").strip()
     sil = str(m.get("silhouette_en") or m.get("silhouette") or "").strip()
@@ -162,7 +203,7 @@ def concept_to_qwen_prompt(meta: dict) -> str:
     bits = [
         "Single full-body front-facing idle anime game character sprite, "
         f"{prop}, crisp outlines, flat colors, one soft shadow, "
-        "perfectly flat solid chroma-key magenta #FF00FF background, "
+        f"{BG_TAG}, uniform background with no gradient, "
         "no floor, no text, no watermark, no border.",
         f"Character: {concept}.",
     ]

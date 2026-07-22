@@ -135,7 +135,12 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.51"
+__version__ = "0.11.52"
+# 0.11.52: 立ち絵が背景と同化する事故の根治。プロンプトで背景色を名指し
+# すると (magenta background) キャラの肌・服まで同じ色に塗られ、キー後に
+# 髪しか残らない絵が回転→歩行まで流れた (2026-07-23実走・2回)。切り抜きは
+# 縁の中央値で行うので色名は不要 → 中立グレー指定へ。加えてキー後の
+# 面積/縦占有を実測して駄目なら種を変えて描き直すゲートを追加。
 # 0.11.51: ターンテーブルの回り方を実測してから8方向へ割り当てる。
 # プロンプトの clockwise 指示にAniSoraが従わず、"right" スロットに画面左
 # 向きの絵が入っていた (2026-07-22実走・C17較正の向き計量で -9.46)。
@@ -8598,11 +8603,37 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
     front_path = Path(str(sj1.get("path") or ""))
     if not front_path.is_file():
         raise RuntimeError("正面立ち絵の生成結果がありません")
-    front = _PIL.open(front_path).convert("RGB")
-    front = gs.key_to_magenta(front)
+    front = gs.key_to_magenta(_PIL.open(front_path).convert("RGB"))
+    # ★背景同化ゲート (v0.11.52): 背景と同じ色で塗られたキャラはキー後に
+    # 消え、髪だけの絵が回転→歩行まで流れる (2026-07-23実走)。ここで弾いて
+    # 種を変えて描き直す — 下流で気づくと20分と数百円を捨てることになる
+    tries = max(1, int(os.environ.get("VIDEOLAB_STILLS_TRIES", "3") or 3))
+    ok, why = gs.stills_ok(front)
+    for att in range(2, tries + 1):
+        if ok:
+            break
+        log(f"⚠ 正面立ち絵をやり直します ({att - 1}/{tries - 1}): {why}")
+        j["detail"] = f"GPU立ち絵: {model} 正面やり直し {att - 1}"
+        seed = (seed + 7919) % (2 ** 31)
+        jid_r = submit_job(model, GenRequest(
+            mode=mode, prompt=prompt, negative=neg, images=images,
+            width=fw, height=fh, num_frames=1, fps=1, steps=steps,
+            seed=seed, guidance=cfg, extra=extra))
+        sj_r = _wp_wait(j, jid_r, 0.02, 0.25)
+        p_r = Path(str(sj_r.get("path") or ""))
+        if not p_r.is_file():
+            continue
+        cand = gs.key_to_magenta(_PIL.open(p_r).convert("RGB"))
+        ok, why = gs.stills_ok(cand)
+        front = cand
+    if not ok:
+        raise RuntimeError(
+            f"正面立ち絵が{tries}回とも使えませんでした: {why} "
+            "(背景と同系色に塗られている可能性 — palette指定を見直すか "
+            "VIDEOLAB_STILLS_TRIES を増やしてください)")
     front_save = pack / "01_generation" / "seed_front.png"
     front.save(front_save)
-    log(f"正面立ち絵完了: {front_save.name}")
+    log(f"正面立ち絵完了: {front_save.name} ({why})")
 
     # ---- 2) AniSora Low ターンテーブル (360°) ----
     j["detail"] = "GPU立ち絵: AniSora Low ターンテーブル"
