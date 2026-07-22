@@ -1090,6 +1090,9 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
       (max(0.125, 想定/1.8)..30%。2026-07-18: 4頭身超の首は30%より上で
       未走査だった)。くびれが浅い(<最大幅の82%)キャラは非チビ体型と
       みなし既定のまま。
+    - landmarks.jsonに意味論実測があれば肩・腰・足首のx/yを直接採用。
+      足首は靴底ではなく少し上の関節行なので、骨格が立ち絵より長くなって
+      身長を押し広げる綱引きを防ぐ。無ければ以下のシルエット推定へ戻る。
     - 肩x = 顎下バンド (肩行〜下へ15%) 最大幅の32% (拡幅も許す。肩行
       そのものは首のくびれで過小になる 2026-07-17 C43実害)。腕鎖が
       シルエットからはみ出さないガードつき。腕の長さは短縮しない
@@ -1266,6 +1269,7 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
         # (前髪・メガネ・ヘルメット・マスクに意味論で頑健。暗ブロブ系は
         # ランドマーク未測定ラウンドのフォールバックへ降格) ----
         _lm_eye = None
+        _lm_joints = None
         try:
             _fn = getattr(ref_image, "filename", None)
             if _fn and os.environ.get("SM_POSE_LANDMARKS", "on") \
@@ -1277,6 +1281,12 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
                     _chin_row = float(_lmj["chin_y"]) - y0
                     _sh_row = float(_lmj["shoulder_y"]) - y0
                     _lm_eye = float(_lmj["pupil_y"]) - y0
+                    _joint_keys = (
+                        "shoulder_left_x", "shoulder_right_x", "hip_y",
+                        "hip_left_x", "hip_right_x", "ankle_y",
+                        "ankle_left_x", "ankle_right_x")
+                    if all(k in _lmj for k in _joint_keys):
+                        _lm_joints = {k: float(_lmj[k]) for k in _joint_keys}
                     hf_lm = max(0.125, min(0.60,
                                            _chin_row / float(ch_img)))
                     fig = Figure(head_frac=hf_lm)
@@ -1294,6 +1304,22 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
         except Exception:                 # noqa: BLE001
             _lm_eye = None                # 破損jsonは無視して従来経路
 
+        # 腰・足首の縦位置を直接アンカー。投影はz=0なら
+        # row/ch == 1-y/total（俯角cosは全高scaleと相殺）なので、この写像で
+        # 画面上の関節行へ厳密に戻る。足首を靴底より少し上へ置くことで、
+        # 骨の全長に生成キャラが引っ張られて背が伸びる再発経路を止める。
+        if _lm_joints is not None:
+            _hip_row = _lm_joints["hip_y"] - y0
+            _ankle_row = _lm_joints["ankle_y"] - y0
+            _hip_y_lm = (1.0 - _hip_row / float(ch_img)) * fig.total
+            _ankle_y_lm = (1.0 - _ankle_row / float(ch_img)) * fig.total
+            if (0.02 * fig.total < _ankle_y_lm < _hip_y_lm
+                    < fig.shoulder_y - 0.04 * fig.total):
+                fig.hip_y = _hip_y_lm
+                _leg_len_lm = fig.hip_y - _ankle_y_lm
+                fig.leg_upper = _leg_len_lm / 2.0
+                fig.leg_lower = _leg_len_lm / 2.0
+
         # ---- 各部位の高さ(世界y)を画像行へ写して実測幅を取る。
         #      骨格スケールは全高で合わせるため「世界yの全高比 = 画像bbox
         #      内の高さ比」(俯角の縦縮みは分子分母で相殺)。帯は±2%中央値 ----
@@ -1309,6 +1335,21 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
         # 余白を3.5%食う。2026-07-12レビュー指摘)
         px2w = fig.total / float(ch_img) \
             * math.cos(math.radians(ELEV_DEG))
+        # 意味論ランドマークの左右関節幅は衣装・髪の外縁ではなく関節中心。
+        # シルエット幅推定より優先し、後段ヒューリスティックで上書きしない。
+        if _lm_joints is not None:
+            _sh_half = ((_lm_joints["shoulder_right_x"]
+                         - _lm_joints["shoulder_left_x"]) / 2.0 * px2w)
+            _hip_half = ((_lm_joints["hip_right_x"]
+                          - _lm_joints["hip_left_x"]) / 2.0 * px2w)
+            fig.sh_x = max(0.035, min(0.30, _sh_half))
+            fig.hip_x = max(0.020, min(0.20, _hip_half))
+            _ank_half = ((_lm_joints["ankle_right_x"]
+                          - _lm_joints["ankle_left_x"]) / 2.0 * px2w)
+            _leg_len = fig.leg_upper + fig.leg_lower
+            if _ank_half > fig.hip_x and _leg_len > 0:
+                fig.leg_out = min(22.0, math.degrees(math.asin(
+                    min(0.42, (_ank_half - fig.hip_x) / _leg_len))))
         # ---- 肩幅: 顎下バンド (肩行〜下へ全高15%) の最大幅で測る。
         # 肩行そのもの (顎直下) は首のくびれ=シルエット最狭部に当たり、
         # 0.32*首幅では肩が胴の中へ埋まって腕鎖ごと体にめり込む
@@ -1330,7 +1371,7 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
                 w_sh = float(seg.max()) * px2w
         w_hip = width_at(fig.hip_y) * px2w
         w_ear = width_at(fig.head_cy) * px2w      # 耳の行の実測幅
-        if w_sh > 0:
+        if w_sh > 0 and _lm_joints is None:
             if _sh_band:
                 new_sh = max(0.05 * fig.total, min(0.26, 0.32 * w_sh))
                 # 腕鎖ガード: 直立の肘・手首 (arm_out≈11°で外へ開く) が
@@ -1365,7 +1406,7 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
                 ratio = fig.sh_x / 0.1625
                 fig.arm_upper *= max(0.5, ratio)
                 fig.arm_lower *= max(0.5, ratio)
-        if w_hip > 0:
+        if w_hip > 0 and _lm_joints is None:
             fig.hip_x = max(0.03 * fig.total, min(fig.hip_x, 0.30 * w_hip))
         if w_ear > 0:
             # face点の広がり専用 (頭の縦寸は Figure の絶対系のまま)。
@@ -1416,7 +1457,9 @@ def _fit_figure_to_char(fig: Figure, ref_image) -> Figure:
         # 足クラスタ間隔から立ち姿の開きを実測し、脚鎖全体の外転角へ写す。
         # スカート等で足が1塊のとき・足が写らないときは不発=既定0度
         # (安全側)。SM_POSE_STANCE_FIT=off で無効化。
-        if os.environ.get("SM_POSE_STANCE_FIT", "").strip().lower()                 not in ("off", "0", "false"):
+        if (_lm_joints is None
+                and os.environ.get("SM_POSE_STANCE_FIT", "").strip().lower()
+                not in ("off", "0", "false")):
             try:
                 band = fg[max(y0, y1 - max(2, int(0.10 * ch_img))):y1 + 1]
                 cols = band.sum(axis=0)

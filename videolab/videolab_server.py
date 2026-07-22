@@ -135,7 +135,11 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.44"
+__version__ = "0.11.45"
+# 0.11.45: 工房AI本線を実走比較で採用した三段6stepへ切替。
+# VACE High 3step (Lightning 4step LoRA + AniSora High要素LoRA) →
+# VACE Low 2step (Lightning 4step LoRA) → native AniSora Low 1step。
+# AniSora Lowの強い回転priorを最終1stepだけに限定する。
 # 0.11.44: 分室GCSパックを8方向walkpack検査へ入れる前に分岐し、原画PNGと
 # 英訳txtを専用構造へ展開。annex_ pack_idも補助判定にして旧/欠損requestを救済。
 # 0.11.43: Codex motion_profileのgait/limb_modeをAI骨格へ配線し、走行語は
@@ -4369,10 +4373,10 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
     desc = ("OpenPose/VACEで構図と歩行を固定し、VACE HighへKijai配布の"
             "AniSora V3.2 High要素抽出LoRAを適用する。同じノイズlatentを"
             "最終1--2stepだけnative AniSora Lowへ直接渡す。AniSora High本体"
-            "の移植、Lightning LoRA、中間動画、VAE再encode、再ノイズ化は"
-            "行わない。extra hybrid_low_steps=1|2 (既定2)。"
-            "hybrid_lightning4=true, hybrid_vace_low_steps=1なら、"
-            "4stepをHigh 2→VACE Low 1→AniSora Low 1で処理する。")
+            "の移植、中間動画、VAE再encode、再ノイズ化は行わない。"
+            "現行既定は合計6stepをHigh 3→VACE Low 2→"
+            "AniSora Low 1で処理し、Lightning 4step LoRAはVACE High/Low"
+            "だけへ適用する。比較時だけ各extraで明示上書きする。")
     requires = ("Colab L4で十分 (Q4+動的キャンバス設計でほぼフル品質・"
                 "料金はA100の約1/5。A100は最速だが贅沢品)。Q4でVACE High"
                 "約8.5GB + AniSora Low約9GBを区間ごとにGPUへ載せ替え。"
@@ -4380,8 +4384,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 "16GB未満のご家庭GPUはextra offloadでblock offload(実験的)")
     cache_repos = VACEAdapter.cache_repos + ("Kijai/WanVideo_comfy",)
     disk_gb = 46
-    defaults = {"width": 464, "height": 848, "num_frames": 49, "fps": 16,
-                "steps": 8, "guidance": 1.0}
+    defaults = {"width": 464, "height": 848, "num_frames": 57, "fps": 16,
+                "steps": 6, "guidance": 1.0}
 
     def __init__(self):
         super().__init__()
@@ -4423,9 +4427,9 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         e = extra or {}
         try:
             value = int(e.get("hybrid_low_steps")
-                        or os.environ.get("VIDEOLAB_HYBRID_LOW_STEPS", "2"))
+                        or os.environ.get("VIDEOLAB_HYBRID_LOW_STEPS", "1"))
         except (TypeError, ValueError):
-            value = 2
+            value = 1
         return max(1, min(2, max(1, int(total_steps) - 1), value))
 
     @staticmethod
@@ -4433,14 +4437,17 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         """AniSora tailの直前に通すVACE Low step数。通常handoffは0。"""
         e = extra or {}
         try:
-            value = int(e.get("hybrid_vace_low_steps", 0) or 0)
+            value = int(e.get("hybrid_vace_low_steps")
+                        if e.get("hybrid_vace_low_steps") is not None
+                        else os.environ.get("VIDEOLAB_HYBRID_VACE_LOW_STEPS",
+                                            "2"))
         except (TypeError, ValueError):
-            value = 0
+            value = 2
         return max(0, min(max(0, int(total_steps) - 2), value))
 
     @staticmethod
     def _hybrid_lightning4(extra: dict) -> bool:
-        value = (extra or {}).get("hybrid_lightning4", False)
+        value = (extra or {}).get("hybrid_lightning4", True)
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
@@ -8077,8 +8084,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # move_vは素通し=手続き式で分岐 (通常は母艦完結でここに来ない)
             }.get(plan_raw, plan_raw)
     if plan_raw == "ai":
-        _wp_print("[walkpack] 動きの型=AI生成: AniSora頭部固定インペイント"
-                  " (VACE不使用)")
+        _wp_print("[walkpack] 動きの型=AI生成: 三段6step "
+                  "(VACE High 3 → VACE Low 2 → AniSora Low 1)")
     elif plan_raw == "biped_legs":
         _wp_print("[walkpack] body_plan=biped_legs: 骨格=脚のみ "
                   "(上半身の姿勢は参照立ち絵に委ねる)")
@@ -8122,12 +8129,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     idle_n, cyc, period, tail = pv.walk_layout(nf)
     gait_end = idle_n + int(round(cyc * period))
     _exp = j.get("_wp_exp") or {}
-    if plan_raw.endswith("_ai") or plan_raw == "ai":
-        # AI経路の一本化 (0.11.0ユーザー裁定「動画AI処理は共通して
-        # AniSoraのみの頭部固定インペイント方式」): 動きの型4択の
-        # ai=AI生成 (既定) と、旧12択の *_ai=AI通過 (レガシー) の両方が
-        # ここへ来る。インペイント式=手続き土台+空間latent固定 (実験r2の
-        # 正式化)。fracは旧体格別値を温存 (face既定では未使用)
+    if plan_raw == "ai":
+        # 本番本線 (2026-07-22実走比較): 6stepを3:2:1へ固定する。
+        # 明示的に旧anisora_inpaintを指定した隔離実験だけは従来経路を残す。
+        if "anisora_inpaint" not in _exp:
+            _exp.setdefault("triple_handoff_321", True)
+    elif plan_raw.endswith("_ai"):
+        # 旧12択の *_ai は後退比較互換として従来インペイントを維持。
         _exp.setdefault("anisora_inpaint", {
             "quadruped_ai": 0.6, "amorphous_ai": 0.55,
             "serpentine_ai": 0.6, "flying_ai": 0.5}.get(plan_raw, 0.55))
@@ -8171,7 +8179,24 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     # 作品詳細へ残す「実際に使った値」。GCS workerが完成manifestへ写す。
     # 生の管理JSONではなく既定補完+クランプ後を記録し、後日の設定変更で
     # 過去作品の表示が変わらないようにする。
-    if _exp.get("anisora_inpaint"):
+    if _exp.get("triple_handoff_321"):
+        j["_generation_settings"] = {
+            "engine": "vace_anisora_handoff",
+            "directions": len(_WP_DIRS),
+            "steps": 6,
+            "stage_steps": {"vace_high": 3, "vace_low": 2,
+                            "anisora_low": 1},
+            "vace_high_loras": ["lightning4", "anisora_high_elements"],
+            "vace_low_loras": ["lightning4"],
+            "anisora_low_loras": [],
+            "motion_control": _motion_kind,
+            "gait": _motion_gait,
+            "limb_mode": _limb_mode,
+            "direction_chain": "adjacent_end_anchor",
+            "transition_frames": 4,
+            "server_version": __version__,
+        }
+    elif _exp.get("anisora_inpaint"):
         _settings_steps = _wp_knob_int(
             _kn, "refine_total", 8, 4, 12)
         _settings_release = min(_settings_steps, _wp_knob_int(
@@ -8702,6 +8727,49 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 pass
             log(f"[{tag}] 実験legs_mask={_fracL}: 上=実画素凍結 / "
                 "下=脚骨格入り生成 (idle/静止=全身実画素)")
+        if _exp.get("triple_handoff_321"):
+            # 採用構成: 1本のnoise latentを途中decode/re-encodeせず三段で
+            # 引き継ぐ。Lightning 4step LoRAはVACE High/Lowだけ、Kijaiの
+            # AniSora High要素LoRAはHighだけ、回転priorの強いnative
+            # AniSora Lowは終端1stepだけに限定する。
+            j["detail"] = f"[{tag}] 三段6step 3:2:1"
+            _triple_extra = {
+                "quant": "Q4_0",
+                "vace_base": "fun",
+                "vace_lora": "anisora_high",
+                "hybrid_lightning4": True,
+                "hybrid_vace_low_steps": 2,
+                "hybrid_low_steps": 1,
+                "conditioning_scale": 1.0,
+                "pose_frames_b64": pv.encode_frames_b64(frames),
+            }
+            if offload:
+                _triple_extra["offload"] = offload
+            log(f"[{tag}] 三段latent直結: VACE High 3step "
+                "(Lightning4+AniSora要素LoRA) → VACE Low 2step "
+                "(Lightning4) → AniSora Low 1step")
+            _wm321 = "mock" if j.get("_wp_mock") else "vace_anisora_handoff"
+            _jid321 = submit_job(_wm321, GenRequest(
+                mode="i2v", prompt=prompt, images=[canvas],
+                width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+                steps=6, seed=seed, guidance=1.0, extra=_triple_extra))
+            _sj321 = _wp_wait(j, _jid321, s1lo, s2hi)
+            cvid = out / f"canvas_{tag}.mp4"
+            shutil.copy2(_sj321["path"], cvid)
+            try:
+                (out / f"prompt_{tag}.txt").write_text(prompt,
+                                                       encoding="utf-8")
+                canvas.save(out / f"refcanvas_{tag}.png")
+                frames[0].save(out / f"control_{tag}_idle.png")
+                frames[idle_n + max(1, (gait_end - idle_n) // 4)].save(
+                    out / f"control_{tag}_move.png")
+            except Exception:                 # noqa: BLE001
+                pass
+            j["detail"] = f"[{tag}] セル分割"
+            _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                      idle_n, gait_end if tail else None, log,
+                      canvas_w=w, canvas_h=h)
+            return
         if _exp.get("anisora_inpaint"):
             # 本線AI (0.11.1): 手続き動画をSDEditの土台にしない。
             # 固定側の頭部原画+maskは歩行ボブへ追従し、bbox外背景だけ静止。

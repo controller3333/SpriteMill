@@ -129,10 +129,14 @@ CLIの `--still-provider` / `--gemini-auth` を使用してください。
   末尾静止8フレームの合計57フレームです。
 - 数度レベルの微妙な向きの傾きは機械検査では拾い切れません。
   最後にプレビューを目視確認してください。
-- VideoLabの現行 `ai` はVACEを使わず、AniSora単体で1方向ずつ8回生成します。
-  0フレーム目を全面固定し、以後は顔・背景固定+体純ノイズ。HighでPose/画像を
-  別予測して合成し、Lowで仕上げます。加工系3種 (上下伸縮/左右伸縮/上下移動) は
-  GPUを使わない手続きアニメです。旧VACE設定はレガシー依頼の互換用だけに残ります。
+- VideoLabの現行 `ai` は各方向57f・合計6stepのlatent直結です。
+  VACE High 3step（4step Lightning LoRA＋AniSora Highの要素を汲んだLoRA）→
+  VACE Low 2step（4step Lightning LoRA）→native AniSora Low 1stepの3:2:1で、
+  回転priorの強いAniSora Lowは最後だけに限定します。加工系3種
+  (上下伸縮/左右伸縮/上下移動) はGPUを使わない手続きアニメです。
+- 母艦はGPU送信前に、肩・腰・足首を重ねた8方向の直立/歩幅ピーク画像を
+  packへ同梱します。受付台の管理画面から確認でき、背景の発光やキラキラは
+  キャラクターbboxから除外します。
 - 「方向を描き直す」で動画を複数方向選んだ場合も同じ生成単位を維持します。
   `compass`は1回、`4x2`は選択が前後半球 (前=front/left/front_left/front_right、
   後=back/right/back_left/back_right) の組をまたぐ場合だけ2回、`all`だけ
