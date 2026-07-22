@@ -135,7 +135,9 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.43"
+__version__ = "0.11.44"
+# 0.11.44: 分室GCSパックを8方向walkpack検査へ入れる前に分岐し、原画PNGと
+# 英訳txtを専用構造へ展開。annex_ pack_idも補助判定にして旧/欠損requestを救済。
 # 0.11.43: Codex motion_profileのgait/limb_modeをAI骨格へ配線し、走行語は
 # run骨格、脚のみ/腕のみ/四肢なしはOpenPose描画部位を自動切替。GCS分室
 # packは通常walkpackと分岐してAniSora単純I2V→MP4+原画posterを納品。
@@ -7201,19 +7203,29 @@ def _pack_refs_dir(pack: Path) -> tuple:
     return (char or "char"), refs
 
 
-def _pack_extract(pid: str, raw: bytes) -> int:
+def _pack_extract(pid: str, raw: bytes, pack_kind: str = "walkpack") -> int:
     """zipバイト列をパック構造へ展開する (既存同名は置換)。
 
     パストラバーサル対策は二重: ①メンバー名はbasenameだけを使い、置き先は
     種別ごとの固定ディレクトリに限定 ②書き込み直前に resolve() でパック
-    ディレクトリ内であることを検証。"""
+    ディレクトリ内であることを検証。
+
+    walkpackは従来どおり8方向PNGを必須にする。annexは一枚絵I2Vなので
+    annex_source.png + annex_prompt_en.txtだけをルートへ展開し、8方向検査を
+    絶対に通さない。"""
+    if pack_kind not in ("walkpack", "annex"):
+        raise ValueError(f"不正なパック種別です: {pack_kind}")
+    annex = pack_kind == "annex"
     pack = (packs_root() / pid)
     root = packs_root()
     root.mkdir(parents=True, exist_ok=True)
     if pack.exists():
         shutil.rmtree(pack)
     sc = pack / "01_generation" / "split_centered"
-    sc.mkdir(parents=True)
+    if annex:
+        pack.mkdir(parents=True)
+    else:
+        sc.mkdir(parents=True)
     count = 0
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
         total = sum(i.file_size for i in zf.infolist())
@@ -7227,6 +7239,11 @@ def _pack_extract(pid: str, raw: bytes) -> int:
                 continue
             if name == "meta.json":
                 dest = pack / "meta.json"
+            elif annex and name in ("annex_source.png",
+                                    "annex_prompt_en.txt"):
+                dest = pack / name
+            elif annex:
+                continue        # 分室は上の固定3ファイル以外を展開しない
             elif name == "landmarks.json":
                 dest = pack / "01_generation" / "landmarks.json"
             elif name == "face_boxes.json":
@@ -7257,8 +7274,24 @@ def _pack_extract(pid: str, raw: bytes) -> int:
                 data = f.read(120 * 2**20 + 1)
             if len(data) > 120 * 2**20:
                 raise ValueError(f"ファイルが大きすぎます: {name}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             count += 1
+    if annex:
+        missing = [name for name in ("annex_source.png",
+                                     "annex_prompt_en.txt")
+                   if not (pack / name).is_file()]
+        if missing:
+            shutil.rmtree(pack, ignore_errors=True)
+            raise ValueError(f"分室パックのファイルが不足しています: {missing}")
+        meta_p = pack / "meta.json"
+        meta = _pack_meta(pack)
+        meta.setdefault("type", "annex_i2v")
+        meta.setdefault("name", pid)
+        meta["created"] = time.time()
+        meta_p.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                          encoding="utf-8")
+        return count
     char, refs = _pack_refs_dir(pack)
     missing = [d for d in _WP_DIRS if d not in refs]
     if missing:
@@ -9531,13 +9564,17 @@ def _gcs_process_one(req: dict, wait: bool = True):
     blob = _gcs_read(f"packs/{pid}.zip")
     if blob is None:
         raise RuntimeError(f"パックが見つかりません: {pid}")
-    _pack_extract(pid, blob)                    # GCS -> ローカルpacks/ へ展開
+    # 分室は8方向PNGを持たない。一枚絵パックを通常extractへ入れた時点で
+    # 「8方向PNG不足」になるため、展開より前に種別を決める。requestの種別
+    # フィールドが古い中継で欠けても annex_ pack_id なら救済する。
+    annex = (req.get("room") == "annex"
+             or req.get("request_type") == "annex_i2v"
+             or pid.startswith("annex_"))
+    _pack_extract(pid, blob, "annex" if annex else "walkpack")
     req["status"] = "generating"
     req["error"] = ""
     _gcs_req_save(req)
     _LAST_GCS_WORK[0] = time.time()
-    annex = (req.get("room") == "annex"
-             or req.get("request_type") == "annex_i2v")
     jid = (_submit_annex_i2v(pid, mock=bool(req.get("_mock")))
            if annex else submit_walkpack(pid, mock=bool(req.get("_mock"))))
     if not wait:
