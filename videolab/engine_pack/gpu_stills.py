@@ -21,9 +21,12 @@ import re
 import zipfile
 from pathlib import Path
 
-# 時計回り360° (上から見て front→right→back→left)。
-# AniSoraターンテーブル用プロンプトと同じ規約。
-TURNTABLE_CLOCKWISE = (
+# ターンテーブルのスロット順。**どちらに回るかはAniSoraに任せきりに
+# できない** — プロンプトで clockwise と指示しても逆に回ることがあり、
+# 2026-07-22の実走では "right" スロットに画面左向きの絵が入った
+# (SpriteMillの right = 画面右向き。posesets/right_idle.png が正)。
+# 実測 (measure_rotation_sense) で選ぶこと。
+TURNTABLE_RIGHT_FIRST = (        # 画面右へ回る: front→front_right→right…
     "front",
     "front_right",
     "right",
@@ -33,6 +36,17 @@ TURNTABLE_CLOCKWISE = (
     "left",
     "front_left",
 )
+TURNTABLE_LEFT_FIRST = (         # 画面左へ回る (上の鏡像)
+    "front",
+    "front_left",
+    "left",
+    "back_left",
+    "back",
+    "back_right",
+    "right",
+    "front_right",
+)
+TURNTABLE_CLOCKWISE = TURNTABLE_RIGHT_FIRST      # 旧名 (後方互換)
 DIR_INDEX = {
     "front": 1, "left": 2, "right": 3, "back": 4,
     "front_left": 5, "front_right": 6,
@@ -161,16 +175,103 @@ def concept_to_qwen_prompt(meta: dict) -> str:
     return " ".join(bits)
 
 
-def turntable_frame_index(n_frames: int, direction: str) -> int:
+def facing_ref_path(posesets_dir=None):
+    """向き判定の参照 (C17 の right 指示書) のパス。無ければ None。
+
+    較正の出典がC17なので、差し替え式の現行poseset (色分け人形・左右が
+    ほぼ対称) では代用しない — 感度が落ちて誤判定側に倒れる
+    (pipeline._facing_margin_vs_poseset の注記と同じ理由)。"""
+    root = Path(posesets_dir) if posesets_dir else (
+        Path(__file__).resolve().parent.parent / "posesets")
+    here = Path(__file__).resolve().parent
+    for p in (root / "_old_C17_v2" / "right_1.png",
+              root / "_old_C17" / "right_1.png",
+              # GPU VMには posesets が無いので engine_pack へ同梱した実体
+              # (gce_drive.push が code/engine_pack/ へ送る)
+              here / "facing_ref_right.png"):
+        if p.is_file():
+            return p
+    return None
+
+
+def _norm64(img, flip: bool = False, thr: int = 70):
+    """マゼンタ地を抜いて前景bboxで切り、64x128へ正規化した配列。
+
+    pipeline._facing_margin_vs_poseset (C17較正の向き判定) と同一の
+    前処理 — 較正値をそのまま引き継ぐため式を変えないこと。"""
+    import numpy as np
+    from PIL import Image
+    a = np.asarray(img.convert("RGB")).astype(int)
+    mag = (np.minimum(a[:, :, 0], a[:, :, 2]) - a[:, :, 1]) >= thr
+    ys, xs = np.nonzero(~mag)
+    if len(ys) < 50:
+        return None
+    crop = img.convert("RGB").crop((int(xs.min()), int(ys.min()),
+                                    int(xs.max()) + 1, int(ys.max()) + 1))
+    if flip:
+        crop = crop.transpose(Image.FLIP_LEFT_RIGHT)
+    return np.asarray(crop.resize((64, 128), Image.LANCZOS)).astype(float)
+
+
+def facing_margin(img, ref_right):
+    """画面右向きらしさ。正=右向き / 負=左向き / None=測れず。
+
+    C17の right 指示書との鏡映比較 (pipeline._facing_margin_vs_poseset と
+    同じ計量。較正: 正常 +9.7以上 / 逆 -6.7以下でプロファイルは完全分離)。
+    目の明度に依存しないので、平坦な塗りのAI出力でも効く
+    (_estimate_yaw はこの実データで flat_lum 全滅だった)。"""
+    import numpy as np
+    g = _norm64(ref_right)
+    own = _norm64(img)
+    flp = _norm64(img, flip=True)
+    if g is None or own is None or flp is None:
+        return None
+    return float(np.abs(flp - g).mean()) - float(np.abs(own - g).mean())
+
+
+def measure_rotation_sense(frames: list, ref_right=None,
+                           min_margin: float = 4.0) -> tuple:
+    """ターンテーブルの回り方を実測する。
+
+    戻り値 (sense, score): sense=+1 なら画面右へ回る
+    (front→front_right→right…)、-1 なら左へ、0 なら判定不能。
+    1/4周と3/4周のコマは必ず互いに反対の横向きなので、両方を「右向き
+    らしさ」で採点し、その差で向きを決める (片方だけより頑健)。
+    2026-07-22の実走データでは 1/4周=-9.46 / 3/4周=+11.63 (差-21.1) と
+    はっきり左回りに出た。"""
+    n = len(frames or [])
+    if n < 4 or ref_right is None:
+        return 0, 0.0
+    q = max(0, min(n - 1, int(round((n - 1) * 0.25))))
+    t = max(0, min(n - 1, int(round((n - 1) * 0.75))))
+    mq = facing_margin(key_to_magenta(frames[q]), ref_right)
+    mt = facing_margin(key_to_magenta(frames[t]), ref_right)
+    if mq is None or mt is None:
+        return 0, 0.0
+    score = mq - mt                    # 正: 1/4周が右向き = 右回り
+    if abs(score) < min_margin:
+        return 0, score
+    return (1 if score > 0 else -1), score
+
+
+def turntable_order(sense: int) -> tuple:
+    """実測した回り方 → スロット順。判定不能(0)は右回り既定。"""
+    return TURNTABLE_LEFT_FIRST if sense < 0 else TURNTABLE_RIGHT_FIRST
+
+
+def turntable_frame_index(n_frames: int, direction: str,
+                          order: tuple = None) -> int:
     """81f等のターンテーブルから方向に対応するフレーム添字を返す。
 
-    先頭=front、時計回りに一周して末尾もfrontに戻る前提。末尾を除いた
-    (n-1) 区間を8等分する。
+    先頭=front、一周して末尾もfrontに戻る前提。末尾を除いた (n-1) 区間を
+    8等分する。order は measure_rotation_sense の実測から作った
+    スロット順 (省略時は右回り既定)。
     """
     if n_frames < 2:
         return 0
+    order = order or TURNTABLE_RIGHT_FIRST
     try:
-        slot = TURNTABLE_CLOCKWISE.index(direction)
+        slot = order.index(direction)
     except ValueError:
         slot = 0
     # slot 0..7 → 0 .. (n-1) の 0/8, 1/8, ...
@@ -228,12 +329,20 @@ def write_centered_crops(crops: dict, out_dir: Path, char_id: str,
     return paths
 
 
-def extract_turntable_dirs(frames: list, thr: int = 70) -> dict:
-    """連番フレーム (PIL) から8方向の tight crop を返す。"""
+def extract_turntable_dirs(frames: list, thr: int = 70,
+                           order: tuple = None, ref_right=None) -> dict:
+    """連番フレーム (PIL) から8方向の tight crop を返す。
+
+    order 省略時は ref_right (C17 right指示書) で回り方を実測する
+    (指示どおりの向きに回るとは限らない)。参照が無ければ右回り既定。
+    """
     n = len(frames)
+    if order is None:
+        order = turntable_order(
+            measure_rotation_sense(frames, ref_right)[0])
     crops = {}
-    for d in TURNTABLE_CLOCKWISE:
-        fi = turntable_frame_index(n, d)
+    for d in order:
+        fi = turntable_frame_index(n, d, order=order)
         fi = max(0, min(n - 1, fi))
         keyed = key_to_magenta(frames[fi])
         crops[d] = tight_crop_magenta(keyed, thr=thr)
@@ -306,10 +415,18 @@ def build_seed_pack_zip(req: dict, rid: str = "",
     except Exception as e:  # noqa: BLE001
         meta["mt_source"] = f"skip:{str(e)[:80]}"
     motion_en = str(meta.get("motion_prompt") or "").strip()
+    # 向き判定の物差し (C17 right指示書)。GPU側はこれでターンテーブルの
+    # 回り方を実測し、左右取り違えを防ぐ。母艦にしか posesets が無いので
+    # パックへ同梱する
+    fr = facing_ref_path()
+    if fr is not None:
+        meta["facing_ref"] = fr.name
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("meta.json",
                    json.dumps(meta, ensure_ascii=False, indent=1))
+        if fr is not None:
+            z.write(fr, "facing_ref_right.png")
         if motion_en:
             z.writestr("motion_prompt.txt", motion_en)
         if ref_bytes:

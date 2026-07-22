@@ -135,7 +135,12 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.50"
+__version__ = "0.11.51"
+# 0.11.51: ターンテーブルの回り方を実測してから8方向へ割り当てる。
+# プロンプトの clockwise 指示にAniSoraが従わず、"right" スロットに画面左
+# 向きの絵が入っていた (2026-07-22実走・C17較正の向き計量で -9.46)。
+# 1/4周と3/4周を「右向きらしさ」で採点し差の符号で並びを決める。物差しの
+# C17 right指示書は母艦がシードパックへ同梱する (GPUにposesetsは無い)。
 # 0.11.50: GPU立ち絵の頭身崩壊を修正。①ControlNet骨格を歩行本線と同じ
 # build_walk_pose_frames の直立コマへ (旧: 歩行キャンバス用の入口に単体
 # 画像を渡し、足が画面外へ出る骨格を作っていた) ②プロンプトの "chibi"
@@ -8632,7 +8637,30 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
     # ---- 3) 8方向切り出し + センタリング ----
     j["detail"] = "GPU立ち絵: 8方向切り出し"
     frames = _seed_decode_mp4_frames(tt_dest, log)
-    crops = gs.extract_turntable_dirs(frames)
+    # ★回り方は実測する: プロンプトで clockwise と指示してもAniSoraは
+    # 逆に回ることがあり、2026-07-22の実走では "right" スロットに画面左
+    # 向きの絵が入った (C17較正の向き計量で -9.46 と明確に検出できる)
+    ref_right = None
+    for cand in (pack / "facing_ref_right.png",
+                 pack / "01_generation" / "facing_ref_right.png"):
+        if cand.is_file():
+            ref_right = _PIL.open(cand).convert("RGB")
+            break
+    if ref_right is None:
+        _fr = gs.facing_ref_path()
+        if _fr is not None:
+            ref_right = _PIL.open(_fr).convert("RGB")
+    sense, score = gs.measure_rotation_sense(frames, ref_right)
+    order = gs.turntable_order(sense)
+    if sense == 0:
+        log(f"⚠ 回転の向きを判定できず (score={score:+.1f}"
+            f"{'・向き参照なし' if ref_right is None else ''}) — "
+            "右回り既定で切り出します")
+    else:
+        log(f"回転の向き実測: {'右回り' if sense > 0 else '左回り'} "
+            f"(score={score:+.1f}) → 1/4周を "
+            f"{order[2]} として切り出します")
+    crops = gs.extract_turntable_dirs(frames, order=order)
     # 正面は生成原画を優先 (回転0°のブレ防止)
     front_crop = gs.tight_crop_magenta(front)
     crops["front"] = front_crop
