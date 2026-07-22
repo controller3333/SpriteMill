@@ -60,15 +60,56 @@ MAGENTA = (255, 0, 255)
 # key_to_magenta が「縁の中央値と近い画素」を落とす方式で背景色を選ばない
 # ので、注文するのは「均一であること」だけでよい。
 BG_TAG = "plain flat solid light gray background"
-BG_NEG = "gray clothes, gray skin, gradient background, scenery, floor"
+BG_NEG = "gradient background, scenery, floor"
 
 # 1体だけ描かせる。ControlNetに骨格を1体分しか渡していなくても、SDXLは
 # 縦長キャンバスを「ターンアラウンド表」で埋めることがある (2026-07-23実走:
 # 5体並びが出て、うち4体は顔が空白だった)。danbooru語の solo が最も効く。
-SOLO_TAG = "solo, 1 character, single character, full body visible"
+SOLO_TAG = "solo"
 SOLO_NEG = ("multiple characters, duplicate character, character sheet, "
             "multiple views, turnaround sheet, collage, 2girls, 3girls, "
             "crowd, cropped")
+
+# 服を必ず着せる。依頼の衣装が訳で落ちると (「青チャイナ」→"blue china" は
+# 服として読まれない) 素体が出る — 2026-07-23実走で実際に裸の立ち絵が
+# 生成され、そのまま回転→歩行へ流れかけた。配布物なので下限として常に付ける。
+CLOTHED_TAG = "fully clothed"
+NSFW_NEG = ("nude, naked, nsfw, topless, bottomless, underwear, lingerie, "
+            "bare chest, exposed skin, nipples, swimsuit")
+
+# 依頼文でよく出る衣装語の対訳 (機械翻訳が服だと解さない語を補う)
+COSTUME_GLOSSARY = (
+    ("チャイナドレス", "cheongsam qipao dress"),
+    ("チャイナ", "cheongsam qipao dress"),
+    ("セーラー", "sailor uniform"),
+    ("巫女", "miko shrine maiden outfit"),
+    ("袴", "hakama"),
+    ("浴衣", "yukata"),
+    ("着物", "kimono"),
+    ("学ラン", "gakuran school uniform"),
+    ("ブレザー", "blazer school uniform"),
+    ("メイド", "maid outfit"),
+    ("白衣", "lab coat"),
+    ("甲冑", "plate armor"),
+    ("鎧", "armor"),
+    ("法衣", "robe"),
+    ("忍装束", "ninja outfit"),
+)
+
+
+def costume_hint(meta: dict) -> str:
+    """依頼の原文 (日本語) から衣装語を拾って英語タグにする。
+
+    palette欄に「青チャイナ」のように書かれた衣装は、機械翻訳では
+    "blue china" になって服として効かない。原文を直接見て補う。"""
+    src = " ".join(str((meta or {}).get(k) or "") for k in (
+        "concept_ja", "palette_ja", "silhouette_ja", "notes_ja",
+        "concept", "palette", "silhouette", "notes"))
+    hits = []
+    for ja, en in COSTUME_GLOSSARY:
+        if ja in src and en not in hits:
+            hits.append(en)
+    return ", ".join(hits)
 
 TURNTABLE_PROMPT = (
     "Full-body turntable animation of exactly the same single anime "
@@ -87,7 +128,8 @@ TURNTABLE_PROMPT = (
 TURNTABLE_NEGATIVE = (
     "walking, running, limb motion, pose change, camera movement, zoom, "
     "close-up, crop, body out of frame, scale change, duplicate character, "
-    "extra limbs, deformed face, motion blur, background change"
+    "extra limbs, deformed face, motion blur, background change, "
+    "nude, naked, undressing, clothing change"
 )
 
 
@@ -138,7 +180,7 @@ def proportion_tags(leg_scale) -> tuple:
 def stills_negative(meta: dict, base: str = "") -> str:
     """立ち絵用ネガティブ = アダプタ既定 + 頭身の否定 + 背景同化の否定。"""
     neg = (proportion_tags((meta or {}).get("leg_scale"))[1]
-           + ", " + BG_NEG + ", " + SOLO_NEG)
+           + ", " + BG_NEG + ", " + SOLO_NEG + ", " + NSFW_NEG)
     base = (base or "").strip().rstrip(",")
     return f"{base}, {neg}" if base else neg
 
@@ -184,24 +226,36 @@ def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
 
 
 def concept_to_illustrious_prompt(meta: dict) -> str:
-    """依頼メタから Illustrious 向けタグ寄りプロンプトを組む (英語化済み)。"""
+    """依頼メタから Illustrious 向けタグ寄りプロンプトを組む (英語化済み)。
+
+    ★語順が効く: SDXLのCLIPは77トークンで切れ、前方ほど強い。定型句を
+    先に積むと依頼のキャラ描写が後方へ押し出されて効かなくなる —
+    2026-07-23の実走で、定型句を増やした版が「顔なし・無彩色・後ろ向き」
+    を連発した (増やす前の短い版は一発で金髪・青チャイナ・緑目が出た)。
+    **キャラ描写を先、技術タグを後**に置くこと。"""
     m = _en_meta(meta)
     prop = proportion_tags(m.get("leg_scale"))[0]
-    tags = str(m.get("illustrious_tags") or (
-        f"masterpiece, best quality, {SOLO_TAG}, {prop}, "
-        "full body, standing, front view, front lighting, flat color, "
-        f"simple background, {BG_TAG}")).strip()
+    if m.get("illustrious_tags"):
+        head = str(m["illustrious_tags"]).strip()
+    else:
+        head = f"masterpiece, best quality, solo, {prop}"
     concept = str(m.get("concept_en") or m.get("concept") or "").strip()
     palette = str(m.get("palette_en") or m.get("palette") or "").strip()
     sil = str(m.get("silhouette_en") or m.get("silhouette") or "").strip()
     notes = str(m.get("notes_en") or m.get("notes") or "").strip()
-    parts = [tags]
+    cos = costume_hint(meta)
+    parts = [head]                     # ① キャラの中身 (依頼の言葉)
     if concept:
         parts.append(concept)
     if palette:
-        parts.append(f"color palette: {palette}")
+        parts.append(palette)
+    if cos:
+        parts.append(cos)
     if sil:
-        parts.append(f"silhouette: {sil}")
+        parts.append(sil)
+    parts.append(CLOTHED_TAG)          # ② 構図と作画の指定
+    parts.append("full body, standing, front view, front lighting, "
+                 f"flat color, simple background, {BG_TAG}")
     if notes:
         parts.append(notes)
     return ", ".join(parts)
@@ -218,12 +272,15 @@ def concept_to_qwen_prompt(meta: dict) -> str:
     prop = proportion_tags(m.get("leg_scale"))[0]
     bits = [
         "Exactly one single full-body front-facing idle anime game "
-        f"character sprite, {prop}, crisp outlines, flat colors, "
-        f"one soft shadow, {BG_TAG}, uniform background with no gradient, "
-        "no floor, no text, no watermark, no border, "
+        f"character sprite, {prop}, {CLOTHED_TAG}, crisp outlines, "
+        f"flat colors, one soft shadow, {BG_TAG}, uniform background with "
+        "no gradient, no floor, no text, no watermark, no border, "
         "not a turnaround sheet.",
         f"Character: {concept}.",
     ]
+    cos = costume_hint(meta)
+    if cos:
+        bits.append(f"Outfit: {cos}.")
     if palette:
         bits.append(f"Palette: {palette}.")
     if sil:
