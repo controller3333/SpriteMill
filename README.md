@@ -1,43 +1,148 @@
-# SpriteMill VideoLab
+# SpriteMill — 8方向歩行スプライトシート生成ツール
 
-ゲームキャラの**歩行スプライトシート**を作るための、モデル差し替え式
-動画生成サーバ + webUI です。[SpriteMill](https://github.com/controller3333/SpriteMill)
-本体の動画AIバックエンドとして、Google Colab またはローカルGPUで動きます。
+1枚のキャラ指定(テキスト or 画像)から、検査・修復つきの歩行スプライト
+シートを自動生成するスタンドアロンGUIアプリです。完成品は機械判定と
+人間の承認を分けて管理できます。
 
-## Colab で使う (GPU不要・推奨)
+## 使う生成AIを選べます
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/controller3333/SpriteMill/blob/main/colab/SpriteMill_video_lab.ipynb)
+| 用途 | 選択肢 | 認証 | i2i対応 |
+|---|---|---|---|
+| 画像(立ち絵) | **GPT** (Codex CLI・推奨) | ChatGPTログイン | ✅ |
+| 画像(立ち絵) | **Google Gemini** | gcloudログイン + GCPプロジェクト | ✅ |
+| 画像(立ち絵) | **Grok** | xAI利用枠 | ❌ (t2iのみ) |
+| 画像(立ち絵) | **ブラウザ手動** | Webサービス側でログイン | ✅ |
+| 動画(歩行) | **Grok** | xAI利用枠 | — |
+| 動画(歩行) | **Google Veo** | gcloudログイン + GCPプロジェクト | — |
+| 動画(歩行) | **ブラウザ生成サポート** | Webサービス側でログイン | — |
 
-1. 上のバッジをクリック(またはSpriteMillアプリの「Colabでノートブックを開く」)
-2. ランタイム → **GPU (A100推奨)** → すべてのセルを実行(2回)
-3. 表示された URL / TOKEN を SpriteMill の「VideoLab URL / TOKEN」欄に貼る
+GPT/CodexはChatGPTの利用枠、Grok/GoogleのAPI直結経路は各サービスの
+クレジットを使用します。開始前のプリフライトに予定生成回数と所要目安が
+表示され、キュー追加前にも確認できます。
 
-> ⚠ Colab **無料枠**は「webUI主体の利用」が規約で禁止されています。
-> 有料プラン (Pay-as-you-go $10〜 / Pro) で使ってください。
+<details>
+<summary>上級者向け: APIキー方式 / OpenAI API</summary>
 
-## ローカルGPUで使う
+GUIのGoogle経路はVertex AI + gcloud認証です。エンジンにはGemini APIキー方式と
+OpenAI API (`gpt-image-1`) も残してあります。必要な場合は `config.json` と
+CLIの `--still-provider` / `--gemini-auth` を使用してください。
+</details>
 
-SpriteMill アプリの「🖥 ローカルサーバーを起動」ボタン一発で、
-セットアップから起動・接続まで自動で行われます。手動起動する場合は
-[videolab/README.md](videolab/README.md) を参照してください。
+- 途中の検査・修復(向き反転検出、反転補填、FAIL方向のみ再生成、
+  スケール統一、ヨー抑制コマ選定)はすべて自動
 
-## 搭載モデル
+## 単体EXE版
 
-| モデル | 用途 |
-|---|---|
-| **AniSora V3.2** (既定) | アニメ特化・2026-07の比較検証でスプライト歩行が圧勝 |
-| **VACE High → AniSora Low latent直結** | Lightning低step LoRAつきOpenPose骨格を前半だけ使い、同じノイズ軌道をAniSoraで仕上げる（中間動画の再入力なし） |
-| LTX-2.3 22B (distilled/dev) | 高速・汎用 |
-| LTX-Video 0.9.7 | 低VRAM (10-16GB) |
-| Wan 2.2 TI2V-5B / I2V-A14B+歩行LoRA | 比較・実験用 |
-| mock | GPU不要の疎通確認 |
+`dist\SpriteMill.exe` (x64) はこのフォルダ一式が無くても単体で動きます。
 
-詳細・調査記録・ライセンス注意は [videolab/README.md](videolab/README.md) へ。
+- 初回起動時に、編集可能な `templates\`・`style_ref.png`・`config.json` を
+  EXEと同じフォルダへ自動展開します(書き込める場所に置いてください)
+- 配布時は EXE 1ファイルを渡すだけでOK。相手側の手順はセットアップタブの
+  ボタンを上から押すだけ(winget導入+ブラウザログイン)
+- 未署名のため初回にSmartScreenの警告が出ます:
+  「詳細情報」→「実行」で起動できます
+- 再ビルド: `<x64のPython> -m PyInstaller --noconfirm SpriteMill.spec`
+  (ARM64版PythonでビルドするとARM64専用EXEになるので注意)
 
-## 開発メモ
+## 前提
 
-- サーバ実装は `videolab/videolab_server.py` の1ファイルが正。
-  Colabノートブックは `videolab/make_notebook.py` で自動生成(手編集禁止)。
-- 各モデルの重みは初回に Hugging Face から自動ダウンロードされます。
-  ライセンスは各モデルのものに従ってください
-  (AniSora=Apache 2.0 / LTX-2=Community License / Wan=Apache 2.0)。
+- Windows 10/11 (winget が使えること)
+- EXE版はPython不要。ソース版のみPython 3.10+
+- 選んだ経路に対応するアカウント/利用枠:
+  - ChatGPT (Codexが使えるプラン)
+  - xAI / Grok、または Google Cloud (Vertex AI)
+
+## 導入
+
+1. `run_sprite_mill.bat` をダブルクリック
+2. 「① セットアップ」タブで上から順に:
+   - Pillow / ffmpeg / Codex CLI / Grok CLI → 「インストール」ボタン
+   - Codex / Grok / Google → 必要な行だけインストール・ログイン
+     (ブラウザが開くのでアカウントでサインイン)
+   - Googleを使う場合はGCPプロジェクトも設定
+3. すべて ✅ になったら「② 生成」タブへ
+
+## 使い方
+
+1. キャラ名を入力
+2. モードを選択
+   - **t2i**: コンセプト・パレット・シルエット要素をテキストで指定
+   - **i2i**: 手持ちのキャラ画像を指定 → その子をスプライト化
+3. テンプレート(出力の並び順)を選択
+   | テンプレート | 構成 | 用途 |
+   |---|---|---|
+   | T規格 | 12列×4行、8方向×(直立+歩行5コマ) | 現行プロジェクト標準 |
+   | ツクールMV/MZ | 3列×4行、下/左/右/上×(歩A/直立/歩B)、`$名前.png` | RPGツクール |
+   | ウディタ4方向 | 3列×4行、同上 | WOLF RPGエディター |
+   | ウディタ8方向 | 6列×4行、基本4方向+斜め4方向 | WOLF RPGエディター(8方向) |
+4. 生成ボタン上のプリフライトで、入力・ログイン・AIの組合せと予定消費を確認
+5. 必要なら「まず立ち絵まで(歩行は作らない)」をON
+6. 「＋ キューに追加」— 空き次第、静止絵→検査→歩行→シート化→最終検査まで自動
+
+「まず立ち絵まで」では8方向立ち絵とQCで停止し、動画生成は0回です。
+確認後に「この立ち絵で歩行へ」を押すと、済んだ工程を再利用して続行します。
+
+## 完成状態とレビュー
+
+「一覧・キュー」のタイルには次の状態が表示されます。
+
+- **合格** — 最終成果物があり、最終QCに警告なし
+- **要確認** — 完成品は出力済みだが、QC不合格または注意事項あり
+- **立ち絵確認待ち** — 意図的に立ち絵までで停止。歩行へ続行可能
+- **途中停止** — 採用できる最終成果物を確認できない
+
+ベストエフォート設定では、QCに注意事項があっても完成品を出力する場合があります。
+これは「要確認」と表示され、「合格」とは区別されます。判定詳細を確認し、目視で
+問題なければ「承認する」を押してください。承認は成果物の世代に紐づくため、
+再生成後に古い承認が持ち越されることはありません。
+
+## テンプレートの編集・追加
+
+`templates/*.json` を編集するか、コピーして新しい JSON を置くと
+プルダウンに自動で追加されます。各セルは
+`{"col": 列, "row": 行, "dir": 方向, "frame": コマ}` の羅列なので、
+並び順は自由に変えられます。
+- 方向: front / left / right / back / front_left / front_right / back_left / back_right
+- コマ: idle, walk1〜walk5, walkA/walkB(歩幅が反対になる2コマ、3パターン形式用)
+
+※ ウディタ8方向の斜め行順は環境の設定により異なる場合があります。
+実機で向きがズレたら `wolf_8dir.json` の `row` 値を入れ替えてください。
+
+## 出力
+
+`output/<日時>_<キャラ名>/` に以下が入ります:
+- `<名前>T.png` / `<名前>LT.png` — T規格シート(64px / 320px)
+- テンプレート指定時はそのシート(例 `$名前.png`)
+- `<名前>_walk_preview.webp` — 歩行プレビュー
+- `01_generation/`〜`07_final_qc/` — 中間生成物と検査ログ(証跡)
+- `result_status.json` — 合格/要確認/立ち絵確認待ち/途中停止の機械可読結果
+- `.spritemill_review.json` — 人間の承認状態(GUIで承認した場合)
+
+## known notes
+
+- Codex がサンドボックスのシェルエラーを出しても問題ありません。
+  生成画像は自動回収されます。
+- 歩行用の立ち絵計測では、二足・四足などの制御種別と、全身・脚のみ・腕のみ・
+  四肢なしを自動判定します。キャラ名またはコンセプトに「走る」「疾走」
+  「ダッシュ」などがあれば、立ち絵の上半身姿勢を尊重しつつ走行モーションへ
+  切り替えます。動画は通常、前半49フレーム（直立6f＋21f周期を2周）と
+  末尾静止8フレームの合計57フレームです。
+- 数度レベルの微妙な向きの傾きは機械検査では拾い切れません。
+  最後にプレビューを目視確認してください。
+- VideoLabの現行 `ai` はVACEを使わず、AniSora単体で1方向ずつ8回生成します。
+  0フレーム目を全面固定し、以後は顔・背景固定+体純ノイズ。HighでPose/画像を
+  別予測して合成し、Lowで仕上げます。加工系3種 (上下伸縮/左右伸縮/上下移動) は
+  GPUを使わない手続きアニメです。旧VACE設定はレガシー依頼の互換用だけに残ります。
+- 「方向を描き直す」で動画を複数方向選んだ場合も同じ生成単位を維持します。
+  `compass`は1回、`4x2`は選択が前後半球 (前=front/left/front_left/front_right、
+  後=back/right/back_left/back_right) の組をまたぐ場合だけ2回、`all`だけ
+  選択方向ごとに1回ずつ生成します。
+
+## 構成
+
+- `sprite_mill.py` — GUI (tkinter)
+- `setup_utils.py` — 依存チェック / インストール / ログイン起動
+- `engine/pipeline.py` — 生成パイプライン本体 (CLIとしても使用可)
+- `engine/inspect_walk_mp4.py` ほか — 検査・組立ツール群
+- `templates/` — シート並び順テンプレート (JSON)
+- `style_ref.png` — 立ち絵の画風参照 (差し替え可)

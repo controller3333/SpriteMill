@@ -317,11 +317,29 @@ def walk_angles_at(phase: float, arm_swing: float = 1.0,
 
 
 def _gait_mode() -> str:
-    """SM_POSE_GAIT: walk (既定) / crawl = 四つん這い (体格メニュー
+    """SM_POSE_GAIT: walk (既定) / run / crawl = 四つん這い (体格メニュー
     「四足歩行(骨格固定)」2026-07-21ユーザー裁定「人型骨格を四つん這いに
     して四足に対応」)。"""
     v = os.environ.get("SM_POSE_GAIT", "walk").strip().lower()
-    return "crawl" if v == "crawl" else "walk"
+    return v if v in ("run", "crawl") else "walk"
+
+
+def _motion_angles_at(phase: float, arm_swing: float = 1.0,
+                      leg_swing: float = 1.0) -> dict:
+    """現在の歩様に合う関節角。runは歩行より大きい脚運び+曲げた肘。
+
+    周期数と位相境界はwalk_layoutのままなので、57fの2周期契約や抽出位置を
+    変えずに「走る」キャラだけ骨の姿勢を走行へ切り替えられる。
+    """
+    if _gait_mode() != "run":
+        return walk_angles_at(phase, arm_swing=arm_swing,
+                              leg_swing=leg_swing)
+    ang = walk_angles_at(phase, arm_swing=arm_swing * 1.30,
+                         leg_swing=leg_swing * 1.30)
+    # 走行は肘を曲げたまま前後へ振る。歩行値を少し残し左右位相も保つ。
+    ang["elbR"] = 52.0 + 0.35 * ang["elbR"]
+    ang["elbL"] = 52.0 + 0.35 * ang["elbL"]
+    return ang
 
 
 def _crawl_J(fig: Figure, angles: dict) -> dict:
@@ -638,17 +656,21 @@ def _face_skip_idx() -> tuple:
 
 
 _LEGS_KEEP = (8, 9, 10, 11, 12, 13)   # 腰・膝・足首 (左右)
+_ARMS_KEEP = (1, 2, 3, 4, 5, 6, 7)    # 首・肩・肘・手首 (左右)
 
 
 def _body_parts_mode() -> str:
-    """SM_POSE_BODY_PARTS: full (既定) / legs = 腰から下 (8-13) だけ描く。
+    """SM_POSE_BODY_PARTS: full / legs / arms / none。
 
     2026-07-21実験h (走る忍者実障害): 参照立ち絵が全方向「走りの途中」
     (前傾・拳・片脚上げ) の依頼に直立歩行骨格の上半身を毎回被せると、
     参照と制御の全面矛盾で二重人格化・ブロブ発明・頭身潰れが起きた。
     脚だけ骨格で誘導し、上半身の姿勢権威を参照立ち絵へ返す折衷モード。"""
     v = os.environ.get("SM_POSE_BODY_PARTS", "full").strip().lower()
-    return "legs" if v in ("legs", "legs_only") else "full"
+    aliases = {"legs_only": "legs", "arms_only": "arms",
+               "off": "none", "no_limbs": "none"}
+    v = aliases.get(v, v)
+    return v if v in ("legs", "arms", "none") else "full"
 
 
 def _draw_openpose_onto(img: Image.Image, kps: list,
@@ -661,8 +683,13 @@ def _draw_openpose_onto(img: Image.Image, kps: list,
     顔点全部を描かない (_face_points_mode 参照)。"""
     dr = ImageDraw.Draw(img)
     skip = set(_face_skip_idx())
-    if _body_parts_mode() == "legs":
+    _parts = _body_parts_mode()
+    if _parts == "legs":
         skip.update(i for i in range(18) if i not in _LEGS_KEEP)
+    elif _parts == "arms":
+        skip.update(i for i in range(18) if i not in _ARMS_KEEP)
+    elif _parts == "none":
+        skip.update(range(18))
     sw = max(2, round(4 * min(img.width, img.height) / 512.0))  # 標準4px@512
     for li, (a, b) in enumerate(OP_LIMBS):
         if kps[a] is None or kps[b] is None:
@@ -695,10 +722,20 @@ def draw_openpose(kps: list, width: int, height: int,
 
 
 def _fg_mask(ref_image):
-    """立ち絵(マゼンタ地)の前景マスク (bool ndarray)。"""
-    a = np.asarray(ref_image.convert("RGB")).astype(int)
-    return ~((np.abs(a[..., 0] - 255) < 40) & (a[..., 1] < 60)
-             & (np.abs(a[..., 2] - 255) < 40))
+    """立ち絵(マゼンタ地)の前景マスク (bool ndarray)。
+
+    背景は生成AIの圧縮・発光・アンチエイリアスで ``#ff00ff`` からかなり
+    外れることがある。旧来の絶対色差だけだと、背景のピンク粒や四隅の
+    光を前景として拾ってbboxがキャンバス全高に伸び、骨格もその誤った
+    身長へ引っ張られていた。ここでは「赤と青が十分強く、どちらも緑より
+    明確に優勢」というマゼンタの色相領域を背景にする。赤青の絶対値を
+    150/130に残すため、暗い紫色の髪・服まで背景として抜くことはない。
+    """
+    a = np.asarray(ref_image.convert("RGB")).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    magenta = ((r > 150) & (b > 130)
+               & ((r - g) > 50) & ((b - g) > 50))
+    return ~magenta
 
 
 def _feet_axis_x(fxs):
@@ -2012,8 +2049,8 @@ def build_walk_pose_frames(direction: str, num_frames: int,
             ang = dict(IDLE_POSE)
         else:
             ph = ((i - idle_n) * cyc / max(1, m - 1)) % 1.0
-            ang = walk_angles_at(ph, arm_swing=arm_swing,
-                                 leg_swing=leg_swing)
+            ang = _motion_angles_at(ph, arm_swing=arm_swing,
+                                    leg_swing=leg_swing)
         # 接地補正: 低い方の足首を接地線へ -> 体側が沈む上下動が生まれる
         gait = idle_n <= i < idle_n + m   # 直立区間は内転しない
         by = base_y + (_ground_shift(fig, ang, leg_cross, gait)
@@ -2186,8 +2223,8 @@ def build_canvas_pose_frames(dir_refs: dict, num_frames: int,
             ang = dict(IDLE_POSE)
         else:
             ph = ((i - idle_n) * cyc / max(1, m - 1)) % 1.0
-            ang = walk_angles_at(ph, arm_swing=arm_swing,
-                                 leg_swing=leg_swing)
+            ang = _motion_angles_at(ph, arm_swing=arm_swing,
+                                    leg_swing=leg_swing)
         img = Image.new("RGB", (width, height), (0, 0, 0))
         _rec = [] if kps_out is not None else None
         for yaw, yaw_h, fig, scale, cx, by, ff, hem_abs, a_hide in cells:

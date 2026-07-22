@@ -135,7 +135,31 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.33"
+__version__ = "0.11.43"
+# 0.11.43: Codex motion_profileのgait/limb_modeをAI骨格へ配線し、走行語は
+# run骨格、脚のみ/腕のみ/四肢なしはOpenPose描画部位を自動切替。GCS分室
+# packは通常walkpackと分岐してAniSora単純I2V→MP4+原画posterを納品。
+# 0.11.42: Lightning 4stepのVACE High/Lowを経由して、最終1stepだけ
+# native AniSora Lowへ渡す三段latent handoffを追加。
+# 0.11.41: KijaiのAniSora High要素抽出LoRAをVACE Highへ適用し、
+# native AniSora Lowは回転priorを抑えるため最終1--2stepだけに限定する
+# latent直結実験へ更新。AniSora High本体の移植とLightning LoRAは使わない。
+# 0.11.40: 歩行グラ用に量子化Wan-Animate素体＋AniSora High LoRAを
+# 使える隔離口を追加（回転を持つAniSora Low本体は混ぜない）。
+# 0.11.39: Wan-Animate制御枝を持つAniSora High/Low二体を3/3stepで
+# 切り替える完全二段の隔離実験を追加。
+# 0.11.38: AniSora High一体を全ノイズ域へ通す対照実験口を追加。
+# 0.11.37: Wan-Animate量子化本体の共通36ch/40層へAniSora V3.2 Lowを
+# 丸ごと移植し、pose/motion/face制御専用層だけ温存する隔離実験を追加。
+# 0.11.36: Low単独Pose実験に、原画latentとPose latentを同じ20ch
+# conditioning内で混合する一回forward方式と、別forward予測合成方式を追加。
+# 0.11.35: AniSora V3.2 Low単独の純I2V実験口を追加。
+# extra.anisora_low_only=trueで通常生成もLow一体だけをロードし、Highの
+# ノイズ域も同じLowへ通す。extra.anisora_flow_shiftで実験ジョブだけ
+# scheduler shiftを変更し、次の通常ジョブでは既定5.0へ自動復帰する。
+# 0.11.34: aiの内部モーション制御を母艦Codexの画像判定で自動分岐。
+# 二足だけOpenPose、四足/飛行/蛇行/不定形/その他はキャラ原画自身を
+# 手続き変形した画像列でAniSoraを誘導する。UIの動きの型4択は不変。
 # 0.10.3: 監査4件修正 — _snap_valid の空JSON誤判定(無限再DL)、.complete を書き順の最後へ、キャッシュ下限割れの無言フォールバックを可視化、AniSoraドナーconfigを実体dirへ (Hub直参照の迂回を封じる)
 # 0.10.1: 依頼リレー — webUIの生成依頼を母艦がclaim/completeし、パック到着でwalkpack自動投入
 # 0.10.0: 工房モード — キャラパック+walk_pack API+お友だち用webUI (旧UIは/advanced)
@@ -1172,6 +1196,18 @@ class MockAdapter(VideoAdapter):
 # ------------------------------------------------ 拡散モデル共通ヘルパ
 def _snap(v: int, mult: int, lo: int) -> int:
     return max(lo, int(round(v / mult)) * mult)
+
+
+def _snap_min_short_edge(width: int, height: int, short: int = 480,
+                         mult: int = 16) -> tuple[int, int]:
+    """縦横比を保ちつつ短辺の下限を保証し、両辺をモデル倍数へ丸める。"""
+    w = _snap(width, mult, mult)
+    h = _snap(height, mult, mult)
+    if min(w, h) >= short:
+        return w, h
+    if w <= h:
+        return _snap(short, mult, short), _snap(h * short / w, mult, short)
+    return _snap(w * short / h, mult, short), _snap(short, mult, short)
 
 
 def _snap_frames(n: int) -> int:
@@ -2398,6 +2434,20 @@ class _WanA14BBase(VideoAdapter):
                         self._inject_guidance_video(
                             condition, guide_frames, n, w, h, log,
                             req.extra.get("anisora_guidance_mask", "known"))
+                        # ControlNet風の最小近似: 主I2Vの原画条件を捨てず、
+                        # Pose条件latentを同じ20ch内へ線形混合する。一回
+                        # forwardなので、別予測合成より安い。学習済み制御枝
+                        # ではないため、骨の画素模写が残るかは実走で判定。
+                        if "anisora_condition_image_weight" in req.extra:
+                            iw = max(0.0, min(1.0, float(
+                                req.extra["anisora_condition_image_weight"])))
+                            condition.mul_(1.0 - iw).add_(
+                                base_condition["value"].to(
+                                    device=condition.device,
+                                    dtype=condition.dtype), alpha=iw)
+                            log("AniSora conditioning混合: "
+                                f"Pose {1-iw:.0%} / 原画 {iw:.0%} "
+                                "(一回forward)")
                     else:
                         self._inject_mid_keyframes(condition, mids, mid_pos,
                                                    n, w, h, log)
@@ -2411,14 +2461,64 @@ class _WanA14BBase(VideoAdapter):
                 return latents, condition
             self.pipe.prepare_latents = _patched
 
+        # Low単独でも、Pose画像と通常I2V画像を同じ36chへ混在させず、
+        # 同一step・同一noisy latentを二度予測してノイズだけを合成する。
+        # モデル実体は一体のまま、Pose=動き・原画=外見へ権威を分離する
+        # 隔離実験。High+Low通常構成の二条件処理はrefine側の本線を使う。
+        dual_model = getattr(self.pipe, "transformer", None)
+        low_model = getattr(self.pipe, "transformer_2", None)
+        low_alias = dual_model is not None and dual_model is low_model
+        orig_dual_forward = None
+        if (guide_frames and low_alias
+                and req.extra.get("anisora_dual_condition")):
+            orig_dual_forward = dual_model.forward
+            zdim_dual = int(self.pipe.vae.config.z_dim)
+            image_weight = max(0.0, min(0.95, float(
+                req.extra.get("anisora_dual_condition_image_weight", 0.75))))
+            dual_logged = [False]
+
+            def _dual_low_forward(*a, **k):
+                pose_out = orig_dual_forward(*a, **k)
+                plain = base_condition.get("value")
+                hidden = k.get("hidden_states")
+                from_args = hidden is None and bool(a)
+                if from_args:
+                    hidden = a[0]
+                if (plain is None or hidden is None
+                        or hidden.shape[1] < zdim_dual + plain.shape[1]):
+                    return pose_out
+                image_hidden = hidden.clone()
+                image_hidden[:, zdim_dual:zdim_dual + plain.shape[1]] = (
+                    plain.to(device=hidden.device, dtype=hidden.dtype))
+                if from_args:
+                    image_args = (image_hidden,) + tuple(a[1:])
+                    image_kwargs = dict(k)
+                else:
+                    image_args = a
+                    image_kwargs = dict(k)
+                    image_kwargs["hidden_states"] = image_hidden
+                image_out = orig_dual_forward(*image_args, **image_kwargs)
+                mixed = ((1.0 - image_weight) * pose_out[0]
+                         + image_weight * image_out[0])
+                if not dual_logged[0]:
+                    log("AniSora Low単独二条件: 同じLowをPose/画像で別forward "
+                        f"(Pose {1-image_weight:.0%} / 画像 {image_weight:.0%})")
+                    dual_logged[0] = True
+                return (mixed,) + tuple(pose_out[1:])
+
+            dual_model.forward = _dual_low_forward
+
         # V3.2の二段デノイズを利用し、High-noise expertだけに
         # Pose条件を見せる。Low-noise expertの入力36chは
         # [noise16 + condition20]なので、後半20chをprepare_latents時に
         # 保存した通常の先頭画像条件へ戻す。これによりHighの
         # 大形を残しつつ、Lowが骨のRGB線を模写するのを防ぐ。
-        low_model = getattr(self.pipe, "transformer_2", None)
         release_low = bool(
             guide_frames and req.extra.get("anisora_guidance_release_low"))
+        if release_low and low_alias:
+            release_low = False
+            log("Low単独構成にはHigh→Low境界が無いため、Pose解放は行わず"
+                "二条件比を全stepへ適用")
         orig_low_forward = None
         if release_low and low_model is not None:
             orig_low_forward = low_model.forward
@@ -2457,6 +2557,8 @@ class _WanA14BBase(VideoAdapter):
         finally:
             if orig_prep is not None:
                 self.pipe.prepare_latents = orig_prep
+            if orig_dual_forward is not None:
+                dual_model.forward = orig_dual_forward
             if orig_low_forward is not None:
                 low_model.forward = orig_low_forward
         progress(0.92)
@@ -2701,6 +2803,12 @@ class AniSoraAdapter(_WanA14BBase):
                 "off", "0", "false", "no"):
             return False
         e = extra or {}
+        # ComfyUIで公開されているV3.2 Low単独レシピの隔離検証口。
+        # 通常I2V・純ノイズ空間生成でも、transformer/transformer_2を
+        # Low一体の別名にして全ノイズ域へ通す。工房本線はこのキーを
+        # 送らないため、既定のHigh+Low構成には影響しない。
+        if e.get("anisora_low_only") or e.get("anisora_high_only"):
+            return True
         # 空間インペイントはσ1.0から始め、boundary以上の
         # High側ステップも必ず通る。Low単体ロードは不可。
         if e.get("latent_spatial_empty"):
@@ -2714,7 +2822,10 @@ class AniSoraAdapter(_WanA14BBase):
                                WanTransformer3DModel)
         from huggingface_hub import hf_hub_download
         quant, offload = self._resolve_want(getattr(self, "_next_extra", {}))
-        lite = self._lite_wanted(getattr(self, "_next_extra", {}))
+        next_extra = getattr(self, "_next_extra", {}) or {}
+        lite = self._lite_wanted(next_extra)
+        single_expert = ("high" if next_extra.get("anisora_high_only") else
+                         "low" if next_extra.get("anisora_low_only") else "")
         # High側の棚在庫はQ4_0/Q8_0のみ — 静的規則で代替 (混載ペア。Highは
         # 序盤数stepの構図担当なので品質影響は小さい)。動的なfile_exists
         # 判定はオフライン/Drive固定で不発になり袋小路DLに落ちる
@@ -2726,15 +2837,20 @@ class AniSoraAdapter(_WanA14BBase):
                 "(Low側は指定どおり)")
         gguf_low = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
-        if lite:
+        if single_expert == "high":
+            log(f"隔離実験ロード: High単体 {hq} (Lowを読まず全ノイズ域へ適用)")
+            hi = _hf_download(self.gguf_repo, gguf_high, log)
+            lo = None
+        elif lite:
             log(f"リファイン専用ロード: Low単体 {quant} (High省略で"
                 "RAM/DL約9GB節約。VIDEOLAB_ANISORA_LITE=offで従来動作)")
             hi = None
+            lo = _hf_download(self.gguf_repo, gguf_low, log)
         else:
             log(f"GGUF DL: {self.gguf_repo} {quant} "
                 f"(High+Low 各{'15.9GB' if quant == 'Q8_0' else '9GB前後'})")
             hi = _hf_download(self.gguf_repo, gguf_high, log)
-        lo = _hf_download(self.gguf_repo, gguf_low, log)
+            lo = _hf_download(self.gguf_repo, gguf_low, log)
         # ベース部品はsnapshot経由 (v0.8.7: Driveキャッシュ+429対策の
         # 多段DLに乗せる。transformer重みは除外済みの約12GB)
         snap = _snapshot_local(self.base_repo, log)
@@ -2764,12 +2880,14 @@ class AniSoraAdapter(_WanA14BBase):
                 subfolder="transformer", torch_dtype=_pick_dtype())
             if _early_off:
                 self._try_group_offload(t_hi, log, "transformer(早期退避)")
-        log("transformer_2(Low) 読み込み")
-        t_lo = WanTransformer3DModel.from_single_file(
-            lo, quantization_config=qc, config=snap,
-            subfolder="transformer_2", torch_dtype=_pick_dtype())
-        if _early_off:
-            self._try_group_offload(t_lo, log, "transformer_2(早期退避)")
+        t_lo = None
+        if lo is not None:
+            log("transformer_2(Low) 読み込み")
+            t_lo = WanTransformer3DModel.from_single_file(
+                lo, quantization_config=qc, config=snap,
+                subfolder="transformer_2", torch_dtype=_pick_dtype())
+            if _early_off:
+                self._try_group_offload(t_lo, log, "transformer_2(早期退避)")
         pipe_kwargs = {}
         if self._te_lazy:
             # v0.8.2: 低RAM VM (L4=53GB) ではUMT5(11GB)を持たずにロードし、
@@ -2779,12 +2897,12 @@ class AniSoraAdapter(_WanA14BBase):
             pipe_kwargs["text_encoder"] = None
             log("低RAM VM: UMT5はロードせずジョブ内で一時ロードします")
         log(f"ベース部品 読み込み: {snap} (VAE+UMT5)")
-        # liteモードはtransformerにもLowを渡す (同一オブジェクトの別名)。
+        # 単体モードはHigh/Lowの両属性へ同じ実体を渡す (追加メモリゼロ)。
         # None渡しはWanImageToVideoPipeline.__call__内の属性参照で壊れる
         # 可能性があるため、実体共有=追加メモリゼロの別名が安全
         self.pipe = WanImageToVideoPipeline.from_pretrained(
             snap, transformer=(t_hi if t_hi is not None else t_lo),
-            transformer_2=t_lo,
+            transformer_2=(t_lo if t_lo is not None else t_hi),
             torch_dtype=_pick_dtype(), **pipe_kwargs)
         self._te_from = snap
         # GPU常駐可否の判定用フットプリント(GB): GGUF実サイズ +
@@ -2803,7 +2921,28 @@ class AniSoraAdapter(_WanA14BBase):
         self._finalize_pipe(log, offload=offload, footprint_gb=fp, gguf=True)
         self.loaded_quant, self.loaded_offload = quant, offload
         self.loaded_lite = lite
+        self.loaded_single_expert = single_expert or ("low" if lite else "")
+        self.loaded_flow_shift = self.flow_shift
         self.loaded = True
+
+    def _configure_experiment_scheduler(self, req: GenRequest, log) -> None:
+        """ジョブ単位のflow shiftを反映し、指定なしでは既定へ戻す。"""
+        try:
+            shift = float(req.extra.get("anisora_flow_shift", self.flow_shift))
+        except (TypeError, ValueError) as e:
+            raise RuntimeError("anisora_flow_shiftは数値が必要です") from e
+        shift = max(0.1, min(20.0, shift))
+        current = float(getattr(self, "loaded_flow_shift", self.flow_shift))
+        if abs(current - shift) < 1e-9:
+            return
+        from diffusers import UniPCMultistepScheduler
+        self.pipe.scheduler = UniPCMultistepScheduler.from_config(
+            self.pipe.scheduler.config, flow_shift=shift)
+        self.loaded_flow_shift = shift
+        tag = ("High単独実験" if req.extra.get("anisora_high_only") else
+               "Low単独実験" if req.extra.get("anisora_low_only") else "")
+        log(f"AniSora scheduler: UniPC flow_shift={shift:g}"
+            + (f" ({tag})" if tag else ""))
 
     def generate(self, req: GenRequest, workdir: Path, log, progress) -> Path:
         # 量子化/オフロード指定がロード時と違う場合は積み替え (共通設定を
@@ -2812,10 +2951,14 @@ class AniSoraAdapter(_WanA14BBase):
         # (逆=High込みでリファインはそのまま賄える)
         want = self._resolve_want(req.extra)
         lite = self._lite_wanted(req.extra)
+        requested_single = ("high" if req.extra.get("anisora_high_only") else
+                            "low" if req.extra.get("anisora_low_only") else "")
         if self.loaded and (
                 want != (getattr(self, "loaded_quant", None),
                          getattr(self, "loaded_offload", None))
-                or (getattr(self, "loaded_lite", False) and not lite)):
+                or (getattr(self, "loaded_lite", False) and not lite)
+                or (requested_single and requested_single !=
+                    getattr(self, "loaded_single_expert", ""))):
             log(f"設定変更 {self.loaded_quant}/{self.loaded_offload}"
                 f"{'/Low単体' if getattr(self, 'loaded_lite', False) else ''}"
                 f" -> {want[0]}/{want[1]}{'' if lite else '/High込み'}: "
@@ -2825,6 +2968,7 @@ class AniSoraAdapter(_WanA14BBase):
         if not self.loaded:
             self._next_extra = dict(req.extra or {})
             self.ensure_loaded(log)
+        self._configure_experiment_scheduler(req, log)
         if req.extra.get("refine_frames_b64") or req.extra.get("latent_from"):
             return self._generate_refine(req, workdir, log, progress)
         return super().generate(req, workdir, log, progress)
@@ -3463,7 +3607,8 @@ def _transplant_base_weights(target, donor, log, tag: str = "",
     VACE-Fun側が温存される。
 
     - patch_embedding: I2V=36ch / VACE=16ch で形状が違うため既定では移植
-      せず VACE-Fun側を維持。patch_mode="slice" はドナー重みの先頭16ch
+      せず VACE-Fun側を維持。patch_mode="same" はWan-Animate等の同じ
+      36ch構造へそのまま移植する。patch_mode="slice" は先頭16ch
       (=ノイズlatent側。I2Vの条件mask4+latent16chは後方連結)を切り出して
       移植する実験モード。
     - GGUF量子化テンソル(GGUFParameter)は named_parameters のオブジェクトを
@@ -3481,7 +3626,7 @@ def _transplant_base_weights(target, donor, log, tag: str = "",
     dn = dict(donor.named_parameters())
     take, skipped, coerced = {}, [], []
     for k, v in dn.items():
-        if k.startswith("patch_embedding."):
+        if k.startswith("patch_embedding.") and patch_mode != "same":
             skipped.append(k)              # slice指定時は後段で個別処理
             continue
         t = tgt.get(k)
@@ -3557,12 +3702,16 @@ def _transplant_base_weights(target, donor, log, tag: str = "",
             mod_path, _, leaf = k.rpartition(".")
             mod = target.get_submodule(mod_path) if mod_path else target
             mod._parameters[leaf] = v
-    kept_vace = sum(1 for k in tgt if k.startswith("vace_"))
+    kept_control = sum(
+        1 for k in tgt
+        if k.startswith(("vace_", "pose_patch_embedding.",
+                         "motion_encoder.", "face_encoder.",
+                         "face_adapter.")))
     log(f"AniSora移植[{tag}]: {len(take)}キー移植"
         f"{f' (うち保存形式変換{len(coerced)})' if coerced else ''} / "
         f"スキップ{len(skipped)} "
         f"({', '.join(skipped[:3])}{' ...' if len(skipped) > 3 else ''}) / "
-        f"vace_*温存 {kept_vace}キー")
+        f"制御専用層温存 {kept_control}キー")
     return len(take), len(skipped)
 
 
@@ -3687,14 +3836,15 @@ class VACEAdapter(_WanA14BBase):
             patch = "fun"
         lora = str(e.get("vace_lora")
                    or os.environ.get("VIDEOLAB_VACE_LORA", "")).lower()
-        if lora not in ("lightning",):
+        if lora not in ("lightning", "anisora_high"):
             lora = ""
         if base != "anisora":
             # 移植なしでは experts/patch は不活性 — 正規化してノブ操作
             # だけの無駄な積み替え(数分)を防ぐ
             experts, patch = "both", "fun"
         else:
-            # LightningはT2V(=fun)向け蒸留。移植ベースでは意味が無い
+            # LoRAはいずれも素のVACE-Funへ載せる比較経路。AniSora本体を
+            # 移植した上へ重ねる二重適用はしない。
             lora = ""
         return q, off, base, experts, patch, lora
 
@@ -3883,6 +4033,37 @@ class VACEAdapter(_WanA14BBase):
                     "Lightning LoRAの適用に失敗しました (GGUF量子化との"
                     "組み合わせが原因の可能性)。videolab_pose_lora を外すか "
                     f"quant=bf16 で再試行してください: {str(e)[:300]}")
+        elif lora == "anisora_high":
+            # 本命実験: AniSora High本体の移植ではなく、Kijaiが配布する
+            # High要素抽出LoRAだけをVACE Highへ適用する。transformer_2へは
+            # load_into_transformer_2を指定しないため、Lowは素のVACEのまま。
+            rep = "Kijai/WanVideo_comfy"
+            lora_name = ("LoRAs/AniSora/"
+                         "Wan2_2_I2V_AniSora_3_2_HIGH_rank_64_fp16.safetensors")
+            log("AniSora High要素抽出LoRA 読み込み: "
+                f"{rep}/{lora_name} (VACE Highのみ)")
+            try:
+                from peft.tuners.lora import torchao as _plt
+                try:
+                    _plt.is_torchao_available()
+                except ImportError:
+                    _plt.is_torchao_available = lambda: False
+                    log("非互換torchaoを検出 -> peftのtorchao dispatcher"
+                        "を無効化 (LoRA適用には影響なし)")
+            except Exception:
+                pass
+            try:
+                _hi_p = Path(_hf_download(rep, lora_name, log))
+                self.pipe.load_lora_weights(
+                    str(_hi_p.parent), adapter_name="anisora_high",
+                    weight_name=_hi_p.name)
+                self.pipe.set_adapters(["anisora_high"], [1.0])
+                log("AniSora High要素LoRA適用完了: VACE Highのみ / "
+                    "VACE Lowは無改造")
+            except Exception as e:
+                raise RuntimeError(
+                    "VACE HighへAniSora High要素抽出LoRAを適用できません"
+                    f"でした: {str(e)[:300]}")
         # VACEは81fの骨格条件動画を丸ごとVAE encodeするため、常駐でも
         # タイリング必須 (無いとA100-80でもencodeでOOM。2026-07-12実障害)
         self._finalize_pipe(log, offload=offload, footprint_gb=fp,
@@ -3919,7 +4100,8 @@ class VACEAdapter(_WanA14BBase):
             # (Lightning LoRA装着時は蒸留済みなので低stepが正解)
             log(f"⚠ vace_base=fun は非蒸留です: steps={steps}/"
                 f"cfg={req.guidance} では崩れます。steps=30 cfg=5.0 を"
-                "指定してください (高速化は vace_lora=lightning を推奨)")
+                "指定してください。vace_lora=anisora_high はHighだけを変え、"
+                "VACE Lowを蒸留しないため、この注意は残ります")
         # vace_end: 骨格制御を序盤ステップに限定し終盤は解放する
         # (kijaiワークフローの end_percent 相当の定石)。ポーズは序盤の
         # 高ノイズ段で確定するため、終盤解放で「骨格がそのまま画面に
@@ -4172,7 +4354,7 @@ def _slice_handoff_scheduler_state(scheduler, drop_frames: int,
 
 @register
 class VACEAniSoraHandoffAdapter(VACEAdapter):
-    """VACE High -> native AniSora Lowを1本のlatent軌道で直結する。
+    """VACE High + AniSora要素LoRA -> native AniSora Lowを直結する。
 
     完成VACE動画をMP4/JPEG化してVAE再encode・再加ノイズする旧refineとは
     異なり、Wan2.2の通常のHigh/Low expert切替と同じUniPC scheduler上で
@@ -4181,19 +4363,21 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
     scheduler stateをそのまま継続できる。
     """
     id = "vace_anisora_handoff"
-    label = "VACE High → AniSora Low (latent直結・品質本命)"
-    desc = ("前半だけOpenPose/VACEで構図と歩行を固定し、同じノイズlatentを"
-            "後半の無改造AniSora Lowへ直接渡す。VACE HighにはLightning"
-            "低step LoRAを維持。中間動画・VAE再encode・"
-            "再ノイズ化なし。extra hybrid_boundary=0.90(既定) / 0.875。"
-            "steps既定8 (6ではLow区間不足で黄変、2026-07-13実測)。")
+    label = "VACE + AniSora要素LoRA → VACE Low → AniSora Low tail"
+    desc = ("OpenPose/VACEで構図と歩行を固定し、VACE HighへKijai配布の"
+            "AniSora V3.2 High要素抽出LoRAを適用する。同じノイズlatentを"
+            "最終1--2stepだけnative AniSora Lowへ直接渡す。AniSora High本体"
+            "の移植、Lightning LoRA、中間動画、VAE再encode、再ノイズ化は"
+            "行わない。extra hybrid_low_steps=1|2 (既定2)。"
+            "hybrid_lightning4=true, hybrid_vace_low_steps=1なら、"
+            "4stepをHigh 2→VACE Low 1→AniSora Low 1で処理する。")
     requires = ("Colab L4で十分 (Q4+動的キャンバス設計でほぼフル品質・"
                 "料金はA100の約1/5。A100は最速だが贅沢品)。Q4でVACE High"
                 "約8.5GB + AniSora Low約9GBを区間ごとにGPUへ載せ替え。"
-                "High側へLightning低step LoRAを適用。DL約77GB。"
+                "High側へAniSora要素抽出LoRAを適用。DL約46GB。"
                 "16GB未満のご家庭GPUはextra offloadでblock offload(実験的)")
-    cache_repos = VACEAdapter.cache_repos + ("lightx2v/Wan2.2-Lightning",)
-    disk_gb = 77
+    cache_repos = VACEAdapter.cache_repos + ("Kijai/WanVideo_comfy",)
+    disk_gb = 46
     defaults = {"width": 464, "height": 848, "num_frames": 49, "fps": 16,
                 "steps": 8, "guidance": 1.0}
 
@@ -4224,12 +4408,40 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
 
     @staticmethod
     def _hybrid_lora(extra: dict) -> str:
-        """VACE Highに使う低step LoRA。既定lightning、offで比較用無効。"""
+        """VACE Highに使うAniSora要素抽出LoRA。offは比較用。"""
         e = extra or {}
         value = str(e.get("vace_lora")
-                    or os.environ.get("VIDEOLAB_VACE_LORA", "lightning"))
+                    or os.environ.get("VIDEOLAB_VACE_LORA", "anisora_high"))
         value = value.strip().lower()
-        return "off" if value in ("off", "none", "0", "false") else "lightning"
+        return "off" if value in ("off", "none", "0", "false") else "anisora_high"
+
+    @staticmethod
+    def _hybrid_low_steps(extra: dict, total_steps: int) -> int:
+        """回転priorの強いAniSora Lowを終端1--2stepだけに制限する。"""
+        e = extra or {}
+        try:
+            value = int(e.get("hybrid_low_steps")
+                        or os.environ.get("VIDEOLAB_HYBRID_LOW_STEPS", "2"))
+        except (TypeError, ValueError):
+            value = 2
+        return max(1, min(2, max(1, int(total_steps) - 1), value))
+
+    @staticmethod
+    def _hybrid_vace_low_steps(extra: dict, total_steps: int) -> int:
+        """AniSora tailの直前に通すVACE Low step数。通常handoffは0。"""
+        e = extra or {}
+        try:
+            value = int(e.get("hybrid_vace_low_steps", 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(max(0, int(total_steps) - 2), value))
+
+    @staticmethod
+    def _hybrid_lightning4(extra: dict) -> bool:
+        value = (extra or {}).get("hybrid_lightning4", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
 
     def _ensure_loaded_impl(self, log):
         """必要なexpertだけロードする (VACE High + native AniSora Low)。"""
@@ -4247,6 +4459,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         next_extra = getattr(self, "_next_extra", {})
         quant, _boundary = self._hybrid_want(next_extra)
         lora = self._hybrid_lora(next_extra)
+        lightning4 = self._hybrid_lightning4(next_extra)
+        want_vace_low = self._hybrid_vace_low_steps(next_extra, 4) > 0
         qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
         vname = (f"HighNoise/Wan2.2-VACE-Fun-A14B-high-noise-"
                  f"{quant}.gguf")
@@ -4256,37 +4470,31 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         snap_vace = _snapshot_local(self.repo, log)
         snap_base = _snapshot_local(self.base_repo, log)
         vp = _hf_download(self.gguf_repo, vname, log)
-        # ロード前RAMゲート (P0-2): vhighロード「前」に判定する (ロード後に
-        # 判定するとvhigh分を空きRAMから二重計上して過大要求になり、L4では
-        # Q4_0でも無条件エラーだった — v0.9.13レビュー指摘)。ピークは
-        # 「vhigh + ドナー1体」(移植はParameterスワップでネット増ゼロ、
-        # del donor後にalowをロードするため同時常駐は常に2体まで)
+        # ロード前RAMゲート (P0-2): vhighロード「前」に判定する。v0.11.41
+        # 以降はAniSora High本体の移植ドナーを読まず、VACE High + AniSora
+        # Lowの2体と631MB LoRAだけがピークになる。
         _vgg1 = _gguf_gb(vp)
         if _vgg1 >= 1.0:
             _dn = 16.0 if quant == "Q8_0" else 9.3
             # ベース部品のRAM実装はVAE等≈2.5GB (UMT5は別項)
-            _ram_gate(log, _vgg1 + _dn + 2.5
+            _ram_gate(log, _vgg1 + _dn
+                      + (9.3 if want_vace_low else 0) + 2.5
                       + (0 if _low_ram_vm() else 11) + 6,
                       f"latent直結 {quant} 読み込み")
         vhigh = WanVACETransformer3DModel.from_single_file(
             vp, quantization_config=qc, config=snap_vace,
             subfolder="transformer", torch_dtype=_pick_dtype())
-        # High段もアニメpriorから離れないよう、共有blockをAniSora Highへ
-        # 移植する。後半はこのキメラを使わずnative Lowそのものへ切り替える。
-        # High側の棚在庫はQ4_0/Q8_0のみ — 静的規則で代替 (v0.9.13)
-        aq = _anisora_high_quant(quant)
-        ah_name = f"High/Index-Anisora-V3.2-High-{aq}.gguf"
-        if aq != quant:
-            log(f"AniSora High移植ドナー: {quant}の棚在庫が無いため"
-                f"{aq}で代替します")
-        log(f"latent直結ロード: AniSora High移植ドナー {aq}")
-        ahp = _hf_download(self.anisora_gguf_repo, ah_name, log)
-        donor = WanTransformer3DModel.from_single_file(
-            ahp, quantization_config=qc, config=snap_base,
-            subfolder="transformer", torch_dtype=_pick_dtype())
-        _transplant_base_weights(vhigh, donor, log, tag="HybridHigh")
-        del donor
-        gc.collect()
+        log("latent直結: AniSora High本体は移植せず、VACE Highを維持")
+
+        vlow = None
+        if want_vace_low:
+            vl_name = (f"LowNoise/Wan2.2-VACE-Fun-A14B-low-noise-"
+                       f"{quant}.gguf")
+            log(f"三段handoffロード: VACE Low {quant}")
+            vlp = _hf_download(self.gguf_repo, vl_name, log)
+            vlow = WanVACETransformer3DModel.from_single_file(
+                vlp, quantization_config=qc, config=snap_vace,
+                subfolder="transformer_2", torch_dtype=_pick_dtype())
 
         al_name = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
         log(f"latent直結ロード: native AniSora Low {quant}")
@@ -4302,7 +4510,7 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         # (2026-07-13 L4実走で「RAMを増やす」画面を確認)。UMT5はジョブ毎に
         # 遅延ロード→encode後に解放 (v0.7.5の解放/再ロード機構を流用)
         _lowram = _low_ram_vm()
-        pipe_kwargs = dict(transformer=vhigh, transformer_2=None,
+        pipe_kwargs = dict(transformer=vhigh, transformer_2=vlow,
                            torch_dtype=_pick_dtype())
         if _lowram:
             pipe_kwargs["text_encoder"] = None
@@ -4316,17 +4524,16 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         sched = UniPCMultistepScheduler.from_config(
             self.pipe.scheduler.config, flow_shift=self.flow_shift)
         self.pipe.scheduler = sched
-        if lora == "lightning":
-            # 旧VACE経路で使っていた低step LoRAをHigh側へ維持する。
-            # handoff後はnative AniSora Low（自身が蒸留済み）なので、VACE用
-            # low_noise LoRAは重ねず、High用だけをVACE transformerへ装着。
-            rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
-                                 "lightx2v/Wan2.2-Lightning")
-            fold = os.environ.get(
-                "VIDEOLAB_VACE_LORA_DIR",
-                "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
-            log(f"latent直結: VACE HighへLightning低step LoRA適用 "
-                f"({rep}/{fold})")
+        adapter_names = []
+        adapter_weights = []
+        if lora == "anisora_high":
+            # AniSora High本体ではなく、KijaiがWan2.2 I2V向けに抽出した
+            # High要素LoRAをVACE Highの共有blockへだけ装着する。
+            rep = "Kijai/WanVideo_comfy"
+            lora_name = ("LoRAs/AniSora/"
+                         "Wan2_2_I2V_AniSora_3_2_HIGH_rank_64_fp16.safetensors")
+            log("latent直結: VACE HighへAniSora High要素抽出LoRA適用 "
+                f"({rep}/{lora_name})")
             try:
                 from peft.tuners.lora import torchao as _plt
                 try:
@@ -4339,19 +4546,52 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                 pass
             try:
                 _hi_p = Path(_hf_download(
-                    rep, f"{fold}/high_noise_model.safetensors", log))
+                    rep, lora_name, log))
                 self.pipe.load_lora_weights(
-                    str(_hi_p.parent), adapter_name="lightning",
+                    str(_hi_p.parent), adapter_name="anisora_high",
                     weight_name=_hi_p.name)
-                self.pipe.set_adapters(["lightning"], [1.0])
+                adapter_names.append("anisora_high")
+                adapter_weights.append(1.0)
             except Exception as e:
                 raise RuntimeError(
-                    "latent直結のVACE HighへLightning LoRAを適用できません"
+                    "latent直結のVACE HighへAniSora High要素抽出LoRAを"
+                    "適用できません"
                     f"でした: {str(e)[:300]}")
-            log("Lightning適用完了: VACE Highのみ（native AniSora Lowは"
-                "蒸留済み重みのまま）")
+            log("AniSora High要素LoRA適用完了: VACE Highのみ "
+                "(native AniSora Lowには非適用)")
         else:
-            log("latent直結: VACE Highの低step LoRAは比較用に無効")
+            log("latent直結: AniSora High要素LoRAは比較用に無効")
+        if lightning4:
+            if vlow is None:
+                raise RuntimeError(
+                    "hybrid_lightning4にはhybrid_vace_low_steps>=1が必要です")
+            rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
+                                 "lightx2v/Wan2.2-Lightning")
+            fold = os.environ.get(
+                "VIDEOLAB_VACE_LORA_DIR",
+                "Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0")
+            log(f"三段handoff: Lightning 4step LoRA読込 {rep}/{fold} "
+                "(VACE High/Lowのみ)")
+            try:
+                _lh = Path(_hf_download(
+                    rep, f"{fold}/high_noise_model.safetensors", log))
+                _ll = Path(_hf_download(
+                    rep, f"{fold}/low_noise_model.safetensors", log))
+                self.pipe.load_lora_weights(
+                    str(_lh.parent), adapter_name="lightning",
+                    weight_name=_lh.name)
+                self.pipe.load_lora_weights(
+                    str(_ll.parent), adapter_name="lightning_2",
+                    weight_name=_ll.name, load_into_transformer_2=True)
+                adapter_names[:0] = ["lightning", "lightning_2"]
+                adapter_weights[:0] = [1.0, 1.0]
+            except Exception as e:
+                raise RuntimeError(
+                    "三段handoffのLightning 4step LoRAを適用できません"
+                    f"でした: {str(e)[:300]}")
+        if adapter_names:
+            self.pipe.set_adapters(adapter_names, adapter_weights)
+            log("三段handoff adapter有効: " + ", ".join(adapter_names))
         # VAE/UMT5/tokenizer/schedulerは同一オブジェクトを共有。両repoのVAE
         # safetensorsは同一hashなのでlatent scaleの変換も不要。
         self.ani_pipe = WanImageToVideoPipeline.from_pretrained(
@@ -4361,7 +4601,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             torch_dtype=_pick_dtype())
         # load_lora_weights/from_pretrainedが内部で置いたdeviceに依存しない。
         # condition encode前はDiT 2体を必ずCPUへ戻し、VAE/UMT5用の空きを作る。
-        for module in (vhigh, alow, self.pipe.vae, self.pipe.text_encoder):
+        for module in (vhigh, vlow, alow, self.pipe.vae,
+                       self.pipe.text_encoder):
             try:
                 module.to("cpu")
             except Exception:
@@ -4371,8 +4612,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         self.prompt_suffix = AniSoraAdapter.prompt_suffix
         self.loaded_quant = quant
         self.loaded_lora = lora
+        self.loaded_lightning4 = lightning4
+        self.loaded_vace_low = want_vace_low
         self.loaded = True
-        log("latent直結モデル準備完了: VACE High + native AniSora Low "
+        log("latent直結モデル準備完了: VACE High + AniSora High要素LoRA + "
+            "native AniSora Low "
             "(VAE/UMT5共有、通常時はCPU待機)")
 
     @staticmethod
@@ -4390,9 +4634,13 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
 
         quant, boundary = self._hybrid_want(req.extra)
         lora = self._hybrid_lora(req.extra)
-        if self.loaded and (quant, lora) != (
+        lightning4 = self._hybrid_lightning4(req.extra)
+        want_vace_low = self._hybrid_vace_low_steps(req.extra, 4) > 0
+        if self.loaded and (quant, lora, lightning4, want_vace_low) != (
                 getattr(self, "loaded_quant", None),
-                getattr(self, "loaded_lora", None)):
+                getattr(self, "loaded_lora", None),
+                getattr(self, "loaded_lightning4", False),
+                getattr(self, "loaded_vace_low", False)):
             log(f"設定変更 {getattr(self, 'loaded_quant', '?')}/"
                 f"{getattr(self, 'loaded_lora', '?')} -> {quant}/{lora}: "
                 "latent直結モデルを積み替えます")
@@ -4418,7 +4666,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         import torch
 
         pipe, apipe = self.pipe, self.ani_pipe
-        vmodel, amodel = pipe.transformer, apipe.transformer_2
+        vmodel, vlow, amodel = (pipe.transformer, pipe.transformer_2,
+                                apipe.transformer_2)
         device = torch.device("cuda")
         w = _snap(req.width, 16, 240)
         h = _snap(req.height, 16, 240)
@@ -4454,6 +4703,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             # 前ジョブやLoRA loaderのdevice状態にかかわらず、条件生成中に
             # DiTがVRAMへ残らないことを毎回保証する。
             vmodel.to("cpu")
+            if vlow is not None:
+                vlow.to("cpu")
             amodel.to("cpu")
             _free_cuda(log)
             _log_cuda_state(log, "condition前/DiT退避済み")
@@ -4530,15 +4781,26 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             sched = pipe.scheduler
             sched.set_timesteps(steps, device=device)
             timesteps = sched.timesteps
-            boundary_t = boundary * sched.config.num_train_timesteps
-            high_count = sum(float(t) >= boundary_t for t in timesteps)
-            if high_count <= 0 or high_count >= len(timesteps):
+            ani_low_count = self._hybrid_low_steps(
+                req.extra, len(timesteps))
+            vace_low_count = self._hybrid_vace_low_steps(
+                req.extra, len(timesteps))
+            high_count = (len(timesteps) - ani_low_count
+                          - vace_low_count)
+            if vace_low_count and vlow is None:
                 raise RuntimeError(
-                    f"hybrid_boundary={boundary} ではHigh/Lowの両区間を"
-                    f"作れません (timesteps={len(timesteps)}, High={high_count})")
-            log(f"latent直結生成: {w}x{h} {n}f / {steps}step — "
-                f"VACE High {high_count}step → native AniSora Low "
-                f"{len(timesteps) - high_count}step (境界{boundary:.3f})")
+                    "hybrid_vace_low_stepsを指定しましたがVACE Lowが"
+                    "ロードされていません")
+            if vace_low_count:
+                log(f"三段latent直結生成: {w}x{h} {n}f / {steps}step — "
+                    f"VACE High + Lightning + AniSora要素LoRA "
+                    f"{high_count}step → VACE Low + Lightning "
+                    f"{vace_low_count}step → native AniSora Low "
+                    f"{ani_low_count}step")
+            else:
+                log(f"latent直結生成: {w}x{h} {n}f / {steps}step — "
+                    f"VACE High + AniSora要素LoRA {high_count}step → "
+                    f"native AniSora Low {ani_low_count}step (終端限定)")
 
             scale = float(req.extra.get("conditioning_scale", 1.0))
             scale = torch.tensor(
@@ -4554,6 +4816,10 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
 
             want_off = str((req.extra or {}).get("offload")
                            or "").lower() in ("seq", "model")
+            if want_off and vace_low_count:
+                log("三段handoffではexpertを明示swapするためoffload指定を"
+                    "無効化")
+                want_off = False
             v_hooked = (want_off
                         and self._try_group_offload(vmodel, log, "VACE High"))
             a_hooked = False
@@ -4564,21 +4830,38 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             # 可否判定を外挿でなく実測で行えるようにする
             torch.cuda.reset_peak_memory_stats()
             switched = False
+            switched_vace_low = False
+            active_vace_model = vmodel
             for si, t in enumerate(timesteps):
-                use_vace = float(t) >= boundary_t
+                use_vace_high = si < high_count
+                use_vace_low = (high_count <= si
+                                < high_count + vace_low_count)
                 timestep = t.expand(latents.shape[0])
-                if use_vace:
-                    latent_input = latents.to(vmodel.dtype)
-                    with vmodel.cache_context("cond"):
-                        pred = vmodel(
+                if use_vace_high or use_vace_low:
+                    stage_model = vmodel
+                    if use_vace_low:
+                        stage_model = vlow
+                        if not switched_vace_low:
+                            self._move(vlow, device, log,
+                                       "VACE Low + Lightning")
+                            if not v_hooked:
+                                vmodel.to("cpu")
+                                _free_cuda(log)
+                            active_vace_model = vlow
+                            switched_vace_low = True
+                            log("handoff 1/2完了: VACE High → VACE Low "
+                                "(latent/UniPC履歴を維持)")
+                    latent_input = latents.to(stage_model.dtype)
+                    with stage_model.cache_context("cond"):
+                        pred = stage_model(
                             hidden_states=latent_input, timestep=timestep,
                             encoder_hidden_states=prompt_embeds,
                             control_hidden_states=control_cond,
                             control_hidden_states_scale=scale,
                             return_dict=False)[0]
                     if guidance > 1.0:
-                        with vmodel.cache_context("uncond"):
-                            uncond = vmodel(
+                        with stage_model.cache_context("uncond"):
+                            uncond = stage_model(
                                 hidden_states=latent_input,
                                 timestep=timestep,
                                 encoder_hidden_states=negative_embeds,
@@ -4617,14 +4900,14 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                                            "native AniSora Low (RAMスパイク"
                                            "回避の先載せ)")
                         if not v_hooked:
-                            vmodel.to("cpu")
+                            active_vace_model.to("cpu")
                             _free_cuda(log)
                         if not a_hooked and not swap_first:
                             self._move(amodel, device, log,
                                        "native AniSora Low")
                         switched = True
-                        log("handoff完了: pixel化せずlatent16chとUniPC履歴を"
-                            "native 36ch I2V入力へ接続")
+                        log("handoff最終完了: pixel化せずlatent16chとUniPC"
+                            "履歴をnative AniSora Low 36ch入力へ接続")
                     latent_input = torch.cat(
                         [latents, i2v_cond], dim=1).to(amodel.dtype)
                     with amodel.cache_context("cond"):
@@ -4676,7 +4959,8 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             return _frames_to_mp4(list(video[0]), req.fps, workdir, log)
         finally:
             for module in (getattr(pipe, "text_encoder", None),
-                           getattr(pipe, "vae", None), vmodel, amodel):
+                           getattr(pipe, "vae", None), vmodel, vlow,
+                           amodel):
                 try:
                     module.to("cpu")
                 except Exception:
@@ -4894,27 +5178,142 @@ class Wan22AnimatePilotAdapter(VideoAdapter):
     requires = "96GB GPU推奨 / DL約77GB / 公式標準20step"
     modes = ("i2v",)
     repo = "Wan-AI/Wan2.2-Animate-14B-Diffusers"
-    cache_repos = (repo,)
-    disk_gb = 77
+    gguf_repo = "QuantStack/Wan2.2-Animate-14B-GGUF"
+    anisora_gguf_repo = "QuantStack/Index-Anisora-V3.2-GGUF"
+    anisora_base_repo = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+    cache_repos = (repo, gguf_repo, anisora_gguf_repo, anisora_base_repo)
+    disk_gb = 24
     defaults = {"width": 480, "height": 864, "num_frames": 77,
                 "fps": 16, "steps": 20, "guidance": 1.0}
 
     def __init__(self):
         super().__init__()
         self.pipe = None
+        self._anisora_high_lora_loaded = False
+        self._animate_high = None
+        self._animate_low = None
 
     def ensure_loaded(self, log):
         _require_deps(log)
-        import torch
+        import gc
         from diffusers import WanAnimatePipeline
-        log(f"読み込み開始: {self.repo} (bf16・初回DL約77GB)")
-        self.pipe = WanAnimatePipeline.from_pretrained(
-            self.repo, torch_dtype=_pick_dtype(), low_cpu_mem_usage=True)
-        _apply_offload(self.pipe, log)
+        extra = getattr(self, "_next_extra", {}) or {}
+        dual_transplant = bool(extra.get("anisora_dual_transplant"))
+        transplant = bool(extra.get("anisora_low_transplant")
+                          or extra.get("anisora_fp8_transplant")
+                          or dual_transplant)
+        quantized_base = bool(extra.get("wan_animate_quantized"))
+        if quantized_base and not transplant:
+            from diffusers import (GGUFQuantizationConfig,
+                                   WanAnimateTransformer3DModel)
+            quant = _norm_quant(extra.get("quant") or "Q4_0")
+            if quant not in ("Q4_0", "Q8_0"):
+                log(f"Wan-Animate量子化実験は{quant}未検証のためQ4_0へ変更")
+                quant = "Q4_0"
+            qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
+            target_name = f"Wan2.2-Animate-14B-{quant}.gguf"
+            target_path = _hf_download(self.gguf_repo, target_name, log)
+            snap = _snapshot_local(self.repo, log)
+            log(f"量子化Wan-Animate本体を読み込み: {quant} "
+                "(AniSora Low移植なし)")
+            target = WanAnimateTransformer3DModel.from_single_file(
+                target_path, quantization_config=qc, config=snap,
+                subfolder="transformer", torch_dtype=_pick_dtype())
+            self.pipe = WanAnimatePipeline.from_pretrained(
+                snap, transformer=target, torch_dtype=_pick_dtype(),
+                low_cpu_mem_usage=True)
+            self.loaded_variant = "quantized_base"
+        elif transplant:
+            from diffusers import (GGUFQuantizationConfig,
+                                   WanAnimateTransformer3DModel,
+                                   WanTransformer3DModel)
+            quant = _norm_quant(extra.get("quant") or "Q4_0")
+            if quant not in ("Q4_0", "Q8_0"):
+                log(f"Wan-Animate移植実験は{quant}未検証のためQ4_0へ変更")
+                quant = "Q4_0"
+            qc = GGUFQuantizationConfig(compute_dtype=_pick_dtype())
+            target_name = f"Wan2.2-Animate-14B-{quant}.gguf"
+            donor_name = f"Low/Index-Anisora-V3.2-Low-{quant}.gguf"
+            target_path = _hf_download(self.gguf_repo, target_name, log)
+            donor_path = _hf_download(
+                self.anisora_gguf_repo, donor_name, log)
+            high_path = None
+            if dual_transplant:
+                high_quant = _anisora_high_quant(quant)
+                high_name = (f"High/Index-Anisora-V3.2-High-"
+                             f"{high_quant}.gguf")
+                high_path = _hf_download(
+                    self.anisora_gguf_repo, high_name, log)
+            snap = _snapshot_local(self.repo, log)
+            donor_snap = _snapshot_local(self.anisora_base_repo, log)
+            model_gb = _gguf_gb(target_path, donor_path, high_path)
+            if model_gb >= 1.0:
+                _ram_gate(log, model_gb + (24 if dual_transplant else 14),
+                          "Wan-Animate + AniSora High/Low移植")
+            log(f"Wan-Animate Low側Body/Face Adapter本体を読み込み: {quant}")
+            target_low = WanAnimateTransformer3DModel.from_single_file(
+                target_path, quantization_config=qc, config=snap,
+                subfolder="transformer", torch_dtype=_pick_dtype())
+            log(f"AniSora V3.2 Low移植ドナーを読み込み: {quant}")
+            donor = WanTransformer3DModel.from_single_file(
+                donor_path, quantization_config=qc, config=donor_snap,
+                subfolder="transformer_2", torch_dtype=_pick_dtype())
+            _transplant_base_weights(
+                target_low, donor, log, tag="WanAnimate+AniSoraLow",
+                patch_mode="same")
+            del donor
+            gc.collect()
+            target_high = None
+            if dual_transplant:
+                log(f"Wan-Animate High側Body/Face Adapter本体を読み込み: {quant}")
+                target_high = WanAnimateTransformer3DModel.from_single_file(
+                    target_path, quantization_config=qc, config=snap,
+                    subfolder="transformer", torch_dtype=_pick_dtype())
+                log("AniSora V3.2 High移植ドナーを読み込み")
+                donor_high = WanTransformer3DModel.from_single_file(
+                    high_path, quantization_config=qc, config=donor_snap,
+                    subfolder="transformer", torch_dtype=_pick_dtype())
+                _transplant_base_weights(
+                    target_high, donor_high, log,
+                    tag="WanAnimate+AniSoraHigh", patch_mode="same")
+                del donor_high
+                gc.collect()
+                log("共通40層=完整AniSora High/Low二体 / "
+                    "各骨・顔制御層=Wan-Animateで構築")
+            else:
+                log("共通40層=完整AniSora Low / 骨・顔制御層=Wan-Animateで構築")
+            self.pipe = WanAnimatePipeline.from_pretrained(
+                snap, transformer=target_low, torch_dtype=_pick_dtype(),
+                low_cpu_mem_usage=True)
+            self._animate_high = target_high
+            self._animate_low = target_low
+            self.loaded_variant = ("anisora_dual_transplant" if dual_transplant
+                                   else "anisora_low_transplant")
+        else:
+            log(f"読み込み開始: {self.repo} (bf16・初回DL約77GB)")
+            self.pipe = WanAnimatePipeline.from_pretrained(
+                self.repo, torch_dtype=_pick_dtype(), low_cpu_mem_usage=True)
+            self.loaded_variant = "official_bf16"
+        if dual_transplant:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.pipe.to(device)
+            self._animate_high.to(device)
+            try:
+                self.pipe.vae.enable_tiling()
+            except Exception:
+                pass
+            log("AniSora High/Low＋制御枝をGPU常駐 (step境界で本体切替)")
+        else:
+            _apply_offload(self.pipe, log)
         self.loaded = True
 
     def unload(self, log):
         self.pipe = None
+        self._animate_high = None
+        self._animate_low = None
+        self._anisora_high_lora_loaded = False
+        self.loaded_variant = None
         self.loaded = False
 
     @staticmethod
@@ -4934,8 +5333,12 @@ class Wan22AnimatePilotAdapter(VideoAdapter):
 
         if not req.images:
             raise RuntimeError("Wan-Animateには参照キャラ画像が必要です")
-        w = _snap(req.width, 16, 256)
-        h = _snap(req.height, 16, 256)
+        requested_w = _snap(req.width, 16, 256)
+        requested_h = _snap(req.height, 16, 256)
+        w, h = _snap_min_short_edge(requested_w, requested_h, 480, 16)
+        if (w, h) != (requested_w, requested_h):
+            log("Wan-Animate個別生成の短辺480px下限を適用: "
+                f"{requested_w}x{requested_h} -> {w}x{h}")
         steps = max(4, min(30, int(req.steps or 20)))
         if steps < 20:
             log(f"注意: Wan-Animateは非蒸留。公式20stepより少ない{steps}stepで実行")
@@ -5026,23 +5429,77 @@ class Wan22AnimatePilotAdapter(VideoAdapter):
 
         def _progress_cb(pipe, step_index, timestep, callback_kwargs):
             callback_count[0] += 1
+            if (use_anisora_lora and anisora_high_lora_steps > 0 and
+                    not lora_switched_off[0] and
+                    int(step_index) + 1 >= anisora_high_lora_steps):
+                self.pipe.disable_lora()
+                lora_switched_off[0] = True
+                log("AniSora High LoRAを終了: "
+                    f"{anisora_high_lora_steps}/{steps}step、以降は素のWan-Animate")
             total = max(1, steps * segment_count)
             progress(0.05 + 0.85 * min(1.0, callback_count[0] / total))
             return callback_kwargs
 
         log(f"Wan-Animate生成開始: {steps}step x {segment_count}区間 / "
             f"CFG 1.0 / seed {req.seed}")
-        result = self.pipe(
-            image=ref, pose_video=pose_frames, face_video=face_frames,
-            prompt=prompt, negative_prompt=req.negative or None,
-            height=h, width=w, segment_frame_length=segment_frames,
-            prev_segment_conditioning_frames=1,
-            num_inference_steps=steps, mode="animate", guidance_scale=1.0,
-            motion_encode_batch_size=max(1, min(16, int(
-                req.extra.get("motion_encode_batch_size", 8)))),
-            generator=generator, output_type="np",
-            callback_on_step_end=_progress_cb,
-            callback_on_step_end_tensor_inputs=["latents"])
+        use_anisora_lora = bool(req.extra.get("anisora_high_lora", False))
+        anisora_lora_scale = max(0.0, min(2.0, float(
+            req.extra.get("anisora_high_lora_scale", 1.0))))
+        anisora_high_lora_steps = max(0, min(steps, int(
+            req.extra.get("anisora_high_lora_steps", 0))))
+        lora_switched_off = [False]
+        if use_anisora_lora:
+            if not self._anisora_high_lora_loaded:
+                log("AniSora V3.2 High rank64 LoRAを読み込み: Kijai/WanVideo_comfy")
+                self.pipe.load_lora_weights(
+                    "Kijai/WanVideo_comfy", subfolder="LoRAs/AniSora",
+                    weight_name=(
+                        "Wan2_2_I2V_AniSora_3_2_HIGH_rank_64_fp16.safetensors"),
+                    adapter_name="anisora_high")
+                self._anisora_high_lora_loaded = True
+            self.pipe.set_adapters(
+                ["anisora_high"], adapter_weights=[anisora_lora_scale])
+            log(f"AniSora High LoRAを適用: scale={anisora_lora_scale:.2f}")
+            if anisora_high_lora_steps:
+                log("High限定適用: "
+                    f"最初の{anisora_high_lora_steps}/{steps}step")
+        elif self._anisora_high_lora_loaded:
+            self.pipe.disable_lora()
+            log("AniSora High LoRAを無効化 (素のWan-Animate)")
+        dual_active = (self._animate_high is not None and
+                       self._animate_low is not None)
+        low_forward = None
+        dual_calls = [0]
+        high_steps = max(1, min(steps - 1, int(
+            req.extra.get("anisora_high_steps", max(1, steps // 2)))))
+        if dual_active:
+            low_forward = self._animate_low.forward
+            high_forward = self._animate_high.forward
+
+            def _dual_forward(*args, **kwargs):
+                step_in_segment = dual_calls[0] % steps
+                dual_calls[0] += 1
+                fn = high_forward if step_in_segment < high_steps else low_forward
+                return fn(*args, **kwargs)
+
+            self._animate_low.forward = _dual_forward
+            log(f"AniSora二段切替: High {high_steps}step → "
+                f"Low {steps - high_steps}step (骨・顔制御枝は両段に維持)")
+        try:
+            result = self.pipe(
+                image=ref, pose_video=pose_frames, face_video=face_frames,
+                prompt=prompt, negative_prompt=req.negative or None,
+                height=h, width=w, segment_frame_length=segment_frames,
+                prev_segment_conditioning_frames=1,
+                num_inference_steps=steps, mode="animate", guidance_scale=1.0,
+                motion_encode_batch_size=max(1, min(16, int(
+                    req.extra.get("motion_encode_batch_size", 8)))),
+                generator=generator, output_type="np",
+                callback_on_step_end=_progress_cb,
+                callback_on_step_end_tensor_inputs=["latents"])
+        finally:
+            if low_forward is not None:
+                self._animate_low.forward = low_forward
         frames = result.frames[0]
         progress(0.94)
         meta = {"model": self.repo, "direction": direction,
@@ -5050,6 +5507,11 @@ class Wan22AnimatePilotAdapter(VideoAdapter):
                 "segment_frames": segment_frames, "width": w,
                 "height": h, "frames": n, "fps": req.fps, "steps": steps,
                 "seed": req.seed, "guidance": 1.0,
+                "anisora_high_lora": use_anisora_lora,
+                "anisora_high_lora_scale": (anisora_lora_scale
+                                             if use_anisora_lora else None),
+                "anisora_high_lora_steps": (anisora_high_lora_steps
+                                             if use_anisora_lora else None),
                 "face_motion": ("blank" if face_mode == "blank" else
                                 "static_reference_head_crop")}
         (workdir / "pilot_settings.json").write_text(
@@ -6062,6 +6524,81 @@ def _wp_motion_prompt(pack: Path) -> str:
     return t
 
 
+_WP_MOTION_CONTROLS = (
+    "biped", "quadruped", "flying", "serpentine", "amorphous", "other")
+
+
+def _wp_infer_motion_control(text: str, body_plan: str = "ai") -> str:
+    """旧パックの動作文から内部制御方式を保守的に推定する。"""
+    legacy = {
+        "biped": "biped", "biped_legs": "biped",
+        "quadruped": "quadruped", "quadruped_ai": "quadruped",
+        "quadruped_bone": "quadruped", "flying": "flying",
+        "flying_ai": "flying", "serpentine": "serpentine",
+        "serpentine_ai": "serpentine", "amorphous": "amorphous",
+        "amorphous_ai": "amorphous",
+    }
+    if body_plan in legacy:
+        return legacy[body_plan]
+    src = (text or "").lower()
+    rules = (
+        ("flying", ("flies in place", "flying in place", "hovers",
+                    "hovering", "wingbeat", "wing beat", "flaps its wings")),
+        ("quadruped", ("on all fours", "four-legged", "four legged",
+                       "quadruped", "forelegs", "forelimbs", "hind legs",
+                       "hindlimbs", "front paws", "crawls", "crawling")),
+        ("serpentine", ("slithers", "slithering", "serpentine", "snake-like",
+                        "snakelike", "legless body")),
+        ("amorphous", ("amorphous", "slime", "gelatinous", "oozes",
+                       "squashes and stretches", "squash and stretch", "blob")),
+        ("biped", ("two legs", "left leg", "right leg", "left foot",
+                   "right foot", "biped", "upright run", "upright walk")),
+    )
+    for kind, needles in rules:
+        if any(n in src for n in needles):
+            return kind
+    # 0.11.34以前のaiパックは大半が二足。明記のない既存依頼だけは挙動を
+    # 変えず、曖昧判定は新規profile側でotherとして保存する。
+    return "biped" if body_plan == "ai" else "other"
+
+
+def _wp_motion_control(pack: Path, body_plan: str = "ai") -> str:
+    """母艦が同梱した内部制御種別を読む。表示上の4択とは独立。"""
+    p = pack / "01_generation" / "motion_profile.json"
+    if p.is_file():
+        try:
+            kind = str(json.loads(p.read_text(encoding="utf-8"))
+                       .get("control_kind") or "").strip().lower()
+            if kind in _WP_MOTION_CONTROLS:
+                return kind
+        except Exception:                         # noqa: BLE001
+            pass
+    return _wp_infer_motion_control(_wp_motion_prompt(pack), body_plan)
+
+
+def _wp_motion_profile(pack: Path) -> dict:
+    """母艦Codexの内部モーション判定を安全な値だけに正規化して読む。"""
+    p = pack / "01_generation" / "motion_profile.json"
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:                             # noqa: BLE001
+        return {}
+
+
+def _wp_motion_gait(pack: Path) -> str:
+    v = str(_wp_motion_profile(pack).get("gait") or "walk").strip().lower()
+    return v if v in ("walk", "run", "crawl", "fly", "slither",
+                      "pulse", "custom") else "walk"
+
+
+def _wp_limb_mode(pack: Path) -> str:
+    v = str(_wp_motion_profile(pack).get("limb_mode") or "full").strip().lower()
+    return v if v in ("full", "legs", "arms", "none") else "full"
+
+
 def _wp_face_boxes(pack: Path) -> dict:
     """pack/01_generation/face_boxes.json を読む (実験g3の顔限定線画用)。
 
@@ -6133,7 +6670,8 @@ def _wp_moving_frames(cv_mod, refs: dict, plan: str, nf: int, idle_n: int,
                    else Image.new("RGB", ref.size, 0))
         base_refs[d] = ref
     win = max(1, gait_end - idle_n + 1)
-    cw_cell, ch_cell = w // 3, h // 3   # compass想定 (hemiは呼ばない)
+    cols_n, rows_n, _dirs_n = layout
+    cw_cell, ch_cell = w // max(1, cols_n), h // max(1, rows_n)
     tmp = Path(_tf.mkdtemp(prefix="depth_refs_"))
     frames = []
     cache = {}
@@ -6328,6 +6866,154 @@ def _wp_puppet_frames(line_canvas, kps_frames, layout, w: int, h: int):
         cache[key] = fr
         frames.append(fr)
     return frames
+
+
+def _wp_puppet_art_frames(art_canvas, kps_frames, layout, w: int, h: int,
+                          freeze_head: bool = True):
+    """原画の各画素を最寄りボーンへ割り当て、色付きパペット下地を作る。
+
+    OpenPoseを画像条件として混ぜてもAniSoraは意味解釈せず、左右向きでは
+    緑の骨が漏れるだけだった。そこで側面だけは、原画の脚画素そのものを
+    交互位相へ仮移動する。粗い関節境界は最終画ではなくHigh予測の下地で、
+    AniSoraが修復する。顔は空間maskの固定位置と衝突しないよう原位置固定。
+    """
+    import numpy as np
+    from PIL import Image
+    cols, rows, dirs = layout
+    cw, ch = w // cols, h // rows
+    rgb = np.asarray(art_canvas.convert("RGB"))
+    # 工房のマゼンタキー。背景画素をボーンへ所有させない。
+    fg = ((np.minimum(rgb[..., 0], rgb[..., 2]).astype(np.int16)
+           - rgb[..., 1].astype(np.int16)) < 70)
+    idle = kps_frames[0]
+
+    def _seg_pts(kps):
+        segs = []
+        for a, b in _PUPPET_PARTS:
+            if kps[a] is not None and kps[b] is not None:
+                segs.append((np.array(kps[a]), np.array(kps[b])))
+            else:
+                segs.append(None)
+        if kps[1] is not None and kps[8] is not None and kps[11] is not None:
+            hip = (np.array(kps[8]) + np.array(kps[11])) / 2.0
+            segs.append((np.array(kps[1]), hip))
+        else:
+            segs.append(None)
+        return segs
+
+    cell_rects = [((i % cols) * cw, (i // cols) * ch)
+                  for i, d in enumerate(dirs) if d is not None]
+    cell_rects = cell_rects[:len(idle) if idle else 0]
+    cell_parts = []
+    _head_si = len(_PUPPET_PARTS) - 1
+    for ci, (ox, oy) in enumerate(cell_rects):
+        segs0 = _seg_pts(idle[ci])
+        sub_fg = fg[oy:oy + ch, ox:ox + cw]
+        ys, xs = np.nonzero(sub_fg)
+        if not len(ys):
+            cell_parts.append(None)
+            continue
+        pts = np.stack([xs + ox, ys + oy], axis=1).astype(np.float64)
+        dists = np.full((len(pts), len(segs0)), 1e9)
+        for si, seg in enumerate(segs0):
+            if seg is None:
+                continue
+            p0, p1 = seg
+            v = p1 - p0
+            vv = float(v @ v) or 1.0
+            t = np.clip(((pts - p0) @ v) / vv, 0.0, 1.0)
+            proj = p0[None, :] + t[:, None] * v[None, :]
+            dists[:, si] = np.linalg.norm(pts - proj, axis=1)
+        dists[:, _head_si] *= 0.5
+        owner = np.argmin(dists, axis=1)
+        neck = idle[ci][1]
+        if neck is not None and segs0[_head_si] is not None:
+            owner[pts[:, 1] < float(neck[1])] = _head_si
+        layers = []
+        for si in range(len(segs0)):
+            sel = owner == si
+            if not sel.any() or segs0[si] is None:
+                layers.append(None)
+                continue
+            la = np.zeros((ch, cw, 4), dtype=np.uint8)
+            gy, gx = ys[sel] + oy, xs[sel] + ox
+            la[ys[sel], xs[sel], :3] = rgb[gy, gx]
+            la[ys[sel], xs[sel], 3] = 255
+            layers.append(Image.fromarray(la, "RGBA"))
+        cell_parts.append((layers, segs0, (ox, oy)))
+
+    # 背景は元キャンバスからキャラだけをキー色へ戻す。セル間も保持。
+    bg = rgb.copy()
+    bg[fg] = (255, 0, 255)
+    frames, cache = [], {}
+    for kf in kps_frames:
+        key = tuple(tuple((round(p[0], 1), round(p[1], 1)) if p else None
+                          for p in kps) for kps in kf)
+        if key in cache:
+            frames.append(cache[key])
+            continue
+        canvas = Image.fromarray(bg, "RGB").convert("RGBA")
+        for ci, cp in enumerate(cell_parts):
+            if cp is None or ci >= len(kf):
+                continue
+            layers, segs0, (ox, oy) = cp
+            segsF = _seg_pts(kf[ci])
+            # 胴→四肢→頭。顔は最後に原位置で載せる。
+            order = [len(segs0) - 1] + [
+                i for i in range(len(segs0) - 1) if i != _head_si] + [_head_si]
+            for si in order:
+                lay = layers[si]
+                if lay is None or segsF[si] is None or segs0[si] is None:
+                    continue
+                if freeze_head and si == _head_si:
+                    warped = lay
+                else:
+                    p0, p1 = segs0[si]
+                    q0, q1 = segsF[si]
+                    co = _sim_affine(p0 - (ox, oy), p1 - (ox, oy),
+                                     q0 - (ox, oy), q1 - (ox, oy))
+                    warped = lay.transform((cw, ch), Image.AFFINE, co,
+                                           resample=Image.BILINEAR)
+                canvas.alpha_composite(warped, (ox, oy))
+        fr = canvas.convert("RGB")
+        cache[key] = fr
+        frames.append(fr)
+    return frames
+
+
+def _wp_ai_control_frames(cv_mod, pv_mod, refs: dict, motion_kind: str,
+                          nf: int, idle_n: int, gait_end: int,
+                          w: int, h: int, layout, gait: str = "walk",
+                          limb_mode: str = "full"):
+    """ai本線の内部制御列。側面二足だけは色付き原画パペットを使う。"""
+    dirs = list(layout[2]) if len(layout) >= 3 else []
+    side = (len(dirs) == 1 and dirs[0] in ("left", "right"))
+    if motion_kind == "biped":
+        kps = []
+        old_gait = os.environ.get("SM_POSE_GAIT")
+        old_parts = os.environ.get("SM_POSE_BODY_PARTS")
+        os.environ["SM_POSE_GAIT"] = "run" if gait == "run" else "walk"
+        os.environ["SM_POSE_BODY_PARTS"] = limb_mode
+        try:
+            pose = pv_mod.build_canvas_pose_frames(
+                refs, nf, w, h, layout, kps_out=kps)
+        finally:
+            if old_gait is None:
+                os.environ.pop("SM_POSE_GAIT", None)
+            else:
+                os.environ["SM_POSE_GAIT"] = old_gait
+            if old_parts is None:
+                os.environ.pop("SM_POSE_BODY_PARTS", None)
+            else:
+                os.environ["SM_POSE_BODY_PARTS"] = old_parts
+        if side and limb_mode == "full":
+            art = cv_mod.compose_reference(refs, w, h, layout).convert("RGB")
+            return (_wp_puppet_art_frames(art, kps, layout, w, h),
+                    "side_art_puppet")
+        return pose, f"openpose_{limb_mode}_{gait}"
+    return (_wp_moving_frames(cv_mod, refs, motion_kind, nf, idle_n,
+                              gait_end, w, h, layout, mode="art"),
+            f"{motion_kind}_art_motion")
 
 
 # スクリブル混成 (2026-07-20ユーザー発案「首から上=立ち絵そのものの線画、
@@ -6549,6 +7235,9 @@ def _pack_extract(pid: str, raw: bytes) -> int:
             elif name == "motion_prompt.txt":
                 # キャラ別モーション文 (母艦Codex作、2026-07-21)
                 dest = pack / "01_generation" / "motion_prompt.txt"
+            elif name == "motion_profile.json":
+                # 4択UIを増やさず、キャラの形に合う内部制御だけを自動選択。
+                dest = pack / "01_generation" / "motion_profile.json"
             elif name == "template.json":
                 # 依頼のシート形式 (母艦が templates/<name>.json を同梱)。
                 # ★これを落とすと _wp_sheet_layout が見つけられず、無言で
@@ -6750,11 +7439,16 @@ def _wp_prompt(eng: dict, refs: dict, layout, nf: int,
             # (legs_onlyで骨格の上半身権威を外した分の言い分)
             prompt += (" LOCOMOTION: every figure is RUNNING in place, "
                        "not walking -- a fast sprint cycle: knees driving "
-                       "high, rear foot kicking up, strong forward lean. "
-                       "The torso, head and arms keep exactly the posture "
-                       "shown in the reference art (the bent-forward "
-                       "running stance with clenched fists) through the "
-                       "whole cycle; only the legs cycle rapidly.")
+                       "high, rear foot kicking up, and a readable forward "
+                       "lean. ")
+            if keep_posture:
+                prompt += ("The torso, head and arms keep exactly the "
+                           "posture shown in the reference art through the "
+                           "whole cycle; only the two legs cycle rapidly.")
+            else:
+                prompt += ("The two bent arms pump in opposition to the "
+                           "two legs, and the whole body clearly follows "
+                           "the running rhythm.")
     else:
         # 歩かない体格では「歩行由来の揺れ」文言が空転する (文意の整合)。
         # あわせて発明抑制節 (_WP_NO_PROPS) を宣言する
@@ -7377,6 +8071,15 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     missing = [d for d in _WP_DIRS if d not in refs]
     if missing:
         raise RuntimeError(f"パックに8方向PNGが不足: {missing}")
+    _motion_kind = (_wp_motion_control(pack, plan_raw)
+                    if plan_raw == "ai" else
+                    _wp_infer_motion_control("", plan_raw))
+    _motion_gait = _wp_motion_gait(pack) if plan_raw == "ai" else "walk"
+    _limb_mode = _wp_limb_mode(pack) if plan_raw == "ai" else "full"
+    if plan_raw == "ai":
+        _wp_print(f"[walkpack] AI内部制御={_motion_kind} "
+                  f"gait={_motion_gait} limbs={_limb_mode} "
+                  f"({'人型OpenPose' if _motion_kind == 'biped' else '原画変形列'})")
     char = str(meta.get("char_id") or char)
     out = pack / "out"
     if out.is_dir():
@@ -7449,6 +8152,14 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             "motion": _wp_knob_float(_kn, "motion", 3.0, 2.0, 4.0),
             "pose_weight": _settings_pose,
             "image_weight": 1.0 - _settings_pose,
+            "motion_control": _motion_kind,
+            "gait": _motion_gait,
+            "limb_mode": _limb_mode,
+            "side_control": ("art_puppet" if _motion_kind == "biped"
+                             else "morphology_art_motion"),
+            "side_control_weight": (max(0.50, _settings_pose)
+                                    if _motion_kind == "biped"
+                                    else _settings_pose),
             "head_release_steps": _settings_release,
             "inpaint": "frame0_fixed_dual_condition",
             "direction_chain": "adjacent_end_anchor",
@@ -7612,11 +8323,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 pass
             log(f"[{tag}] 実験line_puppet: 線画パペット制御 (骨で線を駆動)")
         elif plan_raw == "ai":
-            # 新本線AIも姿勢情報はOpenPose列として作る。
-            # VACEには渡さず、anisora_inpaint分岐のHigh側
-            # 二条件forwardにだけ使う。
-            frames = pv.build_canvas_pose_frames(refs, nf, w, h, layout)
-            log(f"[{tag}] AI生成: AniSora High用OpenPose歩行列")
+            frames, _ai_ctl = _wp_ai_control_frames(
+                cv, pv, refs, _motion_kind, nf, idle_n, gait_end,
+                w, h, layout, gait=_motion_gait,
+                limb_mode=_limb_mode)
+            log(f"[{tag}] AI生成: 内部制御={_ai_ctl} (VACE不使用)")
         elif plan == "biped":
             _fp_save = os.environ.get("SM_POSE_FACE_POINTS")
             _bp_save = os.environ.get("SM_POSE_BODY_PARTS")
@@ -7786,8 +8497,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _ci = _WP_TURN_ORDER.index(_chain_current)
                 _chain_next = _WP_TURN_ORDER[(_ci + 1) % len(_WP_TURN_ORDER)]
                 _next_layout = (1, 1, [_chain_next])
-                _next_pose = pv.build_canvas_pose_frames(
-                    refs, nf, w, h, _next_layout)
+                _next_pose, _next_ctl = _wp_ai_control_frames(
+                    cv, pv, refs, _motion_kind, nf, idle_n, gait_end,
+                    w, h, _next_layout, gait=_motion_gait,
+                    limb_mode=_limb_mode)
                 _chain_next_canvas = cv.compose_reference(
                     refs, w, h, _next_layout).convert("RGB")
                 from PIL import Image as _ImgChain
@@ -7903,7 +8616,8 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 pass
             log(f"[{tag}] 実験edge_idle v2: キャラ限定エッジ (セル枠なし)")
         prompt = _wp_prompt(eng, refs, layout, nf, plan=plan,
-                            gait_run=bool(_exp.get("gait_run")),
+                            gait_run=bool(_exp.get("gait_run")
+                                          or _motion_gait == "run"),
                             keep_posture=bool(_exp.get("keep_posture")),
                             crawl_bone=(plan_raw == "quadruped_bone"))
         _mtext = _wp_motion_prompt(pack)
@@ -8043,6 +8757,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _kn, "head_release_steps", 0, 0, 12))
             _pose_weight_ai = _wp_knob_float(
                 _kn, "pose_weight", 0.25, 0.05, 0.50)
+            if (_motion_kind == "biped"
+                    and _chain_current in ("left", "right")):
+                # OpenPoseを強めると緑骨が漏れるだけだったため、側面は
+                # 色付き原画パペットへ差し替えたうえで50%まで効かせる。
+                _pose_weight_ai = max(0.50, _pose_weight_ai)
             _guide2 = [canvas.convert("RGB").copy()] + list(frames[1:])
             if _chain_next_canvas is not None:
                 prompt += (
@@ -8774,6 +9493,32 @@ _GCS_CT = {".mp4": "video/mp4", ".webp": "image/webp", ".png": "image/png",
            ".gif": "image/gif", ".json": "application/json"}
 
 
+def _submit_annex_i2v(pid: str, mock: bool = False) -> str:
+    """分室パックの原画+英訳文を通常AniSora I2Vジョブへ投入する。"""
+    import math
+    from PIL import Image
+    pack = packs_root() / pid
+    image_path = pack / "annex_source.png"
+    prompt_path = pack / "annex_prompt_en.txt"
+    if not image_path.is_file() or not prompt_path.is_file():
+        raise RuntimeError("分室パックにannex_source.png/英訳文がありません")
+    prompt = " ".join(prompt_path.read_text(
+        encoding="utf-8", errors="replace").split())[:2000]
+    if not prompt:
+        raise RuntimeError("分室の英訳プロンプトが空です")
+    image = Image.open(image_path).convert("RGB")
+    iw, ih = image.size
+    # walkpackと近い総画素数で縦横比を保ち、Wanの16倍数制約へ揃える。
+    scale = math.sqrt((832 * 480) / max(1.0, float(iw * ih)))
+    w = max(224, int(round(iw * scale / 16)) * 16)
+    h = max(224, int(round(ih * scale / 16)) * 16)
+    req = GenRequest(mode="i2v", prompt=prompt, images=[image],
+                     width=w, height=h, num_frames=81, fps=16,
+                     steps=8, seed=int(time.time()) % (2 ** 31),
+                     guidance=1.0, extra={"motion_score": 3.0})
+    return submit_job("mock" if mock else "anisora", req)
+
+
 def _gcs_process_one(req: dict, wait: bool = True):
     """pack_ready の依頼を1件処理: パック取り込み→walkpack→outputs書き戻し。
 
@@ -8791,7 +9536,10 @@ def _gcs_process_one(req: dict, wait: bool = True):
     req["error"] = ""
     _gcs_req_save(req)
     _LAST_GCS_WORK[0] = time.time()
-    jid = submit_walkpack(pid, mock=bool(req.get("_mock")))
+    annex = (req.get("room") == "annex"
+             or req.get("request_type") == "annex_i2v")
+    jid = (_submit_annex_i2v(pid, mock=bool(req.get("_mock")))
+           if annex else submit_walkpack(pid, mock=bool(req.get("_mock"))))
     if not wait:
         return jid
     beat = time.time()                           # ハートビート (120s毎)
@@ -8812,6 +9560,37 @@ def _gcs_process_one(req: dict, wait: bool = True):
             break
     if j.get("status") != "done":
         raise RuntimeError(str(j.get("detail") or "生成失敗")[:400])
+    if annex:
+        result = Path(str(j.get("path") or ""))
+        if not result.is_file():
+            raise RuntimeError("分室I2VのMP4が見つかりません")
+        mp4_name = f"annex_{rid}.mp4"
+        source = packs_root() / pid / "annex_source.png"
+        _gcs_write(f"outputs/{rid}/{mp4_name}", result.read_bytes(),
+                   "video/mp4")
+        files = [{"name": mp4_name, "size": result.stat().st_size,
+                  "kind": "mp4"}]
+        if source.is_file():
+            _gcs_write(f"outputs/{rid}/source.png", source.read_bytes(),
+                       "image/png")
+            files.append({"name": "source.png", "size": source.stat().st_size,
+                          "kind": "poster"})
+        manifest = {"pack_id": pid, "files": files,
+                    "finished": time.time(),
+                    "generation": {"engine": "anisora_i2v", "frames": 81,
+                                   "fps": 16, "steps": 8,
+                                   "server_version": __version__}}
+        _gcs_write(f"outputs/{rid}/manifest.json",
+                   json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+                   "application/json")
+        _gcs_req_finish(req, "done")
+        _LAST_GCS_WORK[0] = time.time()
+        shutil.rmtree(packs_root() / pid, ignore_errors=True)
+        try:
+            _gcs_prune_outputs()
+        except Exception as e:                    # noqa: BLE001
+            _wp_print(f"[GCS] 分室完了後の刈り込み失敗 (継続): {str(e)[:160]}")
+        return jid
     # 依頼がドット絵化を求めていれば歩行後に実行 (out/ にpixelシートを追加)。
     # ベストエフォート — 失敗しても歩行成果物は返す。
     if req.get("pixelize"):
