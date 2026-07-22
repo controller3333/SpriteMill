@@ -62,6 +62,14 @@ MAGENTA = (255, 0, 255)
 BG_TAG = "plain flat solid light gray background"
 BG_NEG = "gray clothes, gray skin, gradient background, scenery, floor"
 
+# 1体だけ描かせる。ControlNetに骨格を1体分しか渡していなくても、SDXLは
+# 縦長キャンバスを「ターンアラウンド表」で埋めることがある (2026-07-23実走:
+# 5体並びが出て、うち4体は顔が空白だった)。danbooru語の solo が最も効く。
+SOLO_TAG = "solo, 1 character, single character, full body visible"
+SOLO_NEG = ("multiple characters, duplicate character, character sheet, "
+            "multiple views, turnaround sheet, collage, 2girls, 3girls, "
+            "crowd, cropped")
+
 TURNTABLE_PROMPT = (
     "Full-body turntable animation of exactly the same single anime "
     "character as the reference. Starting from the straight front view, "
@@ -129,7 +137,8 @@ def proportion_tags(leg_scale) -> tuple:
 
 def stills_negative(meta: dict, base: str = "") -> str:
     """立ち絵用ネガティブ = アダプタ既定 + 頭身の否定 + 背景同化の否定。"""
-    neg = proportion_tags((meta or {}).get("leg_scale"))[1] + ", " + BG_NEG
+    neg = (proportion_tags((meta or {}).get("leg_scale"))[1]
+           + ", " + BG_NEG + ", " + SOLO_NEG)
     base = (base or "").strip().rstrip(",")
     return f"{base}, {neg}" if base else neg
 
@@ -153,17 +162,24 @@ def subject_coverage(img) -> tuple:
         ys.max() - ys.min() + 1) / float(h)
 
 
-def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45) -> tuple:
-    """立ち絵として使えるか (ok, 理由)。閾値はキー後の実測に対する下限。
+def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
+              max_area: float = 0.45) -> tuple:
+    """立ち絵として使えるか (ok, 理由)。閾値は実走4枚の実測から:
 
-    正面立ち絵は縦長キャンバスの上下いっぱいに立つのが正常
-    (骨格CNが全高0.86を占める)。髪だけが残った事故絵は面積0.02級・
-    縦0.3級に落ちるので、この2つで十分に弾ける。"""
+      正常 = 面積21.8% / 22.7% (縦90%・97%)
+      背景と同化して髪だけ残った絵 = 3.7%
+      5体並びのターンアラウンド表 = 56.1%
+
+    下限で「消えた絵」、上限で「複数体で埋めた絵」を弾く。1体の全身は
+    縦長キャンバスの細い柱にしかならないので、この窓で分離できる。"""
     area, height = subject_coverage(img)
     if area < min_area:
         return False, f"被写体が小さすぎます (面積{area * 100:.1f}%)"
     if height < min_height:
         return False, f"全身が写っていません (縦{height * 100:.0f}%)"
+    if area > max_area:
+        return False, (f"画面を埋めすぎです (面積{area * 100:.0f}% — "
+                       "複数体を並べた可能性)")
     return True, f"面積{area * 100:.1f}% 縦{height * 100:.0f}%"
 
 
@@ -172,9 +188,9 @@ def concept_to_illustrious_prompt(meta: dict) -> str:
     m = _en_meta(meta)
     prop = proportion_tags(m.get("leg_scale"))[0]
     tags = str(m.get("illustrious_tags") or (
-        f"masterpiece, best quality, {prop}, full body, standing, "
-        "front view, front lighting, flat color, simple background, "
-        f"{BG_TAG}")).strip()
+        f"masterpiece, best quality, {SOLO_TAG}, {prop}, "
+        "full body, standing, front view, front lighting, flat color, "
+        f"simple background, {BG_TAG}")).strip()
     concept = str(m.get("concept_en") or m.get("concept") or "").strip()
     palette = str(m.get("palette_en") or m.get("palette") or "").strip()
     sil = str(m.get("silhouette_en") or m.get("silhouette") or "").strip()
@@ -201,10 +217,11 @@ def concept_to_qwen_prompt(meta: dict) -> str:
     notes = str(m.get("notes_en") or m.get("notes") or "").strip()
     prop = proportion_tags(m.get("leg_scale"))[0]
     bits = [
-        "Single full-body front-facing idle anime game character sprite, "
-        f"{prop}, crisp outlines, flat colors, one soft shadow, "
-        f"{BG_TAG}, uniform background with no gradient, "
-        "no floor, no text, no watermark, no border.",
+        "Exactly one single full-body front-facing idle anime game "
+        f"character sprite, {prop}, crisp outlines, flat colors, "
+        f"one soft shadow, {BG_TAG}, uniform background with no gradient, "
+        "no floor, no text, no watermark, no border, "
+        "not a turnaround sheet.",
         f"Character: {concept}.",
     ]
     if palette:
