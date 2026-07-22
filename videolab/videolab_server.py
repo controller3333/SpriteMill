@@ -135,7 +135,26 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.45"
+__version__ = "0.11.50"
+# 0.11.50: GPU立ち絵の頭身崩壊を修正。①ControlNet骨格を歩行本線と同じ
+# build_walk_pose_frames の直立コマへ (旧: 歩行キャンバス用の入口に単体
+# 画像を渡し、足が画面外へ出る骨格を作っていた) ②プロンプトの "chibi"
+# 決め打ちを leg_scale 由来の頭身タグ+否定タグへ (骨=8頭身/言葉=chibi の
+# 正面衝突で「チビ頭+棒脚」になっていた実走を修正)。
+# 0.11.49: 満杯ディスクの根治 — GPU立ち絵フォールバックのモデルDLが
+# 「HFの429」と誤報されていた実障害 (2026-07-22)。実体は作業ディスク
+# 100%で、_run_with_stall_watch が「使用量が増えない=停滞」と判定して
+# 全経路を殺していた。①DL前の空き容量ゲート+終了ジョブ作業dir/中断DLの
+# 自動掃除 ②停滞・全滅時のメッセージで満杯を名指し ③分室キーフレームの
+# 既定を qwen(実測57GB) から illustrious(7GB・立ち絵と共用) へ。
+# 0.11.48: 分室経路の確保 — 英訳は規定Codex→代替MT自動切替、
+# 原画欠落時はGPUキーフレーム生成後にAniSora I2V。
+# 0.11.47: Codex無しでも依頼プロンプトを機械翻訳で英語化 (mt_en)。
+# シード立ち絵・歩行motion_prompt・欠落時の合成をカバー。
+# 0.11.46: Codex枠切れ時のGPU立ち絵フォールバック。シードパック
+# (stills_source=gpu_turntable) を受け取ると正面立ち絵を
+# Illustrious(またはQwen)で生成 → AniSora Low 360°ターンテーブル →
+# 8方向切り出し → 既存walkpackへ接続。母艦は失敗時にシードを返す。
 # 0.11.45: 工房AI本線を実走比較で採用した三段6stepへ切替。
 # VACE High 3step (Lightning 4step LoRA + AniSora High要素LoRA) →
 # VACE Low 2step (Lightning 4step LoRA) → native AniSora Low 1step。
@@ -422,6 +441,103 @@ def _disk_used_gb() -> float:
         return -1.0
 
 
+def _disk_free_gb(where=None) -> float:
+    """作業ディスクの空き (GB)。取れなければ -1。"""
+    for cand in (where, WORK_ROOT, Path.home()):
+        if cand is None:
+            continue
+        try:
+            return shutil.disk_usage(str(cand)).free / 2**30
+        except Exception:
+            continue
+    return -1.0
+
+
+_JOBDIR_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _prune_work_scratch(log, keep_hours: float = 6.0) -> float:
+    """終わったジョブの作業dirと中断DLの残骸を掃除する (v0.11.49)。
+
+    2026-07-22の実障害: 実験の残骸でディスクが100%になり、立ち絵
+    フォールバックのモデルDLが1.1GB/6.9GBで死んだ。しかも
+    _run_with_stall_watch は「ディスク使用量が増えない=停滞」で殺すので、
+    満杯は毎回「HFの429」に化けて原因が見えなかった。作業dirは1ジョブ
+    数十MB〜200MBで、サーバ再起動をまたぐと二度と参照されない純ゴミなので
+    自動で回収する。戻り値=解放したGB (概算)。"""
+    freed = 0.0
+    cutoff = time.time() - keep_hours * 3600.0
+    try:
+        entries = list(WORK_ROOT.iterdir())
+    except OSError:
+        return 0.0
+    for d in entries:
+        try:
+            if not d.is_dir() or not _JOBDIR_RE.match(d.name):
+                continue
+            if d.name in JOBS:            # 実行中/履歴に残るジョブは触らない
+                continue
+            if d.stat().st_mtime > cutoff:
+                continue
+            sz = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            shutil.rmtree(d, ignore_errors=True)
+            freed += sz / 2**30
+        except OSError:
+            continue
+    # 中断したモデルDLの部分ファイル (次回は最初から取り直す)
+    dl = WORK_ROOT / "_dl"
+    if dl.is_dir():
+        for f in dl.rglob("*"):
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    sz = f.stat().st_size
+                    f.unlink()
+                    freed += sz / 2**30
+            except OSError:
+                continue
+    if freed > 0.05:
+        log(f"作業ディスクを掃除: {freed:.1f}GB 解放 "
+            f"(終了済みジョブの作業dir・中断DLの残骸)")
+    return freed
+
+
+def _ensure_disk_for(need_gb: float, log, what: str) -> None:
+    """モデル取得前の空き容量ゲート。足りなければ掃除し、それでも足りない
+    ときは「満杯」と名指しで落とす (429と誤診させない)。"""
+    free = _disk_free_gb()
+    if free < 0:
+        return                      # 測れない環境 (テスト等) は素通し
+    if free >= need_gb:
+        return
+    log(f"⚠ ディスク空き {free:.1f}GB < 必要 {need_gb:.1f}GB ({what}) — "
+        "作業ディスクを掃除します")
+    _prune_work_scratch(log, keep_hours=0.5)
+    free = _disk_free_gb()
+    if free >= need_gb:
+        return
+    raise RuntimeError(
+        f"ディスクが足りません: {what} に約{need_gb:.0f}GB 必要ですが空きは "
+        f"{free:.1f}GB です ({WORK_ROOT} のあるディスク)。"
+        "不要なモデル・実験データを削除してから再実行してください "
+        "(HFの拒否ではありません)")
+
+
+def _dl_fail_hint() -> str:
+    """DL全滅時の原因ヒント。満杯を『HFの429』と誤診しないための分岐
+    (2026-07-22実障害: _run_with_stall_watch はディスク使用量が増えない
+    ことを停滞と見なすので、満杯は必ず『停滞→429の疑い』に化けていた)。"""
+    free = _disk_free_gb()
+    if 0 <= free < 5.0:
+        return (f" — ★ディスクの空きが {free:.1f}GB しかありません。"
+                "モデルが書き込めずに停滞したのが原因です "
+                "(HFの拒否ではありません)。不要なモデル・実験データを"
+                "削除してから再実行してください")
+    return (" — HF側の429拒否 (IP/アカウントのDL割当) の可能性。"
+            "①ランタイムを終了して別VMを引き直す ②Driveキャッシュに"
+            "GGUFを置く (ノートのDRIVE_CACHEセル参照) のどちらかで"
+            "回避できます")
+
+
 # ---------------------------------------------------------------- 保証機構
 # 「OOM・フリーズしない保証」(2026-07-16調査に基づくv0.9.12):
 # クライアントのplan_canvasは最適寸法の設計、サーバ側は拒否/降格の最終
@@ -609,6 +725,12 @@ def _run_with_stall_watch(cmd, env, log, tag, stall_secs=90) -> int:
         else:
             stall += 10
             if stall >= stall_secs:
+                # 満杯だと「1バイトも増えない」=必ずここへ落ちるので、
+                # 停滞の理由を先に名指しする (2026-07-22実障害)
+                _fr = _disk_free_gb()
+                if 0 <= _fr < 5.0:
+                    log(f"⚠ ディスクの空きが {_fr:.1f}GB — 停滞の原因は"
+                        "満杯です (HFの拒否ではありません)")
                 log(f"⚠ DL停滞{int(stall)}秒 -> 打ち切って別経路で再試行 "
                     f"({tag})")
                 p.kill()
@@ -679,7 +801,7 @@ def _cache_size_ok(p: Path, log, label: str, expect: int = 0) -> bool:
 
 
 def _hf_download(repo: str, filename: str, log, attempts: int = 6,
-                 stall_secs: int = 90) -> str:
+                 stall_secs: int = 90, need_gb: float = 10.0) -> str:
     """モデルDLの多段フォールバック (v0.8.5-0.8.7)。
 
     実測 (2026-07-14): Colab VM→HFが429で即拒否 (IP/無料アカウントの
@@ -778,6 +900,7 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         # Driveに無いだけなら、HFから取得してDriveへ書き戻す=その場populate。
         # Illustrious等の新モデルをDrive固定が永久ブロックしない)
         raise _drive_only_error(filename, dsrc)
+    _ensure_disk_for(need_gb, log, f"{repo}/{filename}")
 
     def _ok(path: Path) -> bool:
         return path.is_file() and path.stat().st_size > _MIN_CACHE_BYTES
@@ -827,10 +950,8 @@ def _hf_download(repo: str, filename: str, log, attempts: int = 6,
         time.sleep(min(60, 5 * att))
     if not got:
         raise RuntimeError(
-            f"モデルDLが{attempts}回とも失敗: {repo}/{filename} — HF側の"
-            "429拒否 (IP/アカウントのDL割当) の可能性。①ランタイムを終了して"
-            "別VMを引き直す ②DriveキャッシュにGGUFを置く (ノートの"
-            "DRIVE_CACHEセル参照) のどちらかで回避できます")
+            f"モデルDLが{attempts}回とも失敗: {repo}/{filename}"
+            + _dl_fail_hint())
     _writeback(got)
     return got
 
@@ -899,7 +1020,8 @@ def _snap_writeback(local: Path, dsrc: Path, log) -> None:
     (dsrc / ".complete").touch()   # ← 木に対する最後の書き込み
 
 
-def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
+def _snapshot_local(repo: str, log, attempts: int = 5,
+                    need_gb: float = 15.0) -> str:
     """ベース部品リポ(VAE/UMT5/config類)をsymlink無しのプレーンdirへ取得
     (v0.8.7)。transformer重み(GGUF側で持つ)は除外して約12GBに抑える。
     Driveキャッシュがあれば最優先でコピー、DL成功時は書き戻し。
@@ -967,6 +1089,7 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         # 取得してDriveへ書き戻す=その場populate)
         raise _drive_only_error(f"ベース部品 {repo}",
                                 dsrc / ".complete" if dsrc else None)
+    _ensure_disk_for(need_gb, log, f"ベース部品 {repo}")
     ig = "['transformer/*.safetensors','transformer_2/*.safetensors','*.bin','*.md','.git*']"
     code = ("from huggingface_hub import snapshot_download; "
             f"snapshot_download({repo!r}, local_dir={str(local)!r}, "
@@ -986,9 +1109,7 @@ def _snapshot_local(repo: str, log, attempts: int = 5) -> str:
         time.sleep(min(60, 5 * att))
     if not ok:
         raise RuntimeError(
-            f"ベース部品のDLが{attempts}回とも失敗: {repo} — HF側の429拒否の"
-            "可能性。①ランタイム終了→別VM ②Driveキャッシュ (ノートの"
-            "DRIVE_CACHEセル) で回避できます")
+            f"ベース部品のDLが{attempts}回とも失敗: {repo}" + _dl_fail_hint())
     marker.touch()
     if dsrc is not None and not (dsrc / ".complete").is_file():
         try:
@@ -2724,6 +2845,115 @@ class IllustriousAdapter(VideoAdapter):
         # decodeで落ちる実測 (2026-07-14: 0.7と0.9は通ったのに0.8が
         # 「必要1.27GB/空き1.21GB」で失敗)
         del out
+        torch.cuda.empty_cache()
+        progress(0.98)
+        return dst
+
+
+@register
+class QwenImageAdapter(VideoAdapter):
+    """Qwen-Image (t2i/i2i) — Codex代替の正面立ち絵生成用。
+
+    ControlNet無しの素の拡散。参考画像があれば i2i、無ければ t2i。
+    リポジトリは VIDEOLAB_QWEN_REPO (既定 Qwen/Qwen-Image)。
+    未配備やdiffusers非対応環境では ensure_loaded が明示エラーを返す。
+    """
+    id = "qwen"
+    label = "Qwen-Image (正面立ち絵 t2i/i2i)"
+    desc = ("Qwen系画像モデルで正面フルボディを1枚生成。"
+            "工房のCodexフォールバック用。extra不要。")
+    requires = "Colab L4+/ローカル12GB+ (DL約20GB級・環境依存)"
+    modes = ("t2i", "i2i")
+    repo = os.environ.get("VIDEOLAB_QWEN_REPO", "Qwen/Qwen-Image")
+    cache_repos = (repo,)
+    disk_gb = 20
+    defaults = {"width": 768, "height": 1344, "num_frames": 1, "fps": 1,
+                "steps": 30, "guidance": 4.0}
+    NEG = ("worst quality, low quality, blurry, text, watermark, "
+           "extra limbs, deformed, cropped, multiple characters")
+
+    def __init__(self):
+        super().__init__()
+        self.pipe = None
+        self._i2i = None
+
+    def unload(self, log):
+        self.pipe = None
+        self._i2i = None
+        self.loaded = False
+
+    def ensure_loaded(self, log):
+        _require_deps(log)
+        import torch
+        try:
+            from diffusers import DiffusionPipeline
+        except Exception as e:
+            raise RuntimeError(
+                f"Qwen-Image に必要な diffusers が使えません: {e}") from e
+        log(f"Qwen-Image 読み込み: {self.repo}")
+        try:
+            pipe = DiffusionPipeline.from_pretrained(
+                self.repo, torch_dtype=torch.float16
+                if torch.cuda.is_available() else torch.float32)
+        except Exception as e:
+            raise RuntimeError(
+                f"Qwen-Image のロードに失敗しました ({self.repo}): {e}\n"
+                "VIDEOLAB_QWEN_REPO を確認するか stills_model=illustrious "
+                "へ切り替えてください") from e
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
+        self.pipe = pipe
+        self.loaded = True
+
+    def generate(self, req: GenRequest, workdir: Path, log,
+                 progress) -> Path:
+        import torch
+        if not self.loaded:
+            self.ensure_loaded(log)
+        w = _snap(req.width, 8, 512)
+        h = _snap(req.height, 8, 512)
+        steps = max(8, int(req.steps or 30))
+        g = torch.Generator("cpu").manual_seed(req.seed)
+        kw = dict(prompt=req.prompt,
+                  negative_prompt=req.negative or self.NEG,
+                  width=w, height=h,
+                  num_inference_steps=steps,
+                  guidance_scale=float(req.guidance or 4.0),
+                  generator=g)
+        pipe = self.pipe
+        if req.mode == "i2i" and req.images:
+            from diffusers import AutoPipelineForImage2Image
+            if self._i2i is None:
+                try:
+                    self._i2i = AutoPipelineForImage2Image.from_pipe(
+                        self.pipe)
+                except Exception:
+                    # from_pipe 非対応なら画像を無視して t2i
+                    log("Qwen i2i ファサード不可 — t2i にフォールバック")
+                    self._i2i = False
+            if self._i2i:
+                pipe = self._i2i
+                init = req.images[0].convert("RGB")
+                if init.size != (w, h):
+                    from PIL import Image as _PIL
+                    init = init.resize((w, h), _PIL.LANCZOS)
+                den = min(1.0, max(0.05, float(
+                    req.extra.get("denoise", 0.65))))
+                kw.update(image=init, strength=den)
+                log(f"qwen i2i: {w}x{h} steps={steps} denoise={den}")
+            else:
+                log(f"qwen t2i: {w}x{h} steps={steps}")
+        else:
+            log(f"qwen t2i: {w}x{h} steps={steps}")
+        try:
+            out = pipe(**kw)
+        except TypeError:
+            # 一部パイプラインは negative_prompt 非対応
+            kw.pop("negative_prompt", None)
+            out = pipe(**kw)
+        img = out.images[0] if hasattr(out, "images") else out[0]
+        dst = workdir / "out.png"
+        img.save(dst)
         torch.cuda.empty_cache()
         progress(0.98)
         return dst
@@ -6515,22 +6745,43 @@ def _wp_dynamic_pose_masks(canvas_rgb, allowed_generate_mask, pose_frames,
 
 
 def _wp_motion_prompt(pack: Path) -> str:
-    """パックのキャラ別モーション文 (母艦Codex作) を読む。
+    """パックのキャラ別モーション文を読む。
 
-    2026-07-21ユーザー要望「母艦のCodexに毎回動きを英語でプロンプト化
-    させ、GPUの動画プロンプトへ追加」。無し/壊れは空文字=注入なし。
-    英語以外・過長は破棄 (プロンプト汚染防止)。"""
+    母艦Codex作が本線。Codex枠切れ時は機械翻訳 (mt_en) で母艦が同梱した
+    文、または meta.concept からここで英語テンプレを合成する。
+    英語以外・過短は破棄 (プロンプト汚染防止)。"""
     p = pack / "01_generation" / "motion_prompt.txt"
-    if not p.is_file():
-        return ""
+    t = ""
+    if p.is_file():
+        try:
+            t = " ".join(p.read_text(encoding="utf-8",
+                                     errors="replace").split())[:600]
+        except Exception:                         # noqa: BLE001
+            t = ""
+    if len(t) >= 20 and sum(1 for c in t if ord(c) < 128) >= len(t) * 0.9:
+        return t
+    # 欠落/日本語汚染 → meta から機械翻訳テンプレを合成して保存
     try:
-        t = " ".join(p.read_text(encoding="utf-8",
-                                 errors="replace").split())[:600]
+        meta = _pack_meta(pack)
+        eng = None
+        for d in (ENGINE_PACK_DIR, HERE.parent / "engine", HERE / "engine_pack"):
+            if (d / "mt_en.py").is_file():
+                if str(d) not in sys.path:
+                    sys.path.insert(0, str(d))
+                import importlib
+                eng = importlib.import_module("mt_en")
+                break
+        if eng is None:
+            return ""
+        m = eng.ensure_meta_english(meta)
+        t2 = str(m.get("motion_prompt") or "").strip()[:600]
+        if len(t2) >= 20:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(t2, encoding="utf-8")
+            return t2
     except Exception:                             # noqa: BLE001
-        return ""
-    if len(t) < 20 or sum(1 for c in t if ord(c) < 128) < len(t) * 0.9:
-        return ""
-    return t
+        pass
+    return ""
 
 
 _WP_MOTION_CONTROLS = (
@@ -7219,18 +7470,22 @@ def _pack_extract(pid: str, raw: bytes, pack_kind: str = "walkpack") -> int:
 
     walkpackは従来どおり8方向PNGを必須にする。annexは一枚絵I2Vなので
     annex_source.png + annex_prompt_en.txtだけをルートへ展開し、8方向検査を
-    絶対に通さない。"""
-    if pack_kind not in ("walkpack", "annex"):
+    絶対に通さない。seedはCodexフォールバック用: meta+任意refのみで、
+    8方向は後段 _seed_build_stills が埋める。"""
+    if pack_kind not in ("walkpack", "annex", "seed"):
         raise ValueError(f"不正なパック種別です: {pack_kind}")
     annex = pack_kind == "annex"
+    seed = pack_kind == "seed"
     pack = (packs_root() / pid)
     root = packs_root()
     root.mkdir(parents=True, exist_ok=True)
     if pack.exists():
         shutil.rmtree(pack)
     sc = pack / "01_generation" / "split_centered"
-    if annex:
+    if annex or seed:
         pack.mkdir(parents=True)
+        if seed:
+            sc.mkdir(parents=True)
     else:
         sc.mkdir(parents=True)
     count = 0
@@ -7247,10 +7502,24 @@ def _pack_extract(pid: str, raw: bytes, pack_kind: str = "walkpack") -> int:
             if name == "meta.json":
                 dest = pack / "meta.json"
             elif annex and name in ("annex_source.png",
-                                    "annex_prompt_en.txt"):
+                                    "annex_prompt_en.txt",
+                                    "annex_prompt_ja.txt"):
                 dest = pack / name
             elif annex:
-                continue        # 分室は上の固定3ファイル以外を展開しない
+                continue        # 分室は上の固定ファイル以外を展開しない
+            elif seed and name == "ref.png":
+                dest = pack / "ref.png"
+            elif seed and name == "template.json":
+                dest = pack / "template.json"
+            elif seed and name == "motion_prompt.txt":
+                # Codex無し機械翻訳で母艦が同梱した歩行用英語モーション文
+                dest = pack / "01_generation" / "motion_prompt.txt"
+            elif seed and name.lower().endswith((".png", ".jpg", ".jpeg",
+                                                   ".webp")):
+                # 誤って置かれた立ち絵は sc へ (部分シード)
+                dest = sc / name
+            elif seed:
+                continue
             elif name == "landmarks.json":
                 dest = pack / "01_generation" / "landmarks.json"
             elif name == "face_boxes.json":
@@ -7274,6 +7543,8 @@ def _pack_extract(pid: str, raw: bytes, pack_kind: str = "walkpack") -> int:
                 dest = sc / name
             else:
                 continue        # 想定外の拡張子は置かない
+            # pack がまだ無いと resolve が失敗するので先に親を掘る
+            dest.parent.mkdir(parents=True, exist_ok=True)
             rd = dest.resolve()
             if not str(rd).startswith(str(pack.resolve()) + os.sep):
                 raise ValueError(f"不正な展開先: {info.filename}")
@@ -7281,20 +7552,47 @@ def _pack_extract(pid: str, raw: bytes, pack_kind: str = "walkpack") -> int:
                 data = f.read(120 * 2**20 + 1)
             if len(data) > 120 * 2**20:
                 raise ValueError(f"ファイルが大きすぎます: {name}")
-            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             count += 1
     if annex:
-        missing = [name for name in ("annex_source.png",
-                                     "annex_prompt_en.txt")
-                   if not (pack / name).is_file()]
-        if missing:
-            shutil.rmtree(pack, ignore_errors=True)
-            raise ValueError(f"分室パックのファイルが不足しています: {missing}")
-        meta_p = pack / "meta.json"
+        # 英訳文は必須。原画は need_keyframe なら GPU で後から作るので任意。
         meta = _pack_meta(pack)
+        need_kf = bool(meta.get("need_keyframe"))
+        has_en = (pack / "annex_prompt_en.txt").is_file()
+        has_img = (pack / "annex_source.png").is_file()
+        if not has_en:
+            # meta.prompt_en があればファイル化して救済
+            pe = str(meta.get("prompt_en") or "").strip()
+            if pe:
+                (pack / "annex_prompt_en.txt").write_text(pe, encoding="utf-8")
+                has_en = True
+        if not has_en:
+            shutil.rmtree(pack, ignore_errors=True)
+            raise ValueError("分室パックに annex_prompt_en.txt がありません")
+        if not has_img:
+            need_kf = True
+            meta["need_keyframe"] = True
         meta.setdefault("type", "annex_i2v")
         meta.setdefault("name", pid)
+        meta["created"] = time.time()
+        (pack / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        return count
+    if seed:
+        meta_p = pack / "meta.json"
+        if not meta_p.is_file():
+            shutil.rmtree(pack, ignore_errors=True)
+            raise ValueError("シードパックに meta.json がありません")
+        meta = _pack_meta(pack)
+        if str(meta.get("stills_source") or "") != "gpu_turntable":
+            # 明示フラグが無くても seed 種別なら付与 (旧シード救済)
+            meta["stills_source"] = "gpu_turntable"
+        meta.setdefault("name", pid)
+        meta.setdefault("char_id", pid[:12])
+        meta.setdefault("leg_scale", 1.0)
+        meta.setdefault("cell_w", 64)
+        meta.setdefault("cell_h", 128)
+        meta.setdefault("stills_model", "illustrious")
         meta["created"] = time.time()
         meta_p.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
                           encoding="utf-8")
@@ -8059,12 +8357,322 @@ def _wp_kind(name: str) -> str:
     return "other"
 
 
+def _seed_import_gpu_stills():
+    """engine_pack または 隣接 engine/ から gpu_stills を読む。"""
+    import importlib
+    candidates = []
+    if ENGINE_PACK_DIR.is_dir():
+        candidates.append(ENGINE_PACK_DIR)
+    # SpriteMill/engine (ローカル開発) と videolab 隣接
+    candidates.append(HERE.parent / "engine")
+    candidates.append(HERE / "engine_pack")
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        p = d / "gpu_stills.py"
+        if not p.is_file():
+            continue
+        if str(d) not in sys.path:
+            sys.path.insert(0, str(d))
+        try:
+            return importlib.import_module("gpu_stills")
+        except Exception:
+            continue
+    raise RuntimeError(
+        "gpu_stills.py が見つかりません "
+        f"(探した場所: {[str(c) for c in candidates]})")
+
+
+def _seed_front_pose_png(meta: dict, w: int, h: int):
+    """正面直立の OpenPose 1枚 (Illustrious ControlNet用)。
+
+    v0.11.50: マネキン画像を黒地へ貼って build_canvas_pose_frames に
+    渡していたが、あれは歩行キャンバス (方向グリッド) 用の入口で、単体
+    画像を渡すと足が画面外へはみ出す骨格を返していた (2026-07-22の
+    実走で確認)。歩行本線と同じ build_walk_pose_frames の**直立コマ**を
+    そのまま使う — ref無し・adapt無しなら cx=中央 / base_y=0.93h /
+    全高0.86h で必ず画面内に収まり、頭身も leg_scale どおりに出る。"""
+    eng = _engine()
+    pv = eng["pose_video"]
+    leg = max(0.6, min(4.0, float(meta.get("leg_scale") or 1.0)))
+    frames = pv.build_walk_pose_frames(
+        "front", 8, w, h, ref_image=None, leg_scale=leg,
+        adapt=False, arms=True, yaw_adapt=False)
+    return frames[0].convert("RGB")   # walk_layout 先頭 = 直立 (IDLE_POSE)
+
+
+def _seed_decode_mp4_frames(mp4: Path, log) -> list:
+    """mp4 → PILフレーム列 (ffmpeg)。"""
+    from PIL import Image as _PIL
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpegが見つかりません (ターンテーブル切り出し)")
+    work = mp4.parent / "_tt_frames"
+    if work.is_dir():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(mp4),
+           str(work / "%05d.png")]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ターンテーブルmp4のフレーム抽出がタイムアウト")
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg frame extract failed: {r.stderr[-400:]}")
+    paths = sorted(work.glob("*.png"))
+    if len(paths) < 8:
+        raise RuntimeError(f"ターンテーブルフレームが足りません: {len(paths)}")
+    frames = [_PIL.open(p).convert("RGB") for p in paths]
+    log(f"ターンテーブル: {len(frames)} フレームを抽出")
+    return frames
+
+
+def _seed_mock_stills(pack: Path, meta: dict, log) -> None:
+    """mock経路: 8方向の単色プレースホルダ立ち絵を書く。"""
+    from PIL import Image as _PIL, ImageDraw
+    gs = _seed_import_gpu_stills()
+    char = str(meta.get("char_id") or "seed")
+    cw = int(meta.get("cell_w") or 64) * 4
+    ch = int(meta.get("cell_h") or 128) * 4
+    colors = {
+        "front": (220, 80, 80), "left": (80, 180, 80),
+        "right": (80, 80, 220), "back": (200, 200, 60),
+        "front_left": (220, 140, 80), "front_right": (220, 80, 180),
+        "back_left": (80, 200, 200), "back_right": (160, 80, 220),
+    }
+    crops = {}
+    for d, col in colors.items():
+        im = _PIL.new("RGB", (cw, ch), (255, 0, 255))
+        body = _PIL.new("RGB", (cw // 2, int(ch * 0.75)), col)
+        im.paste(body, (cw // 4, ch // 8))
+        dr = ImageDraw.Draw(im)
+        dr.text((8, 8), d, fill=(255, 255, 255))
+        crops[d] = gs.tight_crop_magenta(im)
+    sc = pack / "01_generation" / "split_centered"
+    gs.write_centered_crops(crops, sc, char)
+    log(f"mock立ち絵: 8方向を {sc} に書き出し")
+
+
+def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
+    """シードパックから正面→AniSora Low回転→8方向立ち絵を生成する。
+
+    walkpack スレッド内で呼ぶ (submit_job は worker_loop が処理)。
+    """
+    from PIL import Image as _PIL
+    gs = _seed_import_gpu_stills()
+    pack = packs_root() / pid
+    sc = pack / "01_generation" / "split_centered"
+    char, refs = _pack_refs_dir(pack)
+    if len(refs) >= 8:
+        log("立ち絵8方向が既にあるためGPU立ち絵をスキップ")
+        return
+    if j.get("_wp_mock"):
+        _seed_mock_stills(pack, meta, log)
+        return
+
+    model = str(meta.get("stills_model")
+                or os.environ.get("VIDEOLAB_STILLS_MODEL")
+                or "illustrious").strip().lower()
+    if model not in ("illustrious", "qwen"):
+        model = "illustrious"
+    # Qwenが未配備なら Illustrious へ自動退避
+    if model == "qwen" and "qwen" not in ADAPTERS:
+        log("qwenアダプタ無し → illustrious へ切替")
+        model = "illustrious"
+    char = str(meta.get("char_id") or char or "seed")
+    seed = int(time.time()) % (2 ** 31)
+    ref_path = pack / "ref.png"
+    ref_img = None
+    if ref_path.is_file():
+        ref_img = _PIL.open(ref_path).convert("RGB")
+
+    # ---- 0) 依頼文の英語化 (Codex無し・機械翻訳) ----
+    try:
+        import importlib
+        mt = None
+        for d in (ENGINE_PACK_DIR, HERE.parent / "engine", HERE / "engine_pack"):
+            if (d / "mt_en.py").is_file():
+                if str(d) not in sys.path:
+                    sys.path.insert(0, str(d))
+                mt = importlib.import_module("mt_en")
+                break
+        if mt is not None:
+            meta = mt.ensure_meta_english(dict(meta or {}))
+            mp = pack / "01_generation" / "motion_prompt.txt"
+            if not mp.is_file() and meta.get("motion_prompt"):
+                mp.parent.mkdir(parents=True, exist_ok=True)
+                mp.write_text(str(meta["motion_prompt"])[:600], encoding="utf-8")
+            (pack / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+            log(f"依頼プロンプト英語化: backends="
+                f"{meta.get('_mt_backends') or meta.get('mt_source')}")
+    except Exception as e:                # noqa: BLE001
+        log(f"英語化スキップ: {str(e)[:120]}")
+
+    # ---- 1) 正面立ち絵 ----
+    j["detail"] = f"GPU立ち絵: {model} 正面生成"
+    log(f"GPU立ち絵フォールバック開始 (model={model})")
+    if model == "qwen":
+        prompt = gs.concept_to_qwen_prompt(meta)
+        fw, fh = 768, 1344
+        neg = gs.stills_negative(meta, QwenImageAdapter.NEG)
+        extra: dict = {}
+        mode = "i2i" if ref_img is not None else "t2i"
+        images = [ref_img] if ref_img is not None else []
+        if ref_img is not None:
+            extra["denoise"] = float(
+                os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.65") or 0.65)
+        steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "30") or 30)
+        cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "4.0") or 4.0)
+    else:
+        prompt = gs.concept_to_illustrious_prompt(meta)
+        fw = int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768)
+        fh = int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344)
+        fw, fh = _snap(fw, 8, 512), _snap(fh, 8, 512)
+        pose = _seed_front_pose_png(meta, fw, fh)
+        pose_path = pack / "01_generation" / "seed_front_pose.png"
+        pose_path.parent.mkdir(parents=True, exist_ok=True)
+        pose.save(pose_path)
+        buf = io.BytesIO()
+        pose.save(buf, format="PNG")
+        extra = {
+            "pose_image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "controlnet_scale": float(
+                os.environ.get("VIDEOLAB_STILLS_CN", "0.95") or 0.95),
+        }
+        neg = gs.stills_negative(meta, IllustriousAdapter.NEG)
+        mode = "i2i" if ref_img is not None else "t2i"
+        images = [ref_img] if ref_img is not None else []
+        if ref_img is not None:
+            extra["denoise"] = float(
+                os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.7") or 0.7)
+        steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "28") or 28)
+        cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "6.0") or 6.0)
+        for cfgp in (HERE.parent / "config.json", HERE / "config.json"):
+            try:
+                hft = str(json.loads(cfgp.read_text(encoding="utf-8"))
+                          .get("hf_token") or "").strip()
+                if hft:
+                    extra["hf_token"] = hft
+                    break
+            except Exception:
+                pass
+
+    try:
+        jid1 = submit_job(model, GenRequest(
+            mode=mode, prompt=prompt, negative=neg, images=images,
+            width=fw, height=fh, num_frames=1, fps=1, steps=steps,
+            seed=seed, guidance=cfg, extra=extra))
+        sj1 = _wp_wait(j, jid1, 0.02, 0.25)
+    except Exception as e:                # noqa: BLE001
+        if model != "illustrious" and "illustrious" in ADAPTERS:
+            log(f"{model} 正面生成失敗 → illustrious 再試行: {str(e)[:160]}")
+            model = "illustrious"
+            # Illustrious で作り直し
+            prompt = gs.concept_to_illustrious_prompt(meta)
+            fw = _snap(int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768),
+                       8, 512)
+            fh = _snap(int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344),
+                       8, 512)
+            pose = _seed_front_pose_png(meta, fw, fh)
+            buf = io.BytesIO()
+            pose.save(buf, format="PNG")
+            extra = {
+                "pose_image_b64": base64.b64encode(
+                    buf.getvalue()).decode("ascii"),
+                "controlnet_scale": 0.95,
+            }
+            jid1 = submit_job("illustrious", GenRequest(
+                mode="t2i", prompt=prompt,
+                negative=gs.stills_negative(meta, IllustriousAdapter.NEG),
+                images=[], width=fw, height=fh, num_frames=1, fps=1,
+                steps=28, seed=seed, guidance=6.0, extra=extra))
+            sj1 = _wp_wait(j, jid1, 0.02, 0.25)
+        else:
+            raise
+    front_path = Path(str(sj1.get("path") or ""))
+    if not front_path.is_file():
+        raise RuntimeError("正面立ち絵の生成結果がありません")
+    front = _PIL.open(front_path).convert("RGB")
+    front = gs.key_to_magenta(front)
+    front_save = pack / "01_generation" / "seed_front.png"
+    front.save(front_save)
+    log(f"正面立ち絵完了: {front_save.name}")
+
+    # ---- 2) AniSora Low ターンテーブル (360°) ----
+    j["detail"] = "GPU立ち絵: AniSora Low ターンテーブル"
+    tt_nf = int(os.environ.get("VIDEOLAB_TURNTABLE_FRAMES", "81") or 81)
+    tt_nf = max(9, ((tt_nf - 1) // 4) * 4 + 1)  # 4k+1
+    # 短辺480基準で縦横比維持
+    iw, ih = front.size
+    scale = 480.0 / min(iw, ih)
+    tw = max(480, int(round(iw * scale / 16)) * 16)
+    th = max(480, int(round(ih * scale / 16)) * 16)
+    motion = float(os.environ.get("VIDEOLAB_TURNTABLE_MOTION", "4.0") or 4.0)
+    tt_steps = int(os.environ.get("VIDEOLAB_TURNTABLE_STEPS", "6") or 6)
+    tt_extra = {
+        "anisora_low_only": True,
+        "motion_score": motion,
+        "quant": os.environ.get("VIDEOLAB_ANISORA_QUANT", "Q4_0") or "Q4_0",
+    }
+    # offload はVRAM状況に任せる (L4等)
+    jid2 = submit_job("anisora", GenRequest(
+        mode="i2v", prompt=gs.TURNTABLE_PROMPT,
+        negative=gs.TURNTABLE_NEGATIVE, images=[front],
+        width=tw, height=th, num_frames=tt_nf, fps=16,
+        steps=tt_steps, seed=seed + 1, guidance=1.0, extra=tt_extra))
+    sj2 = _wp_wait(j, jid2, 0.25, 0.70)
+    tt_mp4 = Path(str(sj2.get("path") or ""))
+    if not tt_mp4.is_file():
+        raise RuntimeError("ターンテーブルmp4がありません")
+    tt_dest = pack / "01_generation" / "seed_turntable.mp4"
+    shutil.copy2(tt_mp4, tt_dest)
+    log(f"ターンテーブル完了: {tt_dest.name}")
+
+    # ---- 3) 8方向切り出し + センタリング ----
+    j["detail"] = "GPU立ち絵: 8方向切り出し"
+    frames = _seed_decode_mp4_frames(tt_dest, log)
+    crops = gs.extract_turntable_dirs(frames)
+    # 正面は生成原画を優先 (回転0°のブレ防止)
+    front_crop = gs.tight_crop_magenta(front)
+    crops["front"] = front_crop
+    # スケールを正面に揃える
+    th0 = front_crop.size[1]
+    for d, c in list(crops.items()):
+        if d == "front":
+            continue
+        if abs(c.size[1] - th0) > max(4, th0 * 0.08):
+            s = th0 / max(1, c.size[1])
+            crops[d] = c.resize(
+                (max(1, int(round(c.size[0] * s))), th0), _PIL.LANCZOS)
+    gs.write_centered_crops(crops, sc, char)
+    # meta に経路証跡
+    meta = dict(meta)
+    meta["stills_source"] = "gpu_turntable"
+    meta["stills_model"] = model
+    meta["stills_built"] = time.time()
+    (pack / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    log(f"8方向立ち絵を書き出し: {sc} ({len(crops)}枚)")
+    j["detail"] = "GPU立ち絵完了 → 歩行生成へ"
+
+
 def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
     """walk_pack 本体: 半球2キャンバス x (VACE 4step -> AniSora latent再加工)
     -> セル分割 -> 簡易シート/プレビュー。compass_vace._run_layout の
     latent_refine 分岐のサーバ内部版 (submit_job で自サーバの実ジョブを
     投入し、このオーケストレーションスレッドが完了をポーリングする)。"""
     _wp_apply_pose_defaults()     # 姿勢の既定値 (腕/脚の振り・上下動・交差)
+    # Codexフォールバック: 8方向が無いシードは先にGPUで埋める
+    _src = str((meta or {}).get("stills_source") or "")
+    _char0, _refs0 = _pack_refs_dir(packs_root() / pid)
+    if _src == "gpu_turntable" or len(_refs0) < 8:
+        if len(_refs0) < 8:
+            log("立ち絵不足/シードパック → GPU立ち絵生成へ")
+            _seed_build_stills(j, pid, meta or {}, log)
+            # meta が更新されている可能性
+            meta = _pack_meta(packs_root() / pid)
+            j["progress"] = max(float(j.get("progress") or 0), 0.72)
     plan_raw = str((meta or {}).get("body_plan") or "biped").strip() or "biped"
     # 体格メニュー8種 (2026-07-21ユーザー要望): 亜種はベース体格へ正規化し、
     # 差分は文面/骨格モードで表現する。
@@ -9594,19 +10202,145 @@ _GCS_CT = {".mp4": "video/mp4", ".webp": "image/webp", ".png": "image/png",
            ".gif": "image/gif", ".json": "application/json"}
 
 
+def _annex_ensure_english_prompt(pack: Path) -> str:
+    """分室の英語プロンプトを読み、日本語なら機械翻訳で直す。"""
+    prompt_path = pack / "annex_prompt_en.txt"
+    ja_path = pack / "annex_prompt_ja.txt"
+    prompt = ""
+    if prompt_path.is_file():
+        prompt = " ".join(prompt_path.read_text(
+            encoding="utf-8", errors="replace").split())[:2000]
+    meta = _pack_meta(pack)
+    if not prompt:
+        prompt = " ".join(str(meta.get("prompt_en") or "").split())[:2000]
+    # 英語として十分か
+    ascii_ok = (len(prompt) >= 5
+                and sum(ord(c) < 128 for c in prompt) >= len(prompt) * 0.75)
+    if ascii_ok:
+        return prompt
+    # Codex訳が欠落/日本語汚染 → mt_en
+    src = prompt
+    if ja_path.is_file():
+        src = ja_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not src:
+        src = str(meta.get("prompt_ja") or prompt or "").strip()
+    try:
+        eng = None
+        for d in (ENGINE_PACK_DIR, HERE.parent / "engine", HERE / "engine_pack"):
+            if (d / "mt_en.py").is_file():
+                if str(d) not in sys.path:
+                    sys.path.insert(0, str(d))
+                import importlib
+                eng = importlib.import_module("mt_en")
+                break
+        if eng is not None:
+            en, be = eng.to_english(src)
+            en = " ".join((en or "").split())[:2000]
+            if len(en) >= 5:
+                prompt_path.write_text(en, encoding="utf-8")
+                _wp_print(f"[annex] プロンプト英訳補完 MT ({be})")
+                return en
+    except Exception as e:  # noqa: BLE001
+        _wp_print(f"[annex] MT補完失敗: {str(e)[:120]}")
+    if not prompt:
+        prompt = f"Anime cinematic scene: {src}"[:2000]
+        prompt_path.write_text(prompt, encoding="utf-8")
+    return prompt
+
+
+def _annex_ensure_keyframe(pack: Path, prompt: str, mock: bool = False) -> Path:
+    """Codex画像が無い分室パック向け: GPUで16:9キーフレームを1枚生成する。
+
+    規定は illustrious t2i (ダミー骨格)、無ければ qwen、mock、の順。
+    v0.11.49: 既定を qwen から illustrious へ。qwenは実測で約57GBを
+    引きに行き、動画モデル約100GBが常駐する作業ディスクを一撃で満杯に
+    する (2026-07-22実障害。立ち絵フォールバックのDLごと道連れになった)。
+    illustriousは立ち絵フォールバックが必ず要求する7GBの同じ重みを
+    使い回すので、画像モデルはディスク上に1つで済む。
+    qwenを使うなら VIDEOLAB_ANNEX_MODEL=qwen (要 約60GBの空き)。
+    """
+    from PIL import Image as _PIL
+    dest = pack / "annex_source.png"
+    if dest.is_file() and dest.stat().st_size > 1000:
+        return dest
+    if mock or "mock" in ADAPTERS and os.environ.get(
+            "VIDEOLAB_ANNEX_MOCK_KEYFRAME", "").strip() in ("1", "on"):
+        # 単色プレースホルダ
+        im = _PIL.new("RGB", (1280, 720), (40, 44, 72))
+        im.save(dest)
+        _wp_print("[annex] mock キーフレームを生成")
+        return dest
+    w, h = 1280, 720
+    seed = int(time.time()) % (2 ** 31)
+    want = (os.environ.get("VIDEOLAB_ANNEX_MODEL", "").strip().lower()
+            or "illustrious")
+    order = ([want] if want in ("illustrious", "qwen") else []) + [
+        "illustrious", "qwen"]
+    model = next((m for m in order if m in ADAPTERS), "mock")
+    extra = {}
+    if model == "illustrious":
+        # 風景なので骨格は黒一枚 (ControlNet必須契約を満たすだけ)
+        pose = _PIL.new("RGB", (w, h), (0, 0, 0))
+        buf = io.BytesIO()
+        pose.save(buf, format="PNG")
+        extra = {
+            "pose_image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "controlnet_scale": 0.15,
+        }
+    t2i_prompt = (
+        "Cinematic 16:9 anime keyframe still, polished illustration, "
+        "no text, no watermark, no border. " + prompt
+    )[:1800]
+    jid = submit_job(model if model != "mock" else "mock", GenRequest(
+        mode="t2i", prompt=t2i_prompt, negative=(
+            "text, watermark, logo, border, collage, character sheet, "
+            "low quality, blurry"),
+        images=[], width=w, height=h, num_frames=1, fps=1,
+        steps=28 if model == "illustrious" else 30,
+        seed=seed, guidance=6.0 if model == "illustrious" else 4.0,
+        extra=extra))
+    # annex は walkpack スレッド外 (_gcs_process_one) から呼ばれるので
+    # ジョブ完了をここでポーリングする
+    for _ in range(900):  # 最大~30分
+        time.sleep(2)
+        sj = JOBS.get(jid)
+        if not sj:
+            raise RuntimeError("annex keyframe job missing")
+        st = sj.get("status")
+        if st == "done":
+            src = Path(str(sj.get("path") or ""))
+            if not src.is_file():
+                raise RuntimeError("annex keyframe path missing")
+            shutil.copy2(src, dest)
+            _wp_print(f"[annex] キーフレーム生成完了 ({model})")
+            return dest
+        if st in ("error", "cancelled"):
+            raise RuntimeError(
+                f"annex keyframe {st}: {str(sj.get('detail') or '')[:300]}")
+    raise RuntimeError("annex keyframe timeout")
+
+
 def _submit_annex_i2v(pid: str, mock: bool = False) -> str:
-    """分室パックの原画+英訳文を通常AniSora I2Vジョブへ投入する。"""
+    """分室パックの原画+英訳文を通常AniSora I2Vジョブへ投入する。
+
+    Codex枠切れ時: 英訳は mt_en で補完、原画は GPU t2i で補完してから I2V。
+    """
     import math
     from PIL import Image
     pack = packs_root() / pid
-    image_path = pack / "annex_source.png"
-    prompt_path = pack / "annex_prompt_en.txt"
-    if not image_path.is_file() or not prompt_path.is_file():
-        raise RuntimeError("分室パックにannex_source.png/英訳文がありません")
-    prompt = " ".join(prompt_path.read_text(
-        encoding="utf-8", errors="replace").split())[:2000]
+    meta = _pack_meta(pack)
+    prompt = _annex_ensure_english_prompt(pack)
     if not prompt:
         raise RuntimeError("分室の英訳プロンプトが空です")
+    image_path = pack / "annex_source.png"
+    if (meta.get("need_keyframe") or not image_path.is_file()):
+        image_path = _annex_ensure_keyframe(pack, prompt, mock=mock)
+        meta["need_keyframe"] = False
+        meta["image_source"] = meta.get("image_source") or "gpu_keyframe"
+        (pack / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    if not image_path.is_file():
+        raise RuntimeError("分室パックにannex_source.pngがありません")
     image = Image.open(image_path).convert("RGB")
     iw, ih = image.size
     # walkpackと近い総画素数で縦横比を保ち、Wanの16倍数制約へ揃える。
@@ -9635,10 +10369,40 @@ def _gcs_process_one(req: dict, wait: bool = True):
     # 分室は8方向PNGを持たない。一枚絵パックを通常extractへ入れた時点で
     # 「8方向PNG不足」になるため、展開より前に種別を決める。requestの種別
     # フィールドが古い中継で欠けても annex_ pack_id なら救済する。
+    # seed (Codexフォールバック) も同様に8方向無し — metaの
+    # stills_source=gpu_turntable で判定 (zip内peek)。
     annex = (req.get("room") == "annex"
              or req.get("request_type") == "annex_i2v"
              or pid.startswith("annex_"))
-    _pack_extract(pid, blob, "annex" if annex else "walkpack")
+    seed = False
+    if not annex:
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                if "meta.json" in zf.namelist():
+                    _m = json.loads(zf.read("meta.json").decode("utf-8"))
+                    seed = (str(_m.get("stills_source") or "")
+                            == "gpu_turntable")
+                # 8方向PNGが無ければシード扱い (明示フラグ欠落の救済)
+                if not seed:
+                    pngs = [n for n in zf.namelist()
+                            if n.lower().endswith("_centered.png")
+                            or (n.lower().endswith(".png")
+                                and "centered" in n.lower())]
+                    has_ref_only = any(
+                        PurePosixPath(n).name == "ref.png"
+                        for n in zf.namelist())
+                    if len(pngs) < 8 and (
+                            has_ref_only
+                            or any("meta.json" == PurePosixPath(n).name
+                                   for n in zf.namelist())):
+                        # conceptだけのseed (PNG0枚) も通す
+                        names = [PurePosixPath(n).name for n in zf.namelist()]
+                        if "meta.json" in names and len(pngs) < 8:
+                            seed = True
+        except Exception:                 # noqa: BLE001
+            seed = False
+    kind = "annex" if annex else ("seed" if seed else "walkpack")
+    _pack_extract(pid, blob, kind)
     req["status"] = "generating"
     req["error"] = ""
     _gcs_req_save(req)
@@ -9786,6 +10550,13 @@ def _gcs_pick_pack_ready():
 def _gcs_worker_loop() -> None:
     _wp_print(f"[GCS] ワーカー開始 (bucket={GCS_BUCKET or _GCS_FAKE}, "
               f"poll={_GCS_POLL_SEC}s)")
+    # 前回以前の作業dir残骸を起動時に一掃 (v0.11.49)。VMは呼び起こし運用で
+    # 何度も起き直すので、ここが実質「毎依頼の前」になる
+    try:
+        _prune_work_scratch(_wp_print, keep_hours=1.0)
+        _wp_print(f"[GCS] 作業ディスクの空き {_disk_free_gb():.1f}GB")
+    except Exception as e:                        # noqa: BLE001
+        _wp_print(f"[GCS] 作業ディスク掃除をスキップ: {str(e)[:120]}")
     while True:
         try:
             if _GCS_STOPPING[0]:                  # 停止決定後は新規請負なし
@@ -9797,7 +10568,12 @@ def _gcs_worker_loop() -> None:
                 # 進める — 大きいzipのDL中に猶予満了→電源断の競合防止
                 _LAST_GCS_WORK[0] = time.time()
                 _GCS_INFLIGHT[0] = (rid, str(req.get("pack_id") or ""))
-                _wp_print(f"[GCS] 取り込み {rid} pack={req.get('pack_id')}")
+                _wp_print(f"[GCS] 取り込み {rid} pack={req.get('pack_id')} "
+                          f"(disk free {_disk_free_gb():.1f}GB)")
+                try:
+                    _prune_work_scratch(_wp_print, keep_hours=6.0)
+                except Exception:                 # noqa: BLE001
+                    pass
                 try:
                     _gcs_process_one(req)
                     _wp_print(f"[GCS] 完了 {rid}")
