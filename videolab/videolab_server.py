@@ -135,7 +135,21 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.70"
+__version__ = "0.11.72"
+# 0.11.72: 背景抜きを「縁から連結した背景だけ」へ (ユーザー提案「画像生成
+# のあとにキャラだけで背景抜きして、マゼンタに張り替えてからローテート
+# するほうが良い」)。旧実装は色距離のしきい値だけで塗り潰しており、背景と
+# 同系色の衣装に穴が開き (灰背景×灰チャイナで胴が消えた)、逆にキャラ内部の
+# 明るい面も抜けた。縁からの連結に限ればキャラの内側は色が近くても抜けない。
+# ★生成そのものは中立グレー地のまま — マゼンタ地を注文するとパレット全体が
+# 引っ張られる実測があり、ユーザー指摘「マゼンタ背景が画像生成能力に影響
+# しているのかも」と同じ方向。マゼンタ化はこの張り替え1箇所だけで行う。
+# 0.11.71: 正面コマ探しの前後判定を「front指示書との絶対距離」から
+# 「front指示書とback指示書の**相対**距離」へ (ユーザー報告「正面として
+# 取得されていたのが背面でした」)。別キャラの指示書との絶対値は信号が
+# 薄く、正面/背面はどちらも左右対称なので前後を分けきれない。差なら符号
+# として効く。★ただし今回の実障害の主因は入力がクリーチャーで前後が定義
+# できなかったこと — そちらは0.11.70の見た目検査で回す前に止める。
 # 0.11.70: ターンテーブルへ回す前に「成立している見た目」を検査する
 # (ユーザー指示)。回転は渡された絵を増幅するので、分身・浮いた欠片・
 # 見切れを抱えたまま回すと8方向すべてがクリーチャーになる (2026-07-23の
@@ -9177,7 +9191,17 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         _ff = gs.facing_ref_path(kind="front")
         if _ff is not None:
             ref_front = _PIL.open(_ff).convert("RGB")
-    front_idx = gs.find_front_index(frames, ref_front)
+    ref_back = None
+    for cand in (pack / "facing_ref_back.png",
+                 pack / "01_generation" / "facing_ref_back.png"):
+        if cand.is_file():
+            ref_back = _PIL.open(cand).convert("RGB")
+            break
+    if ref_back is None:
+        _fb = gs.facing_ref_path(kind="back")
+        if _fb is not None:
+            ref_back = _PIL.open(_fb).convert("RGB")
+    front_idx = gs.find_front_index(frames, ref_front, ref_back)
     if front_idx:
         log(f"正面コマを回転内から検出: フレーム{front_idx}/{len(frames)} "
             "(立ち絵が正面向きでなかったため0コマ目を使わない)")

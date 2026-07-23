@@ -481,7 +481,8 @@ def facing_ref_path(posesets_dir=None, kind: str = "right"):
     較正の出典がC17なので、差し替え式の現行poseset (色分け人形・左右が
     ほぼ対称) では代用しない — 感度が落ちて誤判定側に倒れる
     (pipeline._facing_margin_vs_poseset の注記と同じ理由)。"""
-    name = "front_1.png" if kind == "front" else "right_1.png"
+    name = {"front": "front_1.png",
+            "back": "back_1.png"}.get(kind, "right_1.png")
     root = Path(posesets_dir) if posesets_dir else (
         Path(__file__).resolve().parent.parent / "posesets")
     here = Path(__file__).resolve().parent
@@ -495,7 +496,7 @@ def facing_ref_path(posesets_dir=None, kind: str = "right"):
     return None
 
 
-def find_front_index(frames, ref_front=None) -> int:
+def find_front_index(frames, ref_front=None, ref_back=None) -> int:
     """360°回転の中から**本当の正面コマ**を選ぶ。
 
     ★立ち絵が正面向きに描かれるとは限らない (実走で後ろ姿・斜めが出た)。
@@ -504,13 +505,17 @@ def find_front_index(frames, ref_front=None) -> int:
     0フレーム目ではなく、360度の中から正面の絵を選ぶ」)。
     判定は2つの合成:
       ① 左右対称性 — 正面と背面だけが鏡映対称に近い
-      ② C17 front指示書との近さ — 正面と背面を分ける
+      ② front指示書とback指示書の**相対**距離 — 前後を分ける
+    ★②を「front指示書との絶対距離」でやると弱すぎて背面を正面と誤る
+    (2026-07-23実走で実際に背面が選ばれた)。別キャラの指示書との絶対値は
+    意味が薄いが、front寄りかback寄りかの**差**なら符号として効く。
     測れないときは 0 (従来動作) を返す。"""
     import numpy as np
     n = len(frames or [])
     if n < 4:
         return 0
-    g = _norm64(ref_front) if ref_front is not None else None
+    gf = _norm64(ref_front) if ref_front is not None else None
+    gb = _norm64(ref_back) if ref_back is not None else None
     best, best_score = 0, None
     for i in range(n):
         a = _norm64(key_to_magenta(frames[i]))
@@ -518,8 +523,11 @@ def find_front_index(frames, ref_front=None) -> int:
             continue
         sym = float(np.abs(a - a[:, ::-1]).mean())      # 小さいほど対称
         score = sym
-        if g is not None:
-            score = sym + 0.6 * float(np.abs(a - g).mean())
+        if gf is not None and gb is not None:
+            score += 1.2 * (float(np.abs(a - gf).mean())
+                            - float(np.abs(a - gb).mean()))
+        elif gf is not None:
+            score += 0.6 * float(np.abs(a - gf).mean())
         if best_score is None or score < best_score:
             best, best_score = i, score
     return best
@@ -612,14 +620,51 @@ def turntable_frame_index(n_frames: int, direction: str,
 
 
 def key_to_magenta(img, thr: int = 60):
-    """一様背景をマゼンタへ置換 (SDXLがベージュ地を塗る実測への後処理)。"""
+    """キャラだけを残して背景をマゼンタへ張り替える。
+
+    ★「縁から連結している背景だけ」を抜く (2026-07-23ユーザー提案「画像
+    生成のあとにキャラだけで背景抜きして、マゼンタに張り替えてから
+    ローテート処理するほうが良い」)。旧実装は色距離のしきい値だけで
+    塗り潰していたため、背景と同系色の衣装に穴が開き (灰背景×灰チャイナ
+    で胴が消えた)、逆にキャラ内部の明るい面まで抜けた。縁からの連結に
+    限れば、キャラの内側は色が近くても絶対に抜けない。
+    生成そのものは中立グレー地で描かせている (マゼンタ地を注文すると
+    パレット全体が引っ張られる実測) ので、張り替えはここが唯一の場所。"""
     import numpy as np
     from PIL import Image
     a = np.asarray(img.convert("RGB")).astype(int)
+    h, w = a.shape[:2]
     border = np.concatenate([a[0, :], a[-1, :], a[:, 0], a[:, -1]])
     bgc = np.median(border, axis=0)
-    mask = np.abs(a - bgc).sum(axis=2) < thr
-    a[mask] = MAGENTA
+    near = np.abs(a - bgc).sum(axis=2) < thr        # 背景色に近い画素
+    # 縁を種にした連結拡張 (行/列のrun単位で伝播: scipy不要・全解像度)
+    reach = np.zeros(near.shape, dtype=bool)
+    reach[0, :] |= near[0, :]
+    reach[-1, :] |= near[-1, :]
+    reach[:, 0] |= near[:, 0]
+    reach[:, -1] |= near[:, -1]
+    rid_v = np.cumsum(~near, axis=0, dtype=np.int32)
+    rid_h = np.cumsum(~near, axis=1, dtype=np.int32)
+
+    def _fill(rc, rid, axis, rev):
+        if rev:
+            rc = rc[::-1] if axis == 0 else rc[:, ::-1]
+            rid = rid[::-1] if axis == 0 else rid[:, ::-1]
+        acc = np.maximum.accumulate(np.where(rc, rid, -1), axis=axis)
+        f = acc == rid
+        return (f[::-1] if axis == 0 else f[:, ::-1]) if rev else f
+
+    prev = -1
+    for _ in range(8):                              # 実画像は2-3周で収束
+        cur = int(reach.sum())
+        if cur == prev:
+            break
+        prev = cur
+        reach |= _fill(reach, rid_v, 0, False) & near
+        reach |= _fill(reach, rid_v, 0, True) & near
+        reach |= _fill(reach, rid_h, 1, False) & near
+        reach |= _fill(reach, rid_h, 1, True) & near
+    a[reach] = MAGENTA
     return Image.fromarray(a.astype("uint8"), "RGB")
 
 
@@ -756,6 +801,7 @@ def build_seed_pack_zip(req: dict, rid: str = "",
     # パックへ同梱する
     fr = facing_ref_path()
     fr_front = facing_ref_path(kind="front")
+    fr_back = facing_ref_path(kind="back")
     if fr is not None:
         meta["facing_ref"] = fr.name
     buf = io.BytesIO()
@@ -766,6 +812,8 @@ def build_seed_pack_zip(req: dict, rid: str = "",
             z.write(fr, "facing_ref_right.png")
         if fr_front is not None:
             z.write(fr_front, "facing_ref_front.png")
+        if fr_back is not None:
+            z.write(fr_back, "facing_ref_back.png")
         if motion_en:
             z.writestr("motion_prompt.txt", motion_en)
         if ref_bytes:
