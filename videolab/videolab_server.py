@@ -135,7 +135,20 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.79"
+__version__ = "0.11.80"
+# 0.11.80: 足踏みの錨を「静止区間限定」へ (ユーザー報告「錨が多いのか、
+# 歩きにくくなりました」)。0.11.78 の等間隔ストライドは錨を歩行区間の
+# 内側へ落としていた — walk_layout(57)= idle 0-5 / 歩行 6-48 / 末尾静止
+# 49-56 に対し march_anchors=3 は stride28 で [0,28,56]、frame28 が歩行
+# 2周期のど真ん中。書き込む画像は全フレーム同じ立ち絵なので「周期の途中で
+# 直立へ戻れ」の拘束になり、モデルの最小努力解が「振りを小さくする」へ
+# 化けていた。錨の"強さ"ではなく"中身"の問題で、0.11.78 の「画像ガイダンスは
+# 軽いから中央を足しても死なない」は理由になっていなかった。旧ノブ範囲
+# 2-5 のうち歩行区間を汚さないのは 2 だけ (4->frame18,36 / 5->14,28,42)。
+# 対策は既定を2に戻すだけでなく置き場所の是正: guidance mask に明示
+# インデックス指定 "sparse@0,50,56" を追加し、錨は idle と末尾静止の中
+# だけに配る。歩行区間 [idle_n, gait_end] は常に無錨、両端 0/nf-1 は常に
+# 含む (0.11.77 のループ閉じ=回転止めは維持)。
 # 0.11.79: プロンプトから "wind" と props/effects/particles の列挙を撤去
 # (ユーザー報告「やけに風が吹いている感じの動画」)。guidance=1.0=CFG無効
 # なので "no wind" は否定にならず wind を条件へ撒くだけ — "the cape" と
@@ -2740,12 +2753,26 @@ class _WanA14BBase(VideoAdapter):
         sparse = (mode in ("official", "official_sparse", "sparse")
                   or mode.startswith("sparse"))
         sparse_stride = 8
-        if sparse and mode.startswith("sparse"):
+        explicit: list[int] = []
+        if sparse and mode.startswith("sparse@"):
+            # 明示インデックス指定 "sparse@0,3,50,56" (0.11.80)。等間隔
+            # ストライドだと錨が歩行区間の内側へ落ちる (57f/3錨 -> frame28 が
+            # 歩行2周期のど真ん中) ため、置き場所を呼び側が決められるように
+            # する。歩行区間へ立ち姿を書き込む拘束は「振りを小さくする」形で
+            # 満たされてしまい、足踏みが死ぬ。
+            try:
+                explicit = sorted({
+                    max(0, min(num_frames - 1, int(t)))
+                    for t in mode[len("sparse@"):].split(",") if t.strip()})
+            except ValueError:
+                explicit = []
+        elif sparse and mode.startswith("sparse"):
             try:
                 sparse_stride = max(1, int(mode[len("sparse"):]))
             except ValueError:
                 sparse_stride = 8
-        selected = list(range(0, num_frames, sparse_stride))
+        selected = (explicit if explicit
+                    else list(range(0, num_frames, sparse_stride)))
         if selected[-1] != num_frames - 1:
             selected.append(num_frames - 1)
 
@@ -6574,6 +6601,37 @@ WALKPACK_NF = 57                 # 直立6+歩行2周期+末尾静止8 (walk_lay
 WALKPACK_W, WALKPACK_H = 480, 864   # 2x2 x セル240x432
 WALKPACK_FPS = 16
 
+
+def march_anchor_frames(nf: int, idle_n: int, gait_end: int,
+                        n: int) -> list[int]:
+    """足踏みの立ち絵アンカーを置くフレーム番号 (0.11.80)。
+
+    錨は**静止区間にしか置かない**。歩行区間 [idle_n, gait_end] へ立ち絵を
+    書き込むと「周期の途中で直立へ戻れ」という拘束になり、モデルにとっての
+    最小努力解が「振りを小さくする」に化ける (2026-07-23ユーザー報告
+    「錨が多いのか、歩きにくくなりました」)。0.11.78 の等間隔ストライドは
+    まさにそれをしていた: walk_layout(57) の歩行区間は 6-48 なのに
+    march_anchors=3 -> stride28 -> [0, 28, 56] で frame28 が歩行のど真ん中。
+
+    両端 (0 と nf-1) は必ず含む — 同じ立ち姿へ留めることで一周ぶんの回転が
+    溜まらずループも閉じる (0.11.77 の回転止め)。"""
+    nf = max(2, int(nf))
+    idle_n = max(0, min(int(idle_n), nf))
+    gait_end = max(-1, min(int(gait_end), nf - 1))
+    n = max(2, int(n))
+    still = sorted(set(range(0, max(1, idle_n)))
+                   | set(range(min(nf - 1, gait_end + 1), nf)))
+    if len(still) <= n:
+        anchors = list(still)
+    else:
+        step = (len(still) - 1) / float(n - 1)
+        anchors = sorted({still[int(round(i * step))] for i in range(n)})
+    if anchors[0] != 0:
+        anchors.insert(0, 0)
+    if anchors[-1] != nf - 1:
+        anchors.append(nf - 1)
+    return anchors
+
 # 生成の既定詳細設定 (2026-07-19 ユーザー指定)。母艦アプリの config.json と
 # 同じ値をクラウド側 (walkpack) の既定にも入れ、どちらの経路でも絵が揃う。
 # 環境変数が入っていればそちらが優先 (実験用の逃げ道)。
@@ -9986,24 +10044,31 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             j["detail"] = f"[{tag}] AniSora単体・足踏み"
             log(f"[{tag}] AniSora Low単体・素のi2v (骨なし・VACE不使用): "
                 f"参照キャンバス1枚から{nf}f、motion=4")
-            # ★両端だけを立ち絵で錨止めする (2026-07-23ユーザー報告
-            # 「リファイン源抜いたら、錨を入れないと周り出してます」)。
-            # refine源(静止動画)を渡すと動かず、何も渡さないと回る。
-            # sparse guidance なら「指定した時刻にだけ画像を書き込み、
-            # 間は自由」なので、ストライド=フレーム数で [0, 最終] の
-            # 2枚だけになる。先頭と終端が同じ立ち姿に固定されれば、
-            # 回転は一周ぶん溜められない (ループも閉じる)。
-            # 錨の数はノブ (既定3=先頭・中央・終端)。latent固定と違って
-            # 画像ガイダンスは軽いので、中央を足しても動きは死なない
-            # (2026-07-23ユーザー「中央も入れたほうが良いかも」)。
-            _anchor_n = _wp_knob_int(_kn, "march_anchors", 3, 2, 5)
-            _anchor_stride = max(1, (nf - 1) // max(1, _anchor_n - 1))
+            # ★立ち絵の錨は「静止区間にしか置かない」(2026-07-23ユーザー報告
+            # 「錨が多いのか、歩きにくくなりました」)。
+            # 錨が要る理由は 0.11.77 のまま (refine源=静止動画だと動かず、
+            # 無錨だとAniSoraの回転priorで回る。両端を同じ立ち姿に留めれば
+            # 一周ぶんの回転が溜まらずループも閉じる) だが、0.11.78 で足した
+            # 等間隔ストライドが錨を歩行区間の内側へ落としていた:
+            #   walk_layout(57) = idle 0-5 / 歩行 6-48 (2周期) / 末尾静止 49-56
+            #   march_anchors=3 -> stride 28 -> [0, 28, 56] で frame28 が歩行の
+            #   ど真ん中。書き込む画像は全フレーム同じ立ち絵なので「周期の
+            #   途中で直立へ戻れ」という拘束になり、モデルの最小努力解が
+            #   「振りを小さくする」に化ける。錨の強さではなく中身の問題で、
+            #   0.11.78 の「画像ガイダンスは軽いから死なない」は理由になって
+            #   いなかった。ノブ範囲 2-5 のうち安全なのは 2 だけだった。
+            # 以後は歩行区間 [idle_n, gait_end] を必ず空け、idle と末尾静止の
+            # 中だけに錨を配る (両端 0 / nf-1 は常に含む = ループ閉じは維持)。
+            _anchor_n = _wp_knob_int(_kn, "march_anchors", 2, 2, 6)
+            _anchors = march_anchor_frames(nf, idle_n, gait_end, _anchor_n)
+            log(f"[{tag}] 錨={_anchors} (歩行区間 {idle_n}-{gait_end} は無錨)")
             extra2 = {
                 "anisora_low_only": True,
                 "motion_score": _wp_knob_float(_kn, "motion", 4.0, 2.0, 4.0),
                 "anisora_guidance_frames_b64":
                     pv.encode_frames_b64([canvas] * nf),
-                "anisora_guidance_mask": f"sparse{_anchor_stride}",
+                "anisora_guidance_mask":
+                    "sparse@" + ",".join(str(i) for i in _anchors),
             }
             if offload:
                 extra2["offload"] = offload
