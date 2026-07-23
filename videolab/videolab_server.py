@@ -135,7 +135,14 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.66"
+__version__ = "0.11.67"
+# 0.11.67: 歩行をAniSora Low単体・骨なし・その場足踏みへ (ユーザー指示
+# 「VACEハイは顔ごと変えてしまうので骨指定せず、歩行もAniSoraローで全部。
+# 回転しないようその場足踏み。1フレーム目と中間と終端は立ち絵にして、
+# 動きの強さを4に」)。latent源=立ち絵をnf枚並べた静止列、先頭/中間/終端を
+# latent固定、motion=4。プロンプトも「足が同じ場所へ戻る足踏み」へ書き換え
+# (移動を命じると移動できないぶんが回転へ化けるため)。三段handoffへ戻すのは
+# extra.triple_handoff_321_force。
 # 0.11.66: ①歩行キャンバスを**対向ペア4枚**へ (ユーザー指示「8方向一発は
 # 解像度的に難有り」)。前後/左右/左前右後/右前左後で、セルは 240x432 →
 # 480x864 = 1体あたり画素4倍。②正面コマを360°の中から探す (立ち絵が正面
@@ -7936,35 +7943,29 @@ _WP_HOVER_PROMPT = (
 # 再建を促す語は入れない。キャラ別の具体的な動きは母艦Codexの
 # motion_promptが後置で完成させる。
 _WP_AI_PROMPT = (
-    "A game character animation. The character performs continuous, clear, "
-    "readable in-place locomotion for the entire video. Complete at least "
-    "two full locomotion cycles without pausing: one side of the body leads, "
-    "then the opposite side leads, with unmistakably different poses at the "
-    "quarter points of each cycle. Limbs or equivalent body parts articulate, "
-    "weight visibly shifts, and the torso responds naturally. This is a real "
-    "animation cycle, never a still image, pose morph, or barely moving idle. "
-    "The motion continues rhythmically from start to finish. Keep "
-    "the character's identity, outfit, colors, proportions, and number of "
-    "limbs consistent throughout the cycle. "
-    # ★マント発明の抑制 (2026-07-23)。★★否定形で書いてはいけない:
-    # この経路は guidance=1.0 = CFG無効で、負の分岐は評価すらされない。
-    # 「no cape, cloak, mantle」と書くと打ち消しにならず cape/cloak/mantle
-    # という語を条件へ撒くだけになる (0.11.58の実装がまさにこれで、実測
-    # では back_left の1コマで不透明画素の38.6%がマントだった)。
-    # 肩と背中の実シルエットを肯定文で述べるに留める。
+    # ★その場足踏み (2026-07-23ユーザー指示)。VACEを外しAniSora単体に
+    # した経路では「歩く」と言うと画面内を移動しようとし、移動できない
+    # ぶんが体の回転へ化ける。命じるのは**足踏み**= 足が同じ場所へ戻る
+    # 運動そのもの。錨 (先頭/中間/終端の立ち絵) と語彙を一致させる。
+    "A game character animation. The character marches in place: the "
+    "knees lift and lower in a clear steady rhythm, one leg at a time, "
+    "and each foot comes back down on the very same spot it left. "
+    "Complete at least two full stepping cycles without pausing, with "
+    "unmistakably different leg positions between the lifts, while the "
+    "arms swing naturally and the torso responds to the weight shift. "
+    "This is a real animation cycle, never a still image and never a "
+    "barely moving idle. The character returns to the upright standing "
+    "pose at the middle and at the end of the cycle so the motion loops "
+    "seamlessly. Keep the character's identity, outfit, colors, "
+    "proportions, and number of limbs consistent throughout. "
     "The character's shoulders and back keep exactly the same silhouette "
     "as the reference image, with the flat background visible right up to "
     "the body outline from every angle. "
-    # ★歩きを強く命じ、回転を封じる (2026-07-23ユーザー指示)。VACE Lowを
-    # 抜いて仕上げをAniSora Lowへ委ねると、AniSoraの回転priorが効きやすい
-    # ぶん「歩かずに回る」方向へ流れやすい。否定語は使わず (CFG無効)、
-    # 歩幅と接地という**やること**を具体的に書いて上書きする。
-    "The legs take big unmistakable strides with a clear swing and a clear "
-    "stance on every step, one foot planted while the other travels; the "
-    "walk is the whole content of the animation. Each figure keeps the "
-    "exact facing it starts with for every single frame, as if pinned to "
-    "that angle, and the feet stay on the same spot on the ground."
+    "The whole body stays over the same footprint on the ground and keeps "
+    "the exact facing it starts with for every single frame, as if pinned "
+    "to that angle."
 )
+
 
 _WP_AI_CELL_LOCK = (
     " Every figure stays centered in its own cell and keeps facing its own "
@@ -9862,6 +9863,48 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 pass
             log(f"[{tag}] 実験legs_mask={_fracL}: 上=実画素凍結 / "
                 "下=脚骨格入り生成 (idle/静止=全身実画素)")
+        if _exp.get("anisora_march", True) and not _exp.get(
+                "triple_handoff_321_force"):
+            # ★本線 (2026-07-23ユーザー指示): VACEを完全に外し、AniSora Low
+            # 単体で足踏みまで済ませる。VACE Highは顔ごと描き換えてしまう
+            # ため骨格指定も廃止。回転を止める仕掛けは「立ち絵の錨」:
+            #   ・latent源 = 立ち絵をフレーム数ぶん並べた静止列 (骨なし)
+            #   ・先頭 / 中間 / 終端の3コマを立ち絵へ latent固定
+            #   ・その間だけ AniSora が動きを作る = その場足踏み
+            # 錨が「立ち姿」なので周期の節目で必ず立ち姿へ戻り、向きが
+            # 流れない (回転priorを構造で殺す)。動きの強さは motion=4。
+            _march_sigma = _wp_knob_float(_kn, "march_sigma", 0.90, 0.60, 0.95)
+            _march_pins = sorted({0, nf // 2, nf - 1})
+            j["detail"] = f"[{tag}] AniSora単体・足踏み"
+            log(f"[{tag}] AniSora Low単体 (骨なし・VACE不使用): "
+                f"立ち絵を{nf}f並べてσ{_march_sigma:.2f}で再加工、"
+                f"フレーム{_march_pins}を立ち絵へ固定 (回転止め)、"
+                "motion=4")
+            _still_seq = [canvas] * nf
+            extra2 = {
+                "anisora_low_only": True,
+                "refine_frames_b64": pv.encode_frames_b64(_still_seq),
+                "refine_strength": _march_sigma,
+                "refine_cond_still": True,
+                "latent_pin_frames": _march_pins,
+                "motion_score": _wp_knob_float(_kn, "motion", 4.0, 2.0, 4.0),
+            }
+            if offload:
+                extra2["offload"] = offload
+            _st_m = _wp_knob_int(_kn, "march_steps", 8, 4, 24)
+            _wm_m = "mock" if j.get("_wp_mock") else "anisora"
+            _jid_m = submit_job(_wm_m, GenRequest(
+                mode="i2v", prompt=prompt, images=[canvas],
+                width=w, height=h, num_frames=nf, fps=WALKPACK_FPS,
+                steps=_st_m, seed=seed, guidance=1.0, extra=extra2))
+            _sj_m = _wp_wait(j, _jid_m, s1lo, s2hi)
+            cvid = out / f"canvas_{tag}.mp4"
+            shutil.copy2(_sj_m["path"], cvid)
+            j["detail"] = f"[{tag}] セル分割"
+            _wp_split(eng, ffmpeg, cvid, layout, refs, char, out,
+                      idle_n, gait_end if tail else None, log,
+                      canvas_w=w, canvas_h=h)
+            return
         if _exp.get("triple_handoff_321"):
             # 採用構成 (2026-07-23ユーザー指示で二段へ): 1本のnoise latentを
             # 途中decode/re-encodeせず引き継ぐ。**VACE Lowを抜き、仕上げは
