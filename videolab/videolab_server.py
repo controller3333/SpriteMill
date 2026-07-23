@@ -135,7 +135,14 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.62"
+__version__ = "0.11.63"
+# 0.11.63: 歩行の仕上げをAniSora Lowへ一任 (ユーザー指示「VACEロー抜いて、
+# 仕上げ部分をAniSoraローに一任。歩きを強めに命じ回転しないように」)。
+# VACE High 3step → AniSora Low 3step の二段へ (骨は切替時に破棄済み=
+# AniSoraにOpenPose入口が無い問題は元から回避されている)。Lightning LoRAは
+# VACE Lowが居なくても高ノイズ側だけで成立するよう緩和。歩幅と接地を
+# 具体的に命じ、facingを毎フレーム固定する肯定文を追加 (CFG無効なので
+# 否定語は使えない)。VACE Lowへ戻すノブ= admin vace_low_steps。
 # 0.11.62: マント発明の真因を実プロンプトで確定 — compass_vace.NO_WIND の
 # "the cape, hair and clothes hang naturally" が、否定ですらない**肯定の
 # 断言**として全経路に入っていた (歩行は guidance=1.0 = CFG無効なので
@@ -5053,9 +5060,11 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
         else:
             log("latent直結: AniSora High要素LoRAは比較用に無効")
         if lightning4:
-            if vlow is None:
-                raise RuntimeError(
-                    "hybrid_lightning4にはhybrid_vace_low_steps>=1が必要です")
+            # ★VACE Lowを外した二段構成 (VACE High → AniSora Low) でも
+            # Lightningは成立する — Highに当てる高ノイズ側LoRAが本体で、
+            # 低ノイズ側はVACE Lowが居るときだけ載せればよい
+            # (2026-07-23ユーザー指示「VACEロー抜いて仕上げはAniSoraロー
+            # に一任」)。以前はここで無条件に例外にしていた。
             rep = os.environ.get("VIDEOLAB_VACE_LORA_REPO",
                                  "lightx2v/Wan2.2-Lightning")
             fold = os.environ.get(
@@ -5066,16 +5075,19 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
             try:
                 _lh = Path(_hf_download(
                     rep, f"{fold}/high_noise_model.safetensors", log))
-                _ll = Path(_hf_download(
-                    rep, f"{fold}/low_noise_model.safetensors", log))
                 self.pipe.load_lora_weights(
                     str(_lh.parent), adapter_name="lightning",
                     weight_name=_lh.name)
-                self.pipe.load_lora_weights(
-                    str(_ll.parent), adapter_name="lightning_2",
-                    weight_name=_ll.name, load_into_transformer_2=True)
-                adapter_names[:0] = ["lightning", "lightning_2"]
-                adapter_weights[:0] = [1.0, 1.0]
+                adapter_names[:0] = ["lightning"]
+                adapter_weights[:0] = [1.0]
+                if vlow is not None:
+                    _ll = Path(_hf_download(
+                        rep, f"{fold}/low_noise_model.safetensors", log))
+                    self.pipe.load_lora_weights(
+                        str(_ll.parent), adapter_name="lightning_2",
+                        weight_name=_ll.name, load_into_transformer_2=True)
+                    adapter_names[1:1] = ["lightning_2"]
+                    adapter_weights[1:1] = [1.0]
             except Exception as e:
                 raise RuntimeError(
                     "三段handoffのLightning 4step LoRAを適用できません"
@@ -7927,7 +7939,16 @@ _WP_AI_PROMPT = (
     # 肩と背中の実シルエットを肯定文で述べるに留める。
     "The character's shoulders and back keep exactly the same silhouette "
     "as the reference image, with the flat background visible right up to "
-    "the body outline from every angle."
+    "the body outline from every angle. "
+    # ★歩きを強く命じ、回転を封じる (2026-07-23ユーザー指示)。VACE Lowを
+    # 抜いて仕上げをAniSora Lowへ委ねると、AniSoraの回転priorが効きやすい
+    # ぶん「歩かずに回る」方向へ流れやすい。否定語は使わず (CFG無効)、
+    # 歩幅と接地という**やること**を具体的に書いて上書きする。
+    "The legs take big unmistakable strides with a clear swing and a clear "
+    "stance on every step, one foot planted while the other travels; the "
+    "walk is the whole content of the animation. Each figure keeps the "
+    "exact facing it starts with for every single frame, as if pinned to "
+    "that angle, and the feet stay on the same spot on the ground."
 )
 
 _WP_AI_CELL_LOCK = (
@@ -9151,10 +9172,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             "engine": "vace_anisora_handoff",
             "directions": len(_WP_DIRS),
             "steps": 6,
-            "stage_steps": {"vace_high": 3, "vace_low": 2,
-                            "anisora_low": 1},
+            # 2026-07-23: VACE Lowを抜き仕上げはAniSora Lowへ一任
+            "stage_steps": {"vace_high": 3, "vace_low": 0,
+                            "anisora_low": 3},
             "vace_high_loras": ["lightning4", "anisora_high_elements"],
-            "vace_low_loras": ["lightning4"],
+            "vace_low_loras": [],
             "anisora_low_loras": [],
             "motion_control": _motion_kind,
             "gait": _motion_gait,
@@ -9695,26 +9717,34 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             log(f"[{tag}] 実験legs_mask={_fracL}: 上=実画素凍結 / "
                 "下=脚骨格入り生成 (idle/静止=全身実画素)")
         if _exp.get("triple_handoff_321"):
-            # 採用構成: 1本のnoise latentを途中decode/re-encodeせず三段で
-            # 引き継ぐ。Lightning 4step LoRAはVACE High/Lowだけ、Kijaiの
-            # AniSora High要素LoRAはHighだけ、回転priorの強いnative
-            # AniSora Lowは終端1stepだけに限定する。
-            j["detail"] = f"[{tag}] 三段6step 3:2:1"
+            # 採用構成 (2026-07-23ユーザー指示で二段へ): 1本のnoise latentを
+            # 途中decode/re-encodeせず引き継ぐ。**VACE Lowを抜き、仕上げは
+            # AniSora Lowに一任**する — VACE Lowは骨格追従のために入れて
+            # いたが、骨が要るのは構図が決まるHigh側で、仕上げまでVACEに
+            # 委ねると絵がVACE寄りになる。AniSora段には骨を渡していない
+            # (切替時に control_cond を破棄) ので、終盤はアニメ画の事前分布
+            # だけで詰められる。VACE Lowへ戻すなら extra.hybrid_vace_low
+            # _steps を1以上に。
+            _v_low = _wp_knob_int(_kn, "vace_low_steps", 0, 0, 4)
+            _ani_low = max(1, 6 - 3 - _v_low)
+            j["detail"] = (f"[{tag}] 二段6step 3:{_ani_low}" if not _v_low
+                           else f"[{tag}] 三段6step 3:{_v_low}:{_ani_low}")
             _triple_extra = {
                 "quant": "Q4_0",
                 "vace_base": "fun",
                 "vace_lora": "anisora_high",
                 "hybrid_lightning4": True,
-                "hybrid_vace_low_steps": 2,
-                "hybrid_low_steps": 1,
+                "hybrid_vace_low_steps": _v_low,
+                "hybrid_low_steps": _ani_low,
                 "conditioning_scale": 1.0,
                 "pose_frames_b64": pv.encode_frames_b64(frames),
             }
             if offload:
                 _triple_extra["offload"] = offload
-            log(f"[{tag}] 三段latent直結: VACE High 3step "
-                "(Lightning4+AniSora要素LoRA) → VACE Low 2step "
-                "(Lightning4) → AniSora Low 1step")
+            log(f"[{tag}] latent直結: VACE High 3step "
+                "(Lightning4+AniSora要素LoRA) → "
+                + (f"VACE Low {_v_low}step → " if _v_low else "")
+                + f"AniSora Low {_ani_low}step (骨は切替時に破棄)")
             _wm321 = "mock" if j.get("_wp_mock") else "vace_anisora_handoff"
             _jid321 = submit_job(_wm321, GenRequest(
                 mode="i2v", prompt=prompt, images=[canvas],
