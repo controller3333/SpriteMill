@@ -593,6 +593,30 @@ def measure_rotation_sense(frames: list, ref_right=None,
     return (1 if score > 0 else -1), score
 
 
+def front_back_swapped(crop_front, crop_back,
+                       ref_front=None, ref_back=None) -> bool:
+    """切り出した front/back が入れ替わっているか。
+
+    ★正面コマの推定は1枚だけを見る賭けなので外れる (2026-07-23実走で
+    背面が正面として選ばれた)。切り出した後なら「front枠の絵」と
+    「back枠の絵」の2枚を突き合わせられるので、こちらの方が確実。
+    front枠がback指示書寄りで、かつ back枠がfront指示書寄りなら反転。"""
+    import numpy as np
+    gf = _norm64(ref_front) if ref_front is not None else None
+    gb = _norm64(ref_back) if ref_back is not None else None
+    af = _norm64(crop_front)
+    ab = _norm64(crop_back)
+    if gf is None or gb is None or af is None or ab is None:
+        return False
+
+    def _d(x, g):
+        return float(np.abs(x - g).mean())
+    # 「今の割り当て」と「入れ替えた割り当て」で総距離を比べる
+    now = _d(af, gf) + _d(ab, gb)
+    swap = _d(af, gb) + _d(ab, gf)
+    return swap < now - 1.0          # 明確に良いときだけ入れ替える
+
+
 def turntable_order(sense: int) -> tuple:
     """実測した回り方 → スロット順。判定不能(0)は右回り既定。"""
     return TURNTABLE_LEFT_FIRST if sense < 0 else TURNTABLE_RIGHT_FIRST

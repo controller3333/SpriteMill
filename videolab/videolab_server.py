@@ -135,7 +135,14 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.72"
+__version__ = "0.11.73"
+# 0.11.73: ①前後の割り当てを切り出し後に検証して、逆なら半周ずらして
+# 取り直す (ユーザー報告「前後・斜め前後が逆」— 実シートで1行目=後頭部・
+# 4行目=顔だった)。1枚だけ見て正面を当てる賭けより、front枠とback枠の
+# 2枚を指示書と突き合わせる方が確実。②足踏みの錨を先頭と終端だけに
+# (ユーザー指示「中央に錨があると歩かないかも」)。中間を立ち姿へ固定すると
+# その前後が立ち姿へ補間されて動きが痩せる。両端だけならループは閉じたまま
+# 中は自由に動ける。
 # 0.11.72: 背景抜きを「縁から連結した背景だけ」へ (ユーザー提案「画像生成
 # のあとにキャラだけで背景抜きして、マゼンタに張り替えてからローテート
 # するほうが良い」)。旧実装は色距離のしきい値だけで塗り潰しており、背景と
@@ -9217,6 +9224,17 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
             f"{order[2]} として切り出します")
     crops = gs.extract_turntable_dirs(frames, order=order,
                                       front_idx=front_idx)
+    # ★切り出した2枚で前後を検証し、逆なら半周ずらして取り直す
+    # (2026-07-23ユーザー報告「前後・斜め前後が逆」)。1枚で正面を当てる
+    # 賭けより、front枠とback枠を突き合わせる方が確実に効く。
+    if gs.front_back_swapped(crops.get("front"), crops.get("back"),
+                             ref_front, ref_back):
+        half = max(1, (len(frames) - 1) // 2)
+        front_idx = (front_idx + half) % max(1, len(frames) - 1)
+        log(f"前後が逆でした — 正面を半周ずらして取り直します "
+            f"(front={front_idx})")
+        crops = gs.extract_turntable_dirs(frames, order=order,
+                                          front_idx=front_idx)
     # 正面は生成原画を優先 (回転0°のブレ防止)
     # 正面コマが回転の先頭 (=生成した立ち絵そのもの) のときだけ原画を
     # 優先する。回転の途中から採ったならそちらが本当の正面なので触らない
@@ -9944,7 +9962,11 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             # 錨が「立ち姿」なので周期の節目で必ず立ち姿へ戻り、向きが
             # 流れない (回転priorを構造で殺す)。動きの強さは motion=4。
             _march_sigma = _wp_knob_float(_kn, "march_sigma", 0.90, 0.60, 0.95)
-            _march_pins = sorted({0, nf // 2, nf - 1})
+            # ★中間の錨は外す (2026-07-23ユーザー指示「中央に錨が
+            # あると歩かないかもしれません。最初とラストだけでいいかも」)。
+            # 中間を立ち姿へ固定すると、その前後が立ち姿へ補間されて
+            # 動きが痩せる。両端だけならループは閉じたまま中は自由。
+            _march_pins = sorted({0, nf - 1})
             j["detail"] = f"[{tag}] AniSora単体・足踏み"
             log(f"[{tag}] AniSora Low単体 (骨なし・VACE不使用): "
                 f"立ち絵を{nf}f並べてσ{_march_sigma:.2f}で再加工、"
