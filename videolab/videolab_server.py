@@ -135,7 +135,12 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.56"
+__version__ = "0.11.57"
+# 0.11.57: ①AI経路の歩行をコンパス3x3の一発生成へ戻した (ユーザー指示。
+# 1方向ずつ8本描くと方向ごとに別人・別衣装へ散るため。escape=layout
+# "single") ②生成中の中継: 進捗と段階を10秒毎に依頼へ書き、生成途中の
+# latentを軽量デコードした小さなJPEGを live/<rid>.jpg へ上げる (画像段は
+# TAESD、動画段は本物VAEで最終フレーム1枚。失敗しても生成は止めない)。
 # 0.11.56: 「歩行段が衣装を落とす」の真因はキーだった (ユーザー指摘
 # 「マゼンタの服を着せていたから」)。背景と同系色の服は key_to_magenta が
 # 背景ごと塗り潰し、胴がRGB(255,0,255)=穴になる。歩行段は無実。対策=
@@ -1480,10 +1485,122 @@ def _frames_to_mp4(frames, fps: int, workdir: Path, log) -> Path:
     return dest
 
 
+# ---------------------------------------------------------------- ライブ中継
+# 依頼者が20分以上「生成中」の一言だけを見せられる状態を解消する
+# (2026-07-23ユーザー要望「生成中の様子をTAESDとかで工房側に映せない?」)。
+# 生成途中のlatentを軽量デコードして小さなJPEGにし、GCSワーカーが
+# live/<rid>.jpg として上げる。受付台はそれを貼るだけ。
+_LIVE = {"jpeg": None, "seq": 0, "at": 0.0}
+_TAESD: dict = {}
+
+
+def _live_sec() -> float:
+    """中継の最短間隔 (秒)。0/offで無効。"""
+    v = (os.environ.get("VIDEOLAB_LIVE_SEC", "12") or "12").strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return 0.0
+    try:
+        return max(3.0, float(v))
+    except ValueError:
+        return 12.0
+
+
+def _live_put(jpeg: bytes) -> None:
+    _LIVE["jpeg"] = jpeg
+    _LIVE["seq"] += 1
+    _LIVE["at"] = time.time()
+
+
+def _live_take(last_seq: int):
+    """(jpeg, seq) — 新しいものが無ければ (None, last_seq)。"""
+    if _LIVE["jpeg"] is not None and _LIVE["seq"] != last_seq:
+        return _LIVE["jpeg"], _LIVE["seq"]
+    return None, last_seq
+
+
+def _taesd_for(pipe):
+    """SDXL用の極小デコーダ (TAESD)。無ければ None (静かに諦める)。"""
+    if "sdxl" in _TAESD:
+        return _TAESD["sdxl"]
+    _TAESD["sdxl"] = None
+    try:
+        import torch
+        from diffusers import AutoencoderTiny
+        repo = os.environ.get("VIDEOLAB_TAESD_REPO", "madebyollin/taesdxl")
+        vae = AutoencoderTiny.from_pretrained(repo, torch_dtype=torch.float16)
+        _TAESD["sdxl"] = vae.to(pipe.vae.device if hasattr(pipe, "vae")
+                                else "cuda")
+    except Exception:                         # noqa: BLE001
+        pass
+    return _TAESD["sdxl"]
+
+
+def _live_jpeg_from_latents(pipe, latents) -> bytes | None:
+    """生成途中のlatent -> 小さなJPEG。失敗は必ず None (生成は止めない)。
+
+    画像(4D)=TAESD、動画(5D)=本物のVAEで最終フレーム1枚だけデコード
+    (Wan系にはdiffusers標準の極小デコーダが無いため。1枚なら実測1秒未満で、
+    間隔を空けて呼ぶので生成時間にはほぼ効かない)。"""
+    try:
+        import numpy as np
+        import torch
+        from PIL import Image as _I
+        with torch.no_grad():
+            x = latents
+            if x.ndim == 5:                    # [B,C,T,H,W] 動画
+                x = x[:1, :, -1:]
+                vae = getattr(pipe, "vae", None)
+                if vae is None:
+                    return None
+                sc = getattr(vae.config, "scaling_factor", 1.0) or 1.0
+                mean = getattr(vae.config, "latents_mean", None)
+                std = getattr(vae.config, "latents_std", None)
+                z = x.to(vae.dtype)
+                if mean is not None and std is not None:
+                    m = torch.tensor(mean, device=z.device,
+                                     dtype=z.dtype).view(1, -1, 1, 1, 1)
+                    s = torch.tensor(std, device=z.device,
+                                     dtype=z.dtype).view(1, -1, 1, 1, 1)
+                    z = z / sc * s + m
+                else:
+                    z = z / sc
+                img = vae.decode(z).sample[:, :, 0]
+            else:                              # [B,C,H,W] 画像
+                vae = _taesd_for(pipe)
+                if vae is None:
+                    return None
+                z = latents[:1].to(vae.dtype).to(vae.device)
+                img = vae.decode(
+                    z / getattr(vae.config, "scaling_factor", 1.0)).sample
+            a = ((img[0].float().clamp(-1, 1) + 1) * 127.5)
+            a = a.permute(1, 2, 0).cpu().numpy().astype("uint8")
+            im = _I.fromarray(a)
+            w = 320
+            im = im.resize((w, max(1, round(im.height * w / im.width))),
+                           _I.BILINEAR)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=70)
+            return buf.getvalue()
+    except Exception:                          # noqa: BLE001
+        return None
+
+
 def _step_callback(progress, steps: int):
     """diffusers の callback_on_step_end 形式。進捗更新+キャンセル検知。"""
+    every = _live_sec()
+    last = [0.0]
+
     def cb(pipe, step_index, timestep, callback_kwargs):
         progress(0.05 + 0.85 * (step_index + 1) / max(1, steps))
+        if every and (time.time() - last[0]) >= every:
+            lat = callback_kwargs.get("latents")
+            if lat is not None:
+                j = _live_jpeg_from_latents(pipe, lat)
+                if j:
+                    _live_put(j)
+                    last[0] = time.time()
+                else:
+                    last[0] = time.time() + every    # 失敗した経路は間引く
         return callback_kwargs
     return cb
 
@@ -9748,8 +9865,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                   canvas_w=w, canvas_h=h)
 
     _lay_req = str(_exp.get("layout") or "").strip()
-    _use_single = (plan_raw == "ai" and not _lay_req) or _lay_req in (
-        "single", "individual", "8dir")
+    # ★AI経路もコンパス一発へ戻す (2026-07-23ユーザー指示「骨格を使って
+    # いるので、従来のコンパス配置で一回で歩行を出す形に戻してほしい」)。
+    # 0.11.45で ai=1方向ずつ8回 (三段6step) にしていたが、8本別々に描く
+    # 構造上、方向ごとに別人・別衣装へ散る (実走で2/8が別キャラになった)。
+    # 1枚のキャンバスに8方向を同居させれば同一性は構造的に保たれ、生成も
+    # 1本で済む。1方向ずつに戻すには extra.layout="single"。
+    _use_single = _lay_req in ("single", "individual", "8dir")
     if _lay_req == "compass":
         _use_c9 = True
     elif _lay_req in ("hemi", "4x2"):
@@ -10276,6 +10398,22 @@ def _gcs_req_heartbeat(rid: str, pid: str) -> bool:
     return True
 
 
+def _gcs_req_progress(rid: str, pid: str, progress: float,
+                      stage: str) -> bool:
+    """進捗と段階名を依頼へ書く (ハートビート兼務、v0.11.57)。
+
+    受付台にはこれまで updated しか届いておらず、依頼者は20分以上
+    「生成中」の一言だけを見せられていた。所有が外れていたら False。"""
+    cur = _gcs_req_load(rid)
+    if (not cur or cur.get("status") != "generating"
+            or str(cur.get("pack_id") or "") != pid):
+        return False
+    cur["progress"] = round(max(0.0, min(1.0, float(progress or 0.0))), 4)
+    cur["stage"] = str(stage or "")[:120]
+    _gcs_req_save(cur)
+    return True
+
+
 _GCS_CT = {".mp4": "video/mp4", ".webp": "image/webp", ".png": "image/png",
            ".gif": "image/gif", ".json": "application/json"}
 
@@ -10491,11 +10629,23 @@ def _gcs_process_one(req: dict, wait: bool = True):
         return jid
     beat = time.time()                           # ハートビート (120s毎)
     own = True
+    live_seq, live_at = 0, 0.0                   # ライブ中継 (10s毎)
     while True:                                  # ジョブ完了までポーリング
         time.sleep(5)
         j = JOBS.get(jid)
         _LAST_GCS_WORK[0] = time.time()
-        if own and time.time() - beat >= 120:
+        if own and j is not None and time.time() - live_at >= 10:
+            live_at = beat = time.time()
+            try:
+                jpeg, live_seq = _live_take(live_seq)
+                if jpeg:
+                    _gcs_write(f"live/{rid}.jpg", jpeg, "image/jpeg")
+                own = _gcs_req_progress(
+                    rid, pid, float(j.get("progress") or 0.0),
+                    str(j.get("detail") or ""))
+            except Exception:                     # noqa: BLE001
+                pass                              # 中継の欠けは無視 (本業優先)
+        elif own and time.time() - beat >= 120:
             beat = time.time()
             try:
                 own = _gcs_req_heartbeat(rid, pid)
