@@ -52,12 +52,26 @@ LAYOUT_8 = (4, 2, ["front", "front_left", "front_right", "left",
 LAYOUT_COMPASS = (3, 3, ["back_left", "back", "back_right",
                          "left", None, "right",
                          "front_left", "front", "front_right"])
+# ★対向ペア4枚 (2026-07-23ユーザー指示「8方向一発出しは解像度的に難有りで
+# 崩れる。位相向き2つずつで前後・左右・左前右後・右前左後の4枚で」)。
+# 1枚に2セルなのでセルは半解像度化せず素の WALKPACK_W×H が使える
+# (コンパス3x3は 240x432 まで落ちていた = 1体あたり画素が1/4)。
+# 同居させるのは必ず180度の対向 — 隣接角度どうしを並べると片方の腕や
+# 尻尾がもう片方へ染む実績があるが、対向なら混ざっても互いに無害。
+LAYOUT_PAIR_FB = (2, 1, ["front", "back"])            # 前後
+LAYOUT_PAIR_LR = (2, 1, ["left", "right"])            # 左右
+LAYOUT_PAIR_FLBR = (2, 1, ["front_left", "back_right"])   # 左前・右後
+LAYOUT_PAIR_FRBL = (2, 1, ["front_right", "back_left"])   # 右前・左後
+LAYOUT_PAIRS4 = [LAYOUT_PAIR_FB, LAYOUT_PAIR_LR,
+                 LAYOUT_PAIR_FLBR, LAYOUT_PAIR_FRBL]
+
 # 方向 -> シート内インデックス(pipeline.py DIRECTIONS と一致させる)
 IDX = {"front": 1, "left": 2, "right": 3, "back": 4,
        "front_left": 5, "front_right": 6, "back_left": 7, "back_right": 8}
 # 8方向の生成戦略
 MODES = {
     "4x2": [LAYOUT_F4, LAYOUT_B4],   # 前半球 + 後半球 の2生成(高解像度・生成数1/4)
+    "pair4": LAYOUT_PAIRS4,          # 対向ペア4枚 (セル解像度最大)
     "4only": [LAYOUT_4P],            # 主要4方向のみ(1生成)
     "8x1": [LAYOUT_8],               # 8-in-1 の1生成(生成数1/8・低解像度)
     "compass": [LAYOUT_COMPASS],     # 3x3コンパス(中央空白)の1生成(2026-07-10)

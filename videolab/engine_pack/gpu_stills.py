@@ -417,23 +417,55 @@ def concept_to_qwen_prompt(meta: dict) -> str:
     return " ".join(bits)
 
 
-def facing_ref_path(posesets_dir=None):
-    """向き判定の参照 (C17 の right 指示書) のパス。無ければ None。
+def facing_ref_path(posesets_dir=None, kind: str = "right"):
+    """向き判定の参照 (C17 の指示書) のパス。無ければ None。
 
+    kind="right" = 左右の判定用 / kind="front" = 正面コマ探しの物差し。
     較正の出典がC17なので、差し替え式の現行poseset (色分け人形・左右が
     ほぼ対称) では代用しない — 感度が落ちて誤判定側に倒れる
     (pipeline._facing_margin_vs_poseset の注記と同じ理由)。"""
+    name = "front_1.png" if kind == "front" else "right_1.png"
     root = Path(posesets_dir) if posesets_dir else (
         Path(__file__).resolve().parent.parent / "posesets")
     here = Path(__file__).resolve().parent
-    for p in (root / "_old_C17_v2" / "right_1.png",
-              root / "_old_C17" / "right_1.png",
+    for p in (root / "_old_C17_v2" / name,
+              root / "_old_C17" / name,
               # GPU VMには posesets が無いので engine_pack へ同梱した実体
               # (gce_drive.push が code/engine_pack/ へ送る)
-              here / "facing_ref_right.png"):
+              here / f"facing_ref_{kind}.png"):
         if p.is_file():
             return p
     return None
+
+
+def find_front_index(frames, ref_front=None) -> int:
+    """360°回転の中から**本当の正面コマ**を選ぶ。
+
+    ★立ち絵が正面向きに描かれるとは限らない (実走で後ろ姿・斜めが出た)。
+    その場合フレーム0を正面として8等分すると、全方向が丸ごとずれる
+    (2026-07-23ユーザー指示「最初に生成された絵が正面向きでなかったときは
+    0フレーム目ではなく、360度の中から正面の絵を選ぶ」)。
+    判定は2つの合成:
+      ① 左右対称性 — 正面と背面だけが鏡映対称に近い
+      ② C17 front指示書との近さ — 正面と背面を分ける
+    測れないときは 0 (従来動作) を返す。"""
+    import numpy as np
+    n = len(frames or [])
+    if n < 4:
+        return 0
+    g = _norm64(ref_front) if ref_front is not None else None
+    best, best_score = 0, None
+    for i in range(n):
+        a = _norm64(key_to_magenta(frames[i]))
+        if a is None:
+            continue
+        sym = float(np.abs(a - a[:, ::-1]).mean())      # 小さいほど対称
+        score = sym
+        if g is not None:
+            score = sym + 0.6 * float(np.abs(a - g).mean())
+        if best_score is None or score < best_score:
+            best, best_score = i, score
+    return best
 
 
 def _norm64(img, flip: bool = False, thr: int = 70):
@@ -502,7 +534,7 @@ def turntable_order(sense: int) -> tuple:
 
 
 def turntable_frame_index(n_frames: int, direction: str,
-                          order: tuple = None) -> int:
+                          order: tuple = None, front_idx: int = 0) -> int:
     """81f等のターンテーブルから方向に対応するフレーム添字を返す。
 
     先頭=front、一周して末尾もfrontに戻る前提。末尾を除いた (n-1) 区間を
@@ -516,8 +548,10 @@ def turntable_frame_index(n_frames: int, direction: str,
         slot = order.index(direction)
     except ValueError:
         slot = 0
-    # slot 0..7 → 0 .. (n-1) の 0/8, 1/8, ...
-    return int(round(slot * (n_frames - 1) / 8.0))
+    # slot 0..7 → 0 .. (n-1) の 0/8, 1/8, ... を front_idx から数える
+    # (正面コマが先頭とは限らないため。周回なので mod で巻き取る)
+    off = int(round(slot * (n_frames - 1) / 8.0))
+    return int((int(front_idx or 0) + off) % max(1, n_frames - 1))
 
 
 def key_to_magenta(img, thr: int = 60):
@@ -572,7 +606,8 @@ def write_centered_crops(crops: dict, out_dir: Path, char_id: str,
 
 
 def extract_turntable_dirs(frames: list, thr: int = 70,
-                           order: tuple = None, ref_right=None) -> dict:
+                           order: tuple = None, ref_right=None,
+                           front_idx: int = 0) -> dict:
     """連番フレーム (PIL) から8方向の tight crop を返す。
 
     order 省略時は ref_right (C17 right指示書) で回り方を実測する
@@ -584,7 +619,7 @@ def extract_turntable_dirs(frames: list, thr: int = 70,
             measure_rotation_sense(frames, ref_right)[0])
     crops = {}
     for d in order:
-        fi = turntable_frame_index(n, d, order=order)
+        fi = turntable_frame_index(n, d, order=order, front_idx=front_idx)
         fi = max(0, min(n - 1, fi))
         keyed = key_to_magenta(frames[fi])
         crops[d] = tight_crop_magenta(keyed, thr=thr)
@@ -661,6 +696,7 @@ def build_seed_pack_zip(req: dict, rid: str = "",
     # 回り方を実測し、左右取り違えを防ぐ。母艦にしか posesets が無いので
     # パックへ同梱する
     fr = facing_ref_path()
+    fr_front = facing_ref_path(kind="front")
     if fr is not None:
         meta["facing_ref"] = fr.name
     buf = io.BytesIO()
@@ -669,6 +705,8 @@ def build_seed_pack_zip(req: dict, rid: str = "",
                    json.dumps(meta, ensure_ascii=False, indent=1))
         if fr is not None:
             z.write(fr, "facing_ref_right.png")
+        if fr_front is not None:
+            z.write(fr_front, "facing_ref_front.png")
         if motion_en:
             z.writestr("motion_prompt.txt", motion_en)
         if ref_bytes:

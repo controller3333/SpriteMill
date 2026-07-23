@@ -135,7 +135,12 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.65"
+__version__ = "0.11.66"
+# 0.11.66: ①歩行キャンバスを**対向ペア4枚**へ (ユーザー指示「8方向一発は
+# 解像度的に難有り」)。前後/左右/左前右後/右前左後で、セルは 240x432 →
+# 480x864 = 1体あたり画素4倍。②正面コマを360°の中から探す (立ち絵が正面
+# 向きに描かれるとは限らず、0コマ目固定だと8方向まるごとずれる)。
+# 左右対称性 + C17 front指示書で選び、以降の8等分をそこから数える。
 # 0.11.65: 参考画像タグの背景除去を部分一致へ (ユーザー指摘「黒でも透明
 # でもついてたら困る」)。"background" を含むタグは色を問わず全部落とし、
 # 背景の語が無くても後ろに何かを描かせる環境タグ (indoors/sky/wall/floor
@@ -9122,6 +9127,23 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         _fr = gs.facing_ref_path()
         if _fr is not None:
             ref_right = _PIL.open(_fr).convert("RGB")
+    # ★正面コマを回転の中から探す (2026-07-23ユーザー指示)。立ち絵が正面
+    # 向きに描かれるとは限らず、そのときフレーム0を正面とみなすと8方向
+    # まるごとずれる。左右対称性 + C17 front指示書との近さで選ぶ。
+    ref_front = None
+    for cand in (pack / "facing_ref_front.png",
+                 pack / "01_generation" / "facing_ref_front.png"):
+        if cand.is_file():
+            ref_front = _PIL.open(cand).convert("RGB")
+            break
+    if ref_front is None:
+        _ff = gs.facing_ref_path(kind="front")
+        if _ff is not None:
+            ref_front = _PIL.open(_ff).convert("RGB")
+    front_idx = gs.find_front_index(frames, ref_front)
+    if front_idx:
+        log(f"正面コマを回転内から検出: フレーム{front_idx}/{len(frames)} "
+            "(立ち絵が正面向きでなかったため0コマ目を使わない)")
     sense, score = gs.measure_rotation_sense(frames, ref_right)
     order = gs.turntable_order(sense)
     if sense == 0:
@@ -9132,9 +9154,13 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         log(f"回転の向き実測: {'右回り' if sense > 0 else '左回り'} "
             f"(score={score:+.1f}) → 1/4周を "
             f"{order[2]} として切り出します")
-    crops = gs.extract_turntable_dirs(frames, order=order)
+    crops = gs.extract_turntable_dirs(frames, order=order,
+                                      front_idx=front_idx)
     # 正面は生成原画を優先 (回転0°のブレ防止)
-    front_crop = gs.tight_crop_magenta(front)
+    # 正面コマが回転の先頭 (=生成した立ち絵そのもの) のときだけ原画を
+    # 優先する。回転の途中から採ったならそちらが本当の正面なので触らない
+    front_crop = (gs.tight_crop_magenta(front) if not front_idx
+                  else crops["front"])
     crops["front"] = front_crop
     # スケールを正面に揃える
     th0 = front_crop.size[1]
@@ -10207,18 +10233,37 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
                 _use_c9 = _tot >= 40 * (1 << 30)
         except Exception:                     # noqa: BLE001
             pass
+    # ★既定=対向ペア4枚 (2026-07-23ユーザー指示「8方向一発出しは解像度的に
+    # 難有りで崩れる。位相向き2つずつで前後・左右・左前右後・右前左後の
+    # 4枚で」)。コンパス3x3はセルが WALKPACK/2 まで縮んでいた (実測
+    # 240x432) ので、1体あたりの画素は1/4。2セルなら素の 480x864 が使え、
+    # 同居は必ず180度の対向にして混色の害を最小化する。
+    # compass/hemi へ戻すのは extra.layout で明示。
+    _use_pair4 = (not _use_single and not _lay_req) or _lay_req in (
+        "pair4", "pairs", "2x4")
+    if _use_pair4:
+        _use_c9 = False
     if _use_single:
         _use_c9 = False
         _wp_print("[walkpack] AIレイアウト: 1方向ずつ8回 "
                   "(各8step・注意集中)")
+    elif _use_pair4:
+        _wp_print("[walkpack] レイアウト: 対向ペア4枚 "
+                  "(前後/左右/左前右後/右前左後・セル解像度最大)")
     elif _use_c9 and _lay_req != "compass":
         _wp_print("[walkpack] レイアウト: コンパス3x3 (VRAM充足・既定)")
     if _use_c9:
         w, h = (WALKPACK_W // 2) * 3, (WALKPACK_H // 2) * 3
+    elif _use_pair4:
+        w, h = WALKPACK_W * 2, WALKPACK_H       # 2セル横並び=素の解像度
     if _use_single:
         _layouts = tuple(
             (f"D{i + 1:02d}_{d}", (1, 1, [d]))
             for i, d in enumerate(_WP_DIRS))
+    elif _use_pair4:
+        _layouts = tuple(
+            ("P{}_{}".format(i + 1, "_".join(d for d in lay[2] if d)), lay)
+            for i, lay in enumerate(cw.LAYOUT_PAIRS4))
     else:
         _layouts = ((("C9", cw.LAYOUT_COMPASS),) if _use_c9
                     else (("F4", cw.LAYOUT_F4), ("B4", cw.LAYOUT_B4)))
@@ -10227,7 +10272,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         # 顔が写るのは前半球だけ (B4は後ろ姿3方向+横顔) なので、ゲートは
         # F4の直後に1回だけ回す。1レイアウト=1回の生成=1個のノイズなので、
         # 崩れた方向だけを個別に作り直すことはできない — 半球ごと引き直す。
-        if tag != "F4" or not _wp_face_retry_on():
+        # 顔ゲートは「顔が写るキャンバス」の直後に1回。半球ならF4、
+        # 対向ペアなら front を含む P1 (2026-07-23のレイアウト変更で
+        # tag名が変わったため、名前ではなく中身で判定する)
+        if "front" not in (layout[2] or []) or not _wp_face_retry_on():
             continue
         bad, sc = _wp_face_gate(eng, ffmpeg, out, log)
         if not bad:
