@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -209,12 +210,61 @@ def bg_magenta_mask(img: Image.Image, magenta_thr: int) -> Image.Image:
     return Image.fromarray(np.where(reach, 255, 0).astype(np.uint8))
 
 
+def despill_magenta(rgba: Image.Image, alpha: Image.Image,
+                    strength: float = 1.0) -> Image.Image:
+    """前景に残ったマゼンタ被り(スピル)を抜く。
+
+    キーイングはアルファを二値で立てるだけでRGBを直さないので、背景と
+    前景が混ざった画素 — magentaness が閾値(70)未満の 40〜69 の帯 — が
+    **不透明のまま**残る。その帯はちょうど輪郭1pxと細い髪束の幅に一致
+    するため、髪束がピンクに染まり、睫毛や瞳の縁にも紫が乗る
+    (2026-07-23の並列監査で確定。最新シートの半透明縁に純マゼンタが
+    272px=旧方式の9.4倍あった)。
+
+    式は標準的なVlahos: m = min(R,B) - G が正なら R,B を G 側へ寄せる。
+    **大きな面積のマゼンタ/ピンクの衣装や髪は壊さない** — 対象を
+    「アルファの境界から2px以内」に限る (内部の意図的なピンクは無傷)。
+    numpy が無い環境では素通し。"""
+    try:
+        import numpy as np
+    except ImportError:
+        return rgba
+    a = np.asarray(rgba.convert("RGBA")).astype(np.int16)
+    al = np.asarray(alpha)
+    fg = al > 0
+    if not fg.any():
+        return rgba
+    # アルファ境界の2px帯 (前景側)。膨張は shift-OR で足りる
+    edge = np.zeros_like(fg)
+    bgm = ~fg
+    for _ in range(2):
+        g = bgm.copy()
+        g[1:, :] |= bgm[:-1, :]
+        g[:-1, :] |= bgm[1:, :]
+        g[:, 1:] |= bgm[:, :-1]
+        g[:, :-1] |= bgm[:, 1:]
+        bgm = g
+    edge = bgm & fg
+    m = np.minimum(a[..., 0], a[..., 2]) - a[..., 1]
+    hit = edge & (m > 0)
+    if hit.any():
+        cut = (m * float(strength)).clip(0, 255).astype(np.int16)
+        a[..., 0] = np.where(hit, a[..., 0] - cut, a[..., 0])
+        a[..., 2] = np.where(hit, a[..., 2] - cut, a[..., 2])
+    out = Image.fromarray(a.clip(0, 255).astype("uint8"), "RGBA")
+    out.putalpha(alpha)
+    return out
+
+
 def key_magenta_alpha(img: Image.Image, magenta_thr: int) -> Image.Image:
     """Convert magenta-background frames/references to RGBA foreground images."""
     rgba = img.convert("RGBA")
     a = rgba.getchannel("A")
     bg = bg_magenta_mask(rgba, magenta_thr)
     alpha = ImageChops.multiply(a, ImageChops.invert(bg))
+    if os.environ.get("SM_DESPILL", "on").strip().lower() not in (
+            "0", "off", "false", "no"):
+        return despill_magenta(rgba, alpha)
     out = rgba.copy()
     out.putalpha(alpha)
     return out

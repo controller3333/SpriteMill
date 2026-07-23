@@ -135,7 +135,17 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.58"
+__version__ = "0.11.59"
+# 0.11.59: 並列監査 (46エージェント) で確定した21件の穴を修正。
+# ①中継が歩行段で構造的に出なかった — 三段handoffは自前denoiseループで
+# callbackを呼ばない。フックを直接差し、5Dデコードのデバイス不一致も修正
+# (CPU退避時は粗いlatent可視化へ退避)。②中継の持ち越し/消し忘れ/無言失敗
+# (他人の生成途中絵が別ridで公開される経路を含む)。③デスピル導入 (輪郭と
+# 髪のマゼンタ。実測 200px→7px)。④骨格の体幅を頭身追従へ (縦伸びの真犯人。
+# チビは不変・8頭身で肩幅/全高0.167=解剖学域)。⑤参考画像のi2iをアスペクト
+# 維持へ (正方形が縦1.75倍に伸びていた)。⑥完成済み依頼の再生成・シート
+# 欠落doneの防止。⑦再起動が生成中を巻き戻す事故のガード (gce_drive)。
+# 0.11.58: マント抑制を否定形→肯定形へ (CFG無効経路では否定が効かない)。
 # 0.11.58: AI歩行文に「布を増やすな」を明記 (背面・斜め背面で長い髪が
 # マントに化ける実走。★この経路は guidance=1.0 = CFG無効なので負の
 # プロンプトは効かない — 肯定文で言うしかない)。
@@ -1515,96 +1525,169 @@ def _live_put(jpeg: bytes) -> None:
     _LIVE["at"] = time.time()
 
 
+def _live_reset() -> None:
+    """依頼の切れ目で持ち越しを断つ。
+
+    ★_LIVE はプロセス共有なので、これを呼ばないと次の依頼の最初のtickで
+    「前の依頼の最終コマ」が live/<新rid>.jpg として公開される。前が保護
+    キャラで次が非保護なら pwゲートを迂回して他人の途中経過が出る
+    (2026-07-23の並列監査で確定)。"""
+    _LIVE["jpeg"] = None
+    _LIVE["at"] = 0.0
+
+
 def _live_take(last_seq: int):
-    """(jpeg, seq) — 新しいものが無ければ (None, last_seq)。"""
-    if _LIVE["jpeg"] is not None and _LIVE["seq"] != last_seq:
+    """(jpeg, seq) — 新しいものが無ければ (None, last_seq)。
+
+    60秒より古いコマは返さない: ジョブが停滞したときに「止まった絵」を
+    最新として出し続けないため。"""
+    if (_LIVE["jpeg"] is not None and _LIVE["seq"] != last_seq
+            and time.time() - float(_LIVE["at"] or 0.0) <= 60.0):
         return _LIVE["jpeg"], _LIVE["seq"]
     return None, last_seq
 
 
+_LIVE_TICK = [0.0]
+_LIVE_WARNED: set = set()
+
+
+def _live_warn(key: str, msg: str) -> None:
+    """中継の失敗を**1回だけ**言う。黙って消えると誰も気づけない。"""
+    if key in _LIVE_WARNED:
+        return
+    _LIVE_WARNED.add(key)
+    try:
+        _wp_print(f"[live] 中継できません ({key}): {msg[:160]}")
+    except Exception:                          # noqa: BLE001
+        pass
+
+
+def _live_tick(pipe, latents) -> None:
+    """生成ループから呼ぶ中継フック (間隔は_live_secで間引く)。
+
+    diffusers の callback を使わない自前ループ (VACE三段handoff等) からも
+    直接呼べるように、_step_callback とは独立の入口にしてある。"""
+    every = _live_sec()
+    if not every or latents is None:
+        return
+    now = time.time()
+    if now - _LIVE_TICK[0] < every:
+        return
+    _LIVE_TICK[0] = now
+    j = _live_jpeg_from_latents(pipe, latents)
+    if j:
+        _live_put(j)
+
+
 def _taesd_for(pipe):
-    """SDXL用の極小デコーダ (TAESD)。無ければ None (静かに諦める)。"""
-    if "sdxl" in _TAESD:
-        return _TAESD["sdxl"]
-    _TAESD["sdxl"] = None
+    """SDXL用の極小デコーダ (TAESD)。取れなければ None。
+
+    ★失敗を恒久メモ化しない: 初回DLがオフライン/満杯/HFの一時エラーで
+    こけただけで、プロセスの寿命ぶん中継が死んだままになっていた
+    (2026-07-23の並列監査で確定)。5分あけて再挑戦する。"""
+    got = _TAESD.get("sdxl")
+    if got is not None:
+        return got
+    if time.time() - float(_TAESD.get("tried_at") or 0.0) < 300.0:
+        return None
+    _TAESD["tried_at"] = time.time()
     try:
         import torch
         from diffusers import AutoencoderTiny
         repo = os.environ.get("VIDEOLAB_TAESD_REPO", "madebyollin/taesdxl")
         vae = AutoencoderTiny.from_pretrained(repo, torch_dtype=torch.float16)
-        _TAESD["sdxl"] = vae.to(pipe.vae.device if hasattr(pipe, "vae")
-                                else "cuda")
-    except Exception:                         # noqa: BLE001
-        pass
-    return _TAESD["sdxl"]
+        dev = "cuda"
+        try:
+            dev = next(pipe.vae.parameters()).device
+        except Exception:                     # noqa: BLE001
+            pass
+        _TAESD["sdxl"] = vae.to(dev)
+    except Exception as e:                    # noqa: BLE001
+        _live_warn("taesd", f"{type(e).__name__}: {e} (5分後に再試行)")
+    return _TAESD.get("sdxl")
+
+
+def _live_latent_rgb(x):
+    """VAEを使わない粗い可視化 (16chのうち3chを正規化してRGBに割る)。
+
+    動画段のVAEはVRAM節約でCPUへ退避されていることがある。CPUで1コマ
+    デコードすると数十秒かかり生成を止めてしまうので、そのときはこちらへ
+    逃げる。色は本物ではないが、構図と動きの育ち方は見える。"""
+    import numpy as np
+    z = x[0, :3, -1] if x.ndim == 5 else x[0, :3]
+    a = z.detach().float().cpu().numpy()
+    out = np.zeros(a.shape[1:] + (3,), dtype="uint8")
+    for c in range(min(3, a.shape[0])):
+        ch = a[c]
+        lo, hi = float(np.percentile(ch, 2)), float(np.percentile(ch, 98))
+        if hi - lo < 1e-6:
+            continue
+        out[..., c] = np.clip((ch - lo) / (hi - lo) * 255, 0, 255)
+    return out
 
 
 def _live_jpeg_from_latents(pipe, latents) -> bytes | None:
     """生成途中のlatent -> 小さなJPEG。失敗は必ず None (生成は止めない)。
 
     画像(4D)=TAESD、動画(5D)=本物のVAEで最終フレーム1枚だけデコード
-    (Wan系にはdiffusers標準の極小デコーダが無いため。1枚なら実測1秒未満で、
-    間隔を空けて呼ぶので生成時間にはほぼ効かない)。"""
+    (Wan系にはdiffusers標準の極小デコーダが無いため)。VAEがCPUへ退避
+    されている場合はデコードに数十秒かかって生成を止めるので、粗い
+    latent可視化へ逃げる。"""
+    import torch
+    from PIL import Image as _I
     try:
-        import numpy as np
-        import torch
-        from PIL import Image as _I
         with torch.no_grad():
             x = latents
             if x.ndim == 5:                    # [B,C,T,H,W] 動画
-                x = x[:1, :, -1:]
                 vae = getattr(pipe, "vae", None)
-                if vae is None:
-                    return None
-                sc = getattr(vae.config, "scaling_factor", 1.0) or 1.0
-                mean = getattr(vae.config, "latents_mean", None)
-                std = getattr(vae.config, "latents_std", None)
-                z = x.to(vae.dtype)
-                if mean is not None and std is not None:
-                    m = torch.tensor(mean, device=z.device,
-                                     dtype=z.dtype).view(1, -1, 1, 1, 1)
-                    s = torch.tensor(std, device=z.device,
-                                     dtype=z.dtype).view(1, -1, 1, 1, 1)
-                    z = z / sc * s + m
+                dev = None
+                if vae is not None:
+                    try:
+                        dev = next(vae.parameters()).device
+                    except Exception:          # noqa: BLE001
+                        dev = getattr(vae, "device", None)
+                if vae is None or dev is None or dev.type != "cuda":
+                    # CPU退避中 (VACE三段handoffは denoise 中ずっとこれ)
+                    a = _live_latent_rgb(x)
+                    im = _I.fromarray(a)
                 else:
-                    z = z / sc
-                img = vae.decode(z).sample[:, :, 0]
+                    # 既存のデコードと同じ規約 (latents/ls + lm、ls=1/std)
+                    lm = torch.tensor(vae.config.latents_mean).view(
+                        1, -1, 1, 1, 1).to(dev, vae.dtype)
+                    ls = 1.0 / torch.tensor(vae.config.latents_std).view(
+                        1, -1, 1, 1, 1).to(dev, vae.dtype)
+                    z = x[:1, :, -1:].to(dev, vae.dtype)
+                    img = vae.decode(z / ls + lm, return_dict=False)[0]
+                    a = ((img[0, :, 0].float().clamp(-1, 1) + 1) * 127.5)
+                    im = _I.fromarray(
+                        a.permute(1, 2, 0).cpu().numpy().astype("uint8"))
             else:                              # [B,C,H,W] 画像
                 vae = _taesd_for(pipe)
                 if vae is None:
                     return None
-                z = latents[:1].to(vae.dtype).to(vae.device)
+                z = latents[:1].to(vae.device, vae.dtype)
                 img = vae.decode(
                     z / getattr(vae.config, "scaling_factor", 1.0)).sample
-            a = ((img[0].float().clamp(-1, 1) + 1) * 127.5)
-            a = a.permute(1, 2, 0).cpu().numpy().astype("uint8")
-            im = _I.fromarray(a)
+                a = ((img[0].float().clamp(-1, 1) + 1) * 127.5)
+                im = _I.fromarray(
+                    a.permute(1, 2, 0).cpu().numpy().astype("uint8"))
             w = 320
             im = im.resize((w, max(1, round(im.height * w / im.width))),
                            _I.BILINEAR)
             buf = io.BytesIO()
             im.save(buf, format="JPEG", quality=70)
             return buf.getvalue()
-    except Exception:                          # noqa: BLE001
+    except Exception as e:                     # noqa: BLE001
+        _live_warn(f"decode{getattr(latents, 'ndim', '?')}d",
+                   f"{type(e).__name__}: {e}")
         return None
 
 
 def _step_callback(progress, steps: int):
     """diffusers の callback_on_step_end 形式。進捗更新+キャンセル検知。"""
-    every = _live_sec()
-    last = [0.0]
-
     def cb(pipe, step_index, timestep, callback_kwargs):
         progress(0.05 + 0.85 * (step_index + 1) / max(1, steps))
-        if every and (time.time() - last[0]) >= every:
-            lat = callback_kwargs.get("latents")
-            if lat is not None:
-                j = _live_jpeg_from_latents(pipe, lat)
-                if j:
-                    _live_put(j)
-                    last[0] = time.time()
-                else:
-                    last[0] = time.time() + every    # 失敗した経路は間引く
+        _live_tick(pipe, callback_kwargs.get("latents"))
         return callback_kwargs
     return cb
 
@@ -5316,6 +5399,12 @@ class VACEAniSoraHandoffAdapter(VACEAdapter):
                         pred = uncond + guidance * (pred - uncond)
                 latents = sched.step(pred, t, latents, return_dict=False)[0]
                 progress(0.10 + 0.76 * (si + 1) / len(timesteps))
+                # ★工房への中継 (2026-07-23)。このアダプタは diffusers の
+                # pipe.__call__ を使わず自前でループを回すので、
+                # callback_on_step_end は一度も呼ばれない。歩行段は生成
+                # 時間の大半を占めるのに、ここを差さないと依頼者には
+                # 20分以上まったく絵が出ない (並列監査で確定した本命)。
+                _live_tick(apipe if switched else pipe, latents)
 
             if not switched:
                 raise RuntimeError("native AniSora Lowへhandoffされませんでした")
@@ -8645,6 +8734,22 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
     if ref_path.is_file():
         ref_img = _PIL.open(ref_path).convert("RGB")
 
+    def _fit_ref(im, tw: int, th: int):
+        """参考画像を目標比へ**アスペクト維持**で収める (余白はキー色)。
+
+        i2iのinitはアダプタが問答無用で (w,h) へresizeする。受付台に上がる
+        参考画像は正方形が普通なので、そのままだと縦1.75倍に引き伸ばされた
+        絵が潜在の出発点になり、頭身と顔の縦横比が最初から狂う
+        (2026-07-23の並列監査で確定)。"""
+        if im is None:
+            return None
+        s = min(tw / im.width, th / im.height)
+        nw, nh = max(1, round(im.width * s)), max(1, round(im.height * s))
+        canvas = _PIL.new("RGB", (tw, th), gs.MAGENTA)
+        canvas.paste(im.resize((nw, nh), _PIL.LANCZOS),
+                     ((tw - nw) // 2, (th - nh) // 2))
+        return canvas
+
     # ---- 0) 依頼文の英語化 (Codex無し・機械翻訳) ----
     try:
         import importlib
@@ -8677,7 +8782,8 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         neg = gs.stills_negative(meta, QwenImageAdapter.NEG)
         extra: dict = {}
         mode = "i2i" if ref_img is not None else "t2i"
-        images = [ref_img] if ref_img is not None else []
+        images = ([_fit_ref(ref_img, fw, fh)] if ref_img is not None
+                  else [])
         if ref_img is not None:
             extra["denoise"] = float(
                 os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.65") or 0.65)
@@ -8701,7 +8807,8 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         }
         neg = gs.stills_negative(meta, IllustriousAdapter.NEG)
         mode = "i2i" if ref_img is not None else "t2i"
-        images = [ref_img] if ref_img is not None else []
+        images = ([_fit_ref(ref_img, fw, fh)] if ref_img is not None
+                  else [])
         if ref_img is not None:
             extra["denoise"] = float(
                 os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.7") or 0.7)
@@ -10314,6 +10421,7 @@ def _gcs_prune_outputs(keep: int = GCS_KEEP_OUTPUTS) -> None:
             _gcs_delete(on)
         _gcs_delete(f"requests/{rid}.json")
         _gcs_delete(f"requests/{rid}.ref.png")
+        _gcs_delete(f"live/{rid}.jpg")        # 途中経過の置き土産も消す
         if pid:
             _gcs_delete(f"packs/{pid}.zip")
     _wp_print(f"[GCS] 保持{keep}件を超える{len(doomed)}件の古い生成物を削除")
@@ -10384,6 +10492,14 @@ def _gcs_req_finish(req: dict, status: str, error: str = "") -> None:
         return
     cur["status"] = status
     cur["error"] = error
+    # 途中経過は生成中だけのもの。残すと「やりなおし直後に前回の90%」が
+    # 出るし、live画像は削除済みキャラの覗き見口にもなる
+    cur["progress"] = 1.0 if status == "done" else 0.0
+    cur["stage"] = ""
+    try:
+        _gcs_delete(f"live/{rid}.jpg")
+    except Exception:                         # noqa: BLE001
+        pass
     for i in range(6):                        # 保存: 計~2.5分粘る (一発勝負廃止)
         try:
             _gcs_req_save(cur)
@@ -10634,6 +10750,9 @@ def _gcs_process_one(req: dict, wait: bool = True):
     _pack_extract(pid, blob, kind)
     req["status"] = "generating"
     req["error"] = ""
+    req["progress"] = 0.0                     # 前回の到達率を出さない
+    req["stage"] = "準備中"
+    _live_reset()                             # 前の依頼の絵を持ち越さない
     _gcs_req_save(req)
     _LAST_GCS_WORK[0] = time.time()
     jid = (_submit_annex_i2v(pid, mock=bool(req.get("_mock")))
@@ -10642,7 +10761,9 @@ def _gcs_process_one(req: dict, wait: bool = True):
         return jid
     beat = time.time()                           # ハートビート (120s毎)
     own = True
-    live_seq, live_at = 0, 0.0                   # ライブ中継 (10s毎)
+    # ライブ中継 (10s毎)。live_seq は「今ある絵は既読」から始める —
+    # 0起点だと前の依頼の最終コマを自分のridで公開してしまう
+    live_seq, live_at = _LIVE["seq"], 0.0
     while True:                                  # ジョブ完了までポーリング
         time.sleep(5)
         j = JOBS.get(jid)
@@ -10726,6 +10847,14 @@ def _gcs_process_one(req: dict, wait: bool = True):
             files.append({"name": p.name, "size": p.stat().st_size, "kind": k})
     order = {"preview": 0, "mp4": 1, "sheet": 2, "pixel": 3}
     files.sort(key=lambda f: (order.get(f["kind"], 9), f["name"]))
+    # ★シートが1枚も無いなら done にしない (2026-07-23監査): _wp_assemble は
+    # 失敗を警告だけで飲み込んで続行するので、依頼者から見て「完成」なのに
+    # 落とせるシートが無い、という壊れ方が成立していた。母艦の手続き経路
+    # には同等のガードが既にある
+    if not any(f["kind"] == "sheet" for f in files):
+        raise RuntimeError(
+            "スプライトシートが1枚も作られませんでした "
+            "(歩行動画は出来ているのでシート組立の失敗です)")
     manifest = {"pack_id": pid, "files": files, "finished": time.time(),
                 "generation": j.get("_generation_settings") or {}}
     _gcs_write(f"outputs/{rid}/manifest.json",
@@ -10782,6 +10911,19 @@ def _gcs_pick_pack_ready():
         if (req.get("status") == "generating"
                 and time.time() - float(req.get("updated") or 0)
                 > _GCS_STALE_GEN_SEC):
+            # ★成果物が真実・依頼JSONは影 (2026-07-23監査): outputs と
+            # manifest を書き終えた後で status の書き戻しだけが失敗すると、
+            # 完成済みの依頼が「宙に浮いたgenerating」として拾い直され、
+            # 20分かけて丸ごと作り直されていた。先に成果物を見る。
+            if _gcs_read(f"outputs/{rid}/manifest.json") is not None:
+                _wp_print(f"[GCS] {rid} は成果物が揃っている — "
+                          "再生成せず done へ確定します")
+                try:
+                    _gcs_req_finish(req, "done")
+                except Exception as e:        # noqa: BLE001
+                    _wp_print(f"[GCS] done確定に失敗 (次回再試行): "
+                              f"{str(e)[:120]}")
+                continue
             _wp_print(f"[GCS] 宙に浮いたgenerating依頼を再取り込み: {rid} "
                       f"(updated停止から{_GCS_STALE_GEN_SEC:.0f}s超)")
             return req

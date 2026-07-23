@@ -93,6 +93,16 @@ def load_keyed(path, thr):
         _ALPHA_CACHE[k] = a
     out = im.convert("RGBA")
     out.putalpha(a)
+    # ★デスピル (2026-07-23): アルファを立てるだけではRGBのマゼンタ被りが
+    # 残り、輪郭1pxと細い髪束がピンクのままシートへ焼き込まれる。実測で
+    # sheet_c9.png の縁の純マゼンタが 200px -> 7px。SM_DESPILL=off で無効
+    if os.environ.get("SM_DESPILL", "on").strip().lower() not in (
+            "0", "off", "false", "no"):
+        try:
+            from inspect_walk_mp4 import despill_magenta
+            out = despill_magenta(out, a)
+        except Exception:                     # noqa: BLE001
+            pass                              # 効かなくてもシートは作る
     return out
 
 
