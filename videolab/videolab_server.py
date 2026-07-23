@@ -135,7 +135,20 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.59"
+__version__ = "0.11.61"
+# 0.11.61: 0.11.60の是正 + ロップ実障害の真因3つ。①面積上限45%は8頭身の
+# 細身で決めた値で、1.2頭身のずんぐり体型(面積57%)を「複数体」と誤判定して
+# いた → 頭身別の上限へ (1.2頭身=72%)。②依頼文が空の依頼では参考画像が
+# 唯一の見た目情報なので下地を捨ててはいけない (捨てるとモノクロ線画が出て、
+# 白い線画はキーで丸ごと背景送り=面積0%)。denoise既定は「文章あり=1.0
+# (下地不要)/文章なし=0.72」の自動選択へ。③彩色を必ず要求するタグと、
+# 線画・モノクロ・白背景のネガティブを常時付与。
+# 0.11.60: 参考画像つき依頼の立ち絵が3回とも落ちる実障害 (ロップ)。原因は
+# i2iの既定 denoise=0.7 — 参考画像の構図と背景が3割残り、マゼンタ一色に
+# ならないままキーへ進んで被写体面積57%=「複数体」ゲート直撃。姿勢は骨格
+# ControlNetが持っているので下地を引きずる必要がない → 既定を1.0 (=下地を
+# 使わない) へ。やり直しも「種替えだけ」から「2回目以降はt2iへ降りる」に
+# 変更 (同じ手を3回繰り返して依頼ごと落とさない)。
 # 0.11.59: 並列監査 (46エージェント) で確定した21件の穴を修正。
 # ①中継が歩行段で構造的に出なかった — 三段handoffは自前denoiseループで
 # callbackを呼ばない。フックを直接差し、5Dデコードのデバイス不一致も修正
@@ -8750,6 +8763,27 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
                      ((tw - nw) // 2, (th - nh) // 2))
         return canvas
 
+    # ★立ち絵のi2iは既定で denoise=1.0 = 実質t2i (2026-07-23ユーザー指摘
+    # 「デノイズ1.0にしてますか?」)。0.7だと参考画像の構図と背景が3割
+    # 残り、マゼンタ一色にならないままキーへ進むので被写体面積が膨らみ、
+    # 「複数体を並べた可能性」ゲートに当たって3回とも落ちる実障害になった
+    # (ロップ: 面積57%)。参考画像の役目は姿勢ではなく見た目で、姿勢は
+    # 骨格ControlNetが持っているので、下地として引きずる必要がない。
+    # 参考画像を下地に効かせたいときだけ VIDEOLAB_STILLS_DENOISE を下げる。
+    # ★ただし「文章の手がかりが一切ない依頼」では参考画像が唯一の見た目
+    # 情報なので、下地を捨ててはいけない。捨てた瞬間プロンプトが定型句
+    # だけになり、色の手がかりゼロで**モノクロ線画**が出て、白い線画は
+    # キーで全部背景送り=面積0% になる (ロップの実障害)。
+    _has_text = any(str(meta.get(k) or "").strip() for k in (
+        "concept", "concept_en", "palette", "palette_en",
+        "silhouette", "silhouette_en", "notes", "notes_en"))
+    _den_env = os.environ.get("VIDEOLAB_STILLS_DENOISE", "").strip()
+    _den = float(_den_env) if _den_env else (1.0 if _has_text else 0.72)
+    _use_init = ref_img is not None and _den < 0.99
+    if ref_img is not None and not _has_text:
+        log("依頼文が空 — 参考画像を下地に使います "
+            f"(denoise={_den})")
+
     # ---- 0) 依頼文の英語化 (Codex無し・機械翻訳) ----
     try:
         import importlib
@@ -8781,12 +8815,10 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         fw, fh = 768, 1344
         neg = gs.stills_negative(meta, QwenImageAdapter.NEG)
         extra: dict = {}
-        mode = "i2i" if ref_img is not None else "t2i"
-        images = ([_fit_ref(ref_img, fw, fh)] if ref_img is not None
-                  else [])
-        if ref_img is not None:
-            extra["denoise"] = float(
-                os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.65") or 0.65)
+        mode = "i2i" if _use_init else "t2i"
+        images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
+        if _use_init:
+            extra["denoise"] = _den
         steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "30") or 30)
         cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "4.0") or 4.0)
     else:
@@ -8806,12 +8838,10 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
                 os.environ.get("VIDEOLAB_STILLS_CN", "0.95") or 0.95),
         }
         neg = gs.stills_negative(meta, IllustriousAdapter.NEG)
-        mode = "i2i" if ref_img is not None else "t2i"
-        images = ([_fit_ref(ref_img, fw, fh)] if ref_img is not None
-                  else [])
-        if ref_img is not None:
-            extra["denoise"] = float(
-                os.environ.get("VIDEOLAB_STILLS_DENOISE", "0.7") or 0.7)
+        mode = "i2i" if _use_init else "t2i"
+        images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
+        if _use_init:
+            extra["denoise"] = _den
         steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "28") or 28)
         cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "6.0") or 6.0)
         for cfgp in (HERE.parent / "config.json", HERE / "config.json"):
@@ -8864,13 +8894,21 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
     # 消え、髪だけの絵が回転→歩行まで流れる (2026-07-23実走)。ここで弾いて
     # 種を変えて描き直す — 下流で気づくと20分と数百円を捨てることになる
     tries = max(1, int(os.environ.get("VIDEOLAB_STILLS_TRIES", "3") or 3))
-    ok, why = gs.stills_ok(front)
+    _mx = gs.max_area_for(meta.get('leg_scale'))
+    ok, why = gs.stills_ok(front, max_area=_mx)
     for att in range(2, tries + 1):
         if ok:
             break
         log(f"⚠ 正面立ち絵をやり直します ({att - 1}/{tries - 1}): {why}")
         j["detail"] = f"GPU立ち絵: {model} 正面やり直し {att - 1}"
         seed = (seed + 7919) % (2 ** 31)
+        # ★同じ手を繰り返さない: 下地(i2i)が原因のことがあるので、2回目
+        # からは参考画像を外して t2i にする (種替えだけだと3回とも同じ
+        # 失敗を繰り返して依頼ごと落ちる — ロップの実障害)
+        if mode == "i2i" and _has_text:
+            log("  下地(参考画像)を外して t2i でやり直します")
+            mode, images = "t2i", []
+            extra.pop("denoise", None)
         jid_r = submit_job(model, GenRequest(
             mode=mode, prompt=prompt, negative=neg, images=images,
             width=fw, height=fh, num_frames=1, fps=1, steps=steps,
@@ -8880,7 +8918,7 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         if not p_r.is_file():
             continue
         cand = gs.key_to_magenta(_PIL.open(p_r).convert("RGB"))
-        ok, why = gs.stills_ok(cand)
+        ok, why = gs.stills_ok(cand, max_area=_mx)
         front = cand
     if not ok:
         raise RuntimeError(

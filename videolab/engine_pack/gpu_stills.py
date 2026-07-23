@@ -83,6 +83,13 @@ CLOTHED_TAG = "fully clothed"
 NSFW_NEG = ("nude, naked, nsfw, topless, bottomless, underwear, lingerie, "
             "bare chest, exposed skin, nipples, swimsuit")
 
+# 彩色を必ず要求する。パレット指定が無い依頼では色の手がかりが定型句
+# だけになり、白地に輪郭線だけの線画が出る (2026-07-23実障害: 白い線画は
+# 縁の中央値キーで丸ごと背景送りになり被写体面積0%で落ちた)。
+COLOR_TAG = "colored illustration, solid color fill"
+COLOR_NEG = ("monochrome, greyscale, grayscale, lineart, line art, sketch, "
+             "uncolored, white background")
+
 # 依頼文でよく出る衣装語の対訳 (機械翻訳が服だと解さない語を補う)
 COSTUME_GLOSSARY = (
     ("チャイナドレス", "cheongsam qipao dress"),
@@ -186,7 +193,8 @@ def proportion_tags(leg_scale) -> tuple:
 def stills_negative(meta: dict, base: str = "") -> str:
     """立ち絵用ネガティブ = アダプタ既定 + 頭身の否定 + 背景同化の否定。"""
     neg = (proportion_tags((meta or {}).get("leg_scale"))[1]
-           + ", " + BG_NEG + ", " + SOLO_NEG + ", " + NSFW_NEG)
+           + ", " + BG_NEG + ", " + SOLO_NEG + ", " + NSFW_NEG
+           + ", " + COLOR_NEG)
     base = (base or "").strip().rstrip(",")
     return f"{base}, {neg}" if base else neg
 
@@ -235,6 +243,28 @@ def torso_solid(img) -> float:
     if band.size == 0:
         return 0.0
     return float(band.mean())
+
+
+def max_area_for(leg_scale) -> float:
+    """頭身ごとの「画面占有の上限」。
+
+    ★低頭身ほど大きく写るのが正常: 同じ全高でも 1.2頭身のずんぐり体型は
+    8頭身の細身よりずっと面積を食う。上限を8頭身基準(45%)で固定していた
+    ため、1.2頭身の依頼(ロップ・leg_scale 0.6)が面積57%で「複数体を並べた
+    可能性」と誤判定され、3回とも落ちて依頼ごと失敗していた
+    (2026-07-23実障害)。実測アンカー: 8頭身の正常値 16-26%。"""
+    try:
+        heads = 2.0 * float(leg_scale or 1.0)
+    except (TypeError, ValueError):
+        heads = 2.0
+    heads = max(1.0, min(8.0, heads))
+    if heads <= 3.0:
+        return 0.72
+    if heads <= 4.5:
+        return 0.62
+    if heads <= 6.0:
+        return 0.52
+    return 0.45
 
 
 def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
@@ -292,6 +322,7 @@ def concept_to_illustrious_prompt(meta: dict) -> str:
     if sil:
         parts.append(sil)
     parts.append(CLOTHED_TAG)          # ② 構図と作画の指定
+    parts.append(COLOR_TAG)
     parts.append("full body, standing, front view, front lighting, "
                  f"flat color, simple background, {BG_TAG}")
     if notes:
