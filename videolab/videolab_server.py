@@ -135,7 +135,11 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.57"
+__version__ = "0.11.58"
+# 0.11.58: AI歩行文に「布を増やすな」を明記 (背面・斜め背面で長い髪が
+# マントに化ける実走。★この経路は guidance=1.0 = CFG無効なので負の
+# プロンプトは効かない — 肯定文で言うしかない)。
+# 0.11.57: AI経路をコンパス一発へ + 生成中のライブ中継。
 # 0.11.57: ①AI経路の歩行をコンパス3x3の一発生成へ戻した (ユーザー指示。
 # 1方向ずつ8本描くと方向ごとに別人・別衣装へ散るため。escape=layout
 # "single") ②生成中の中継: 進捗と段階を10秒毎に依頼へ書き、生成途中の
@@ -7806,7 +7810,17 @@ _WP_AI_PROMPT = (
     "animation cycle, never a still image, pose morph, or barely moving idle. "
     "The motion continues rhythmically from start to finish. Keep "
     "the character's identity, outfit, colors, proportions, and number of "
-    "limbs consistent throughout the cycle."
+    "limbs consistent throughout the cycle. "
+    # ★マント発明の抑制 (2026-07-23ユーザー指摘「横や斜め背面向きで高確率
+    # でマント風のアーティファクトが出る」)。背面・斜め背面では長い髪の
+    # 塊が布として読まれやすい。ネガティブでは効かない — この経路は
+    # guidance=1.0 (CFG無効) で、負のプロンプトは参照すらされないため、
+    # 肯定文で「増やさない」ことを明言するしかない。
+    "The character wears exactly the same garments as the reference image "
+    "and nothing more: no cape, cloak, mantle, coat tail, veil or any "
+    "added fabric appears from behind, and long hair stays hair rather "
+    "than turning into cloth, in every direction including the side and "
+    "rear three-quarter views."
 )
 
 _WP_AI_CELL_LOCK = (
