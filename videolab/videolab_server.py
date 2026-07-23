@@ -7811,16 +7811,15 @@ _WP_AI_PROMPT = (
     "The motion continues rhythmically from start to finish. Keep "
     "the character's identity, outfit, colors, proportions, and number of "
     "limbs consistent throughout the cycle. "
-    # ★マント発明の抑制 (2026-07-23ユーザー指摘「横や斜め背面向きで高確率
-    # でマント風のアーティファクトが出る」)。背面・斜め背面では長い髪の
-    # 塊が布として読まれやすい。ネガティブでは効かない — この経路は
-    # guidance=1.0 (CFG無効) で、負のプロンプトは参照すらされないため、
-    # 肯定文で「増やさない」ことを明言するしかない。
-    "The character wears exactly the same garments as the reference image "
-    "and nothing more: no cape, cloak, mantle, coat tail, veil or any "
-    "added fabric appears from behind, and long hair stays hair rather "
-    "than turning into cloth, in every direction including the side and "
-    "rear three-quarter views."
+    # ★マント発明の抑制 (2026-07-23)。★★否定形で書いてはいけない:
+    # この経路は guidance=1.0 = CFG無効で、負の分岐は評価すらされない。
+    # 「no cape, cloak, mantle」と書くと打ち消しにならず cape/cloak/mantle
+    # という語を条件へ撒くだけになる (0.11.58の実装がまさにこれで、実測
+    # では back_left の1コマで不透明画素の38.6%がマントだった)。
+    # 肩と背中の実シルエットを肯定文で述べるに留める。
+    "The character's shoulders and back keep exactly the same silhouette "
+    "as the reference image, with the flat background visible right up to "
+    "the body outline from every angle."
 )
 
 _WP_AI_CELL_LOCK = (
