@@ -60,7 +60,13 @@ MAGENTA = (255, 0, 255)
 # key_to_magenta が「縁の中央値と近い画素」を落とす方式で背景色を選ばない
 # ので、注文するのは「均一であること」だけでよい。
 BG_TAG = "plain flat solid light gray background"
-BG_NEG = "gradient background, scenery, floor"
+# ★背景と同系色の服を禁じる。key_to_magenta は「縁の中央値に近い画素」を
+# 背景として塗り潰すので、背景色に近い衣装は**穴になる** (2026-07-23実走:
+# 灰背景×灰系チャイナ→胴が丸ごとRGB(255,0,255)に化け、歩行シートでは
+# 下着姿に見えた)。ユーザー指摘「衣装が消えたのはマゼンタの服だから」。
+BG_NEG = ("gradient background, scenery, floor, "
+          "gray clothes, gray dress, magenta clothes, purple clothes, "
+          "clothes same color as background")
 
 # 1体だけ描かせる。ControlNetに骨格を1体分しか渡していなくても、SDXLは
 # 縦長キャンバスを「ターンアラウンド表」で埋めることがある (2026-07-23実走:
@@ -204,8 +210,35 @@ def subject_coverage(img) -> tuple:
         ys.max() - ys.min() + 1) / float(h)
 
 
+def torso_solid(img) -> float:
+    """キー済み立ち絵で、胴の中心線が残っている割合 (0..1)。
+
+    背景と同系色の服はキーで穴になる。面積だけ見ていると髪と手足が残る
+    ので通ってしまい、歩行段まで「胴が透明なキャラ」が流れる
+    (2026-07-23実走: 灰背景×灰系チャイナで胴がRGB(255,0,255)に化けた)。
+    立位の胴は必ず中心線上にあるので、そこを直接見るのが一番確実。"""
+    import numpy as np
+    a = np.asarray(img.convert("RGB")).astype(int)
+    # 下流と同じキー判定 (build_T_sheet / pipeline._keyed と同一式)
+    mag = (np.minimum(a[:, :, 0], a[:, :, 2]) - a[:, :, 1]) >= 70
+    fg = ~mag
+    if not fg.any():
+        return 0.0
+    ys = np.where(fg.any(axis=1))[0]
+    xs = np.where(fg.any(axis=0))[0]
+    y0, y1 = int(ys.min()), int(ys.max())
+    cx = int((xs.min() + xs.max()) / 2)
+    h = y1 - y0 + 1
+    band = fg[y0 + int(0.25 * h): y0 + int(0.55 * h),
+              max(0, cx - max(2, (xs.max() - xs.min()) // 12)):
+              cx + max(2, (xs.max() - xs.min()) // 12) + 1]
+    if band.size == 0:
+        return 0.0
+    return float(band.mean())
+
+
 def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
-              max_area: float = 0.45) -> tuple:
+              max_area: float = 0.45, min_torso: float = 0.6) -> tuple:
     """立ち絵として使えるか (ok, 理由)。閾値は実走4枚の実測から:
 
       正常 = 面積21.8% / 22.7% (縦90%・97%)
@@ -222,7 +255,12 @@ def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
     if area > max_area:
         return False, (f"画面を埋めすぎです (面積{area * 100:.0f}% — "
                        "複数体を並べた可能性)")
-    return True, f"面積{area * 100:.1f}% 縦{height * 100:.0f}%"
+    torso = torso_solid(img)
+    if torso < min_torso:
+        return False, (f"胴が抜けています (中心線の残り{torso * 100:.0f}% — "
+                       "背景と同系色の服がキーで消えた可能性)")
+    return True, (f"面積{area * 100:.1f}% 縦{height * 100:.0f}% "
+                  f"胴{torso * 100:.0f}%")
 
 
 def concept_to_illustrious_prompt(meta: dict) -> str:
