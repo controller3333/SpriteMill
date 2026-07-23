@@ -340,8 +340,8 @@ def subject_parts(img, min_frac: float = 0.02) -> tuple:
         return 0.0, 0, 0
     h, w = fg.shape
     b = max(1, int(min(h, w) * 0.01))
-    edges = sum(bool(x) for x in (
-        fg[:b].any(), fg[-b:].any(), fg[:, :b].any(), fg[:, -b:].any()))
+    top, bot = bool(fg[:b].any()), bool(fg[-b:].any())
+    edges = sum((top, bot, bool(fg[:, :b].any()), bool(fg[:, -b:].any())))
     small = np.asarray(_I.fromarray((fg * 255).astype("uint8")).resize(
         (96, 160), _I.NEAREST)) > 127
     lab = np.zeros(small.shape, dtype=np.int32)
@@ -361,12 +361,15 @@ def subject_parts(img, min_frac: float = 0.02) -> tuple:
         return 0.0, 0, edges
     tot = float(counts.sum())
     big = int((counts >= tot * min_frac).sum())
-    return float(counts.max()) / tot, big, edges
+    # 上下**両方**に接していたら頭か足が確実に切れている (片側だけなら
+    # 足が枠下に接地しているなど正常があり得るので落とさない)
+    return float(counts.max()) / tot, big, (edges + (10 if (top and bot)
+                                                     else 0))
 
 
 def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
               max_area: float = 0.45, min_torso: float = 0.6,
-              max_height: float = 0.97, min_main: float = 0.82,
+              max_height: float = 0.995, min_main: float = 0.82,
               max_parts: int = 3) -> tuple:
     """立ち絵として使えるか (ok, 理由)。閾値は実走4枚の実測から:
 
@@ -385,10 +388,15 @@ def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
         return False, (f"画面を埋めすぎです (面積{area * 100:.0f}% — "
                        "複数体を並べた可能性)")
     # ★ターンテーブルに回す前の「成立している見た目」検査 (2026-07-23)
-    if height > max_height:
-        return False, (f"上下が見切れています (縦{height * 100:.0f}% — "
-                       "頭か足がキャンバス外に出ている)")
     main, parts, edges = subject_parts(img)
+    # ★縦の割合では判定しない (2026-07-23): 骨格が画面の86%を占める設計
+    # なので、正常な全身立ち絵も縦92-97%になる。97%上限にしたら良品まで
+    # 3回とも弾いて依頼を落とした。見切れは「上下の両端に実際に接して
+    # いるか」で見る (edgesに+10して符号化)。
+    if edges >= 10:
+        return False, (f"上下が見切れています (縦{height * 100:.0f}%・"
+                       "上端と下端の両方に接している)")
+    edges = edges % 10
     if parts > max_parts:
         return False, (f"体がばらけています (大きな塊が{parts}個 — "
                        "分身や浮いた欠片の可能性)")
