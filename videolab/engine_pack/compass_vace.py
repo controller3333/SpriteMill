@@ -40,7 +40,13 @@ from canvas_walk import (CANVAS_PROMPT, IDX, LAYOUT_COMPASS, MODES,
 MAGENTA = (255, 0, 255)
 # 方向名のマッチは長い順 (back_right が right に食われないように)
 DIRS8 = sorted([d for d in LAYOUT_COMPASS[2] if d], key=len, reverse=True)
-NO_WIND = (" The air is completely still with no wind; the cape, hair and "
+# ★"the cape" を名指ししてはいけない (2026-07-23、ロップの実障害で確定)。
+# この文は否定ですらなく「マントが自然に垂れている」という**肯定の断言**
+# で、しかも歩行経路は guidance=1.0 = CFG無効なので打ち消す術がない。
+# 実際の出力は「静止コマにはマント無し・歩行コマは全部マント」——まさに
+# 「動きに応じて揺れる布」としてモデルが忠実に描いた結果だった。
+# 参照キャンバス側にはマントが1本も無いことも確認済み。
+NO_WIND = (" The air is completely still with no wind; the hair and "
            "clothes hang naturally, swaying only subtly from the walking "
            "motion itself. There is no text in the video.")
 
