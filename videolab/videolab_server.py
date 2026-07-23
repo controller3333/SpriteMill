@@ -135,7 +135,12 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.78"
+__version__ = "0.11.79"
+# 0.11.79: プロンプトから "wind" と props/effects/particles の列挙を撤去
+# (ユーザー報告「やけに風が吹いている感じの動画」)。guidance=1.0=CFG無効
+# なので "no wind" は否定にならず wind を条件へ撒くだけ — "the cape" と
+# 同じ罠を残していた。望む状態 (髪と服が体に沿って落ち着く / 周囲は
+# 平坦なマゼンタのまま) を、その語を使わない肯定文で書く。
 # 0.11.78: 足踏みの錨を既定3点 (先頭・中央・終端) へ (ユーザー「中央も
 # 入れたほうが良いかも」)。錨はlatent固定ではなくsparse画像ガイダンス
 # なので中央を足しても動きは死なない。数は admin ノブ march_anchors
@@ -8085,10 +8090,12 @@ _WP_NAT_PLANS = tuple(_WP_PLAN_PROMPTS)
 # 効かないため、「空白は空白のまま」を正のプロンプトで宣言する。骨格なし
 # 経路はσ0.9の自由スロットが約8個あり、ノイズの解決先から「新規物体」を
 # 言語で奪う。bipedは骨格latentが動きを強制するので対象外 (実績運転不変)
+# ★同じ理由で props/objects/effects/particles/creatures も列挙しない
+# (CFG無効では否定が「言及」になる)。空であることを肯定文で述べる。
 _WP_NO_PROPS = (
-    " Nothing new ever appears anywhere in the frame: no props, no objects, "
-    "no effects, no particles, no extra creatures; the flat magenta "
-    "background stays completely empty at all times.")
+    " Every pixel that is not the character stays the same flat magenta "
+    "from the first frame to the last, an empty even field all around the "
+    "character for the whole video.")
 
 
 def _wp_prompt(eng: dict, refs: dict, layout, nf: int,

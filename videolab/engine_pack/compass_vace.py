@@ -46,9 +46,13 @@ DIRS8 = sorted([d for d in LAYOUT_COMPASS[2] if d], key=len, reverse=True)
 # 実際の出力は「静止コマにはマント無し・歩行コマは全部マント」——まさに
 # 「動きに応じて揺れる布」としてモデルが忠実に描いた結果だった。
 # 参照キャンバス側にはマントが1本も無いことも確認済み。
-NO_WIND = (" The air is completely still with no wind; the hair and "
-           "clothes hang naturally, swaying only subtly from the walking "
-           "motion itself. There is no text in the video.")
+# ★"wind" と書いてはいけない (2026-07-23ユーザー報告「やけに風が吹いて
+# いる感じの動画」)。guidance=1.0=CFG無効なので "no wind" は否定にならず、
+# wind という語を条件へ撒くだけ — "the cape" で踏んだのと同じ罠。
+# 望む状態を、その語を使わずに肯定文で書く。
+NO_WIND = (" The hair and clothes hang down and settle against the body, "
+           "moving only as much as the character's own steps carry them. "
+           "The air around the character is perfectly calm and empty.")
 
 
 def planned_direction_jobs(mode: str,
