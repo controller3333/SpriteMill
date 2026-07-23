@@ -110,6 +110,50 @@ COSTUME_GLOSSARY = (
 )
 
 
+# 参考画像から拾ったタグのうち、立ち絵生成に持ち込んではいけないもの。
+# ★背景・構図・画風メタは必ず落とす: 参考画像の白背景をそのまま持ち込むと
+# 生成物も白背景になり、マゼンタ抜きが成立しない (2026-07-23ユーザー指摘
+# 「denoise 0.72では背景がマゼンタにならない」)。頭身・単独性・服の有無は
+# こちらが別に指定しているので、それらも捨てて衝突を避ける。
+CAPTION_DROP = (
+    "background", "backdrop", "border", "frame", "letterboxed",
+    "simple background", "white background", "grey background",
+    "gray background", "transparent background", "gradient background",
+    "chibi", "solo", "1girl", "1boy", "2girls", "multiple",
+    "full body", "fullbody", "upper body", "portrait", "close-up",
+    "looking at viewer", "standing", "sitting", "walking",
+    "monochrome", "greyscale", "grayscale", "lineart", "sketch",
+    "highres", "absurdres", "commentary", "artist name", "signature",
+    "watermark", "username", "web address", "text", "english text",
+    "nude", "naked", "nsfw",
+)
+
+
+def clean_caption_tags(tags, limit: int = 24) -> str:
+    """参考画像のタグ/説明文 → 立ち絵プロンプトに混ぜてよい断片。
+
+    背景・構図・画風のメタを落とし、見た目 (髪・目・服・色・種族) だけを
+    残す。tagsは list でも カンマ区切り文字列でもよい。"""
+    if isinstance(tags, str):
+        items = [t.strip() for t in tags.replace(chr(10), ",").split(",")]
+    else:
+        items = [str(t).strip() for t in (tags or [])]
+    out = []
+    for t in items:
+        low = t.lower().strip(" ._").replace("_", " ")
+        if not low or len(low) > 40:
+            continue
+        if any(d == low or d in low.split() or low.endswith(" " + d)
+               for d in CAPTION_DROP):
+            continue
+        if low in [o.lower() for o in out]:
+            continue
+        out.append(low)
+        if len(out) >= limit:
+            break
+    return ", ".join(out)
+
+
 def costume_hint(meta: dict) -> str:
     """依頼の原文 (日本語) から衣装語を拾って英語タグにする。
 
@@ -313,6 +357,9 @@ def concept_to_illustrious_prompt(meta: dict) -> str:
     notes = str(m.get("notes_en") or m.get("notes") or "").strip()
     cos = costume_hint(meta)
     parts = [head]                     # ① キャラの中身 (依頼の言葉)
+    cap = str(m.get("caption_tags") or "").strip()
+    if cap:                            # 参考画像から読んだ見た目 (背景は除去済)
+        parts.append(cap)
     if concept:
         parts.append(concept)
     if palette:

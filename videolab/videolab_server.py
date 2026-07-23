@@ -135,7 +135,13 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.63"
+__version__ = "0.11.64"
+# 0.11.64: 参考画像を「下地」から「言葉」へ (ユーザー提案「イラストから
+# プロンプトを作るモデルに一任し、1.0デノイズで背景情報は省く」)。WD14
+# taggerでdanbooruタグを読み、背景・構図・画風メタを落として立ち絵
+# プロンプトへ差し込む → denoise 1.0 = 下地なしで描けるので、参考画像の
+# 白背景を持ち込まずに済む (0.72では白背景がそのまま残っていた)。
+# タガーが使えない環境は BLIP → それも駄目なら従来のi2iへ退避。
 # 0.11.63: 歩行の仕上げをAniSora Lowへ一任 (ユーザー指示「VACEロー抜いて、
 # 仕上げ部分をAniSoraローに一任。歩きを強めに命じ回転しないように」)。
 # VACE High 3step → AniSora Low 3step の二段へ (骨は切替時に破棄済み=
@@ -8671,6 +8677,106 @@ def _seed_import_gpu_stills():
         f"(探した場所: {[str(c) for c in candidates]})")
 
 
+_TAGGER: dict = {}
+
+
+def _caption_reference(img, log) -> str:
+    """参考画像 → 見た目タグ (danbooru語)。取れなければ空文字。
+
+    ★2026-07-23ユーザー提案「イラストからプロンプトを作るモデルに一任し、
+    denoise 1.0 で背景情報は省くほうが確実」。実際 denoise 0.72 では参考
+    画像の白背景がそのまま残り、マゼンタ抜きが成立しなかった。
+    見た目を**言葉**へ移してしまえば、下地を一切使わずに済む。
+    主= WD14 tagger (アニメ絵→danbooruタグ。Illustriousの母語)。
+    副= BLIP captioning (transformersだけで動く保険)。"""
+    tags = _caption_wd14(img, log)
+    if not tags:
+        tags = _caption_blip(img, log)
+    if not tags:
+        return ""
+    try:
+        gs = _seed_import_gpu_stills()
+        cleaned = gs.clean_caption_tags(tags)
+    except Exception:                         # noqa: BLE001
+        cleaned = ""
+    if cleaned:
+        log(f"参考画像を読み取り: {cleaned[:160]}")
+    return cleaned
+
+
+def _caption_wd14(img, log) -> list:
+    """WD14 tagger (ONNX)。onnxruntimeが無ければ静かに空を返す。"""
+    try:
+        import csv
+        import numpy as np
+        import onnxruntime as ort
+    except Exception:                         # noqa: BLE001
+        return []
+    repo = os.environ.get("VIDEOLAB_TAGGER_REPO",
+                          "SmilingWolf/wd-swinv2-tagger-v3")
+    try:
+        if "sess" not in _TAGGER:
+            _ensure_disk_for(2.0, log, f"タガー {repo}")
+            mp = _hf_download(repo, "model.onnx", log, need_gb=2.0)
+            cp = _hf_download(repo, "selected_tags.csv", log, need_gb=2.0)
+            _TAGGER["sess"] = ort.InferenceSession(
+                mp, providers=["CPUExecutionProvider"])
+            with open(cp, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            _TAGGER["names"] = [r["name"] for r in rows]
+            _TAGGER["cats"] = [int(r.get("category", 0)) for r in rows]
+        sess = _TAGGER["sess"]
+        _, hh, ww, _ = sess.get_inputs()[0].shape
+        size = int(hh or 448)
+        im = img.convert("RGB")
+        side = max(im.size)
+        from PIL import Image as _I
+        pad = _I.new("RGB", (side, side), (255, 255, 255))
+        pad.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
+        arr = np.asarray(pad.resize((size, size), _I.BICUBIC),
+                         dtype=np.float32)[:, :, ::-1]        # RGB->BGR
+        out = sess.run(None, {sess.get_inputs()[0].name: arr[None]})[0][0]
+        names, cats = _TAGGER["names"], _TAGGER["cats"]
+        thr = float(os.environ.get("VIDEOLAB_TAGGER_THR", "0.35") or 0.35)
+        got = [(float(out[i]), names[i]) for i in range(len(names))
+               if cats[i] == 0 and float(out[i]) >= thr]   # 0=general
+        got.sort(reverse=True)
+        return [n for _p, n in got]
+    except Exception as e:                    # noqa: BLE001
+        log(f"WD14タガーを使えません ({type(e).__name__}: "
+            f"{str(e)[:100]}) — BLIPへ")
+        return []
+
+
+def _caption_blip(img, log) -> list:
+    """BLIP captioning (transformersのみ)。自然文なのでカンマで割る。"""
+    try:
+        import torch
+        from transformers import BlipForConditionalGeneration, BlipProcessor
+    except Exception:                         # noqa: BLE001
+        return []
+    repo = os.environ.get("VIDEOLAB_CAPTION_REPO",
+                          "Salesforce/blip-image-captioning-large")
+    try:
+        if "blip" not in _TAGGER:
+            _ensure_disk_for(3.0, log, f"キャプション {repo}")
+            _TAGGER["blip_p"] = BlipProcessor.from_pretrained(repo)
+            _TAGGER["blip"] = BlipForConditionalGeneration.from_pretrained(
+                repo, torch_dtype=torch.float16).to("cuda")
+        proc, model = _TAGGER["blip_p"], _TAGGER["blip"]
+        inp = proc(img.convert("RGB"), return_tensors="pt").to(
+            "cuda", torch.float16)
+        with torch.no_grad():
+            ids = model.generate(**inp, max_new_tokens=48)
+        txt = proc.decode(ids[0], skip_special_tokens=True)
+        return [t for t in txt.replace(" with ", ", ").replace(
+            " and ", ", ").split(",") if t.strip()]
+    except Exception as e:                    # noqa: BLE001
+        log(f"BLIPキャプションを使えません ({type(e).__name__}: "
+            f"{str(e)[:100]})")
+        return []
+
+
 def _seed_front_pose_png(meta: dict, w: int, h: int):
     """正面直立の OpenPose 1枚 (Illustrious ControlNet用)。
 
@@ -8804,12 +8910,22 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
     _has_text = any(str(meta.get(k) or "").strip() for k in (
         "concept", "concept_en", "palette", "palette_en",
         "silhouette", "silhouette_en", "notes", "notes_en"))
+    # ★参考画像は「下地」ではなく「言葉」にして使う (2026-07-23ユーザー提案)。
+    # 下地(i2i)にすると参考画像の白背景まで持ち込まれ、マゼンタ抜きが成立
+    # しない実害があった。見た目をタグへ移せば denoise 1.0 = 下地なしで
+    # 描けるので、背景は完全にこちらの指定どおりになる。
+    if ref_img is not None:
+        j["detail"] = "GPU立ち絵: 参考画像を読み取り中"
+        _cap = _caption_reference(ref_img, log)
+        if _cap:
+            meta["caption_tags"] = _cap
+            _has_text = True
+        else:
+            log("⚠ 参考画像から見た目を読み取れませんでした — "
+                "下地(i2i)で代用します")
     _den_env = os.environ.get("VIDEOLAB_STILLS_DENOISE", "").strip()
     _den = float(_den_env) if _den_env else (1.0 if _has_text else 0.72)
     _use_init = ref_img is not None and _den < 0.99
-    if ref_img is not None and not _has_text:
-        log("依頼文が空 — 参考画像を下地に使います "
-            f"(denoise={_den})")
 
     # ---- 0) 依頼文の英語化 (Codex無し・機械翻訳) ----
     try:
