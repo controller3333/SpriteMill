@@ -115,10 +115,19 @@ COSTUME_GLOSSARY = (
 # 生成物も白背景になり、マゼンタ抜きが成立しない (2026-07-23ユーザー指摘
 # 「denoise 0.72では背景がマゼンタにならない」)。頭身・単独性・服の有無は
 # こちらが別に指定しているので、それらも捨てて衝突を避ける。
+# ★"background" を含むタグは色によらず**全部**落とす (2026-07-23ユーザー
+# 指摘「黒でも透明でもついてたら困る」)。部分一致にしてあるので
+# black/transparent/two-tone/checkered… どれが来ても確実に消える。
+CAPTION_DROP_SUBSTR = ("background", "backdrop", "wallpaper")
+# 背景の語が無くても「後ろに何かを描かせる」タグも塞ぐ (場所・天候・
+# 光・小道具)。キャラの見た目だけを残すのがこの関数の役目。
 CAPTION_DROP = (
-    "background", "backdrop", "border", "frame", "letterboxed",
-    "simple background", "white background", "grey background",
-    "gray background", "transparent background", "gradient background",
+    "border", "frame", "letterboxed",
+    "indoors", "outdoors", "scenery", "sky", "cloud", "clouds", "sun",
+    "moon", "star", "stars", "tree", "trees", "grass", "flower field",
+    "wall", "floor", "ceiling", "window", "door", "room", "road",
+    "水", "night", "day", "sunset", "sunlight", "lens flare",
+    "shadow", "cast shadow", "reflection", "gradient", "vignette",
     "chibi", "solo", "1girl", "1boy", "2girls", "multiple",
     "full body", "fullbody", "upper body", "portrait", "close-up",
     "looking at viewer", "standing", "sitting", "walking",
@@ -143,6 +152,8 @@ def clean_caption_tags(tags, limit: int = 24) -> str:
         low = t.lower().strip(" ._").replace("_", " ")
         if not low or len(low) > 40:
             continue
+        if any(d in low for d in CAPTION_DROP_SUBSTR):
+            continue                       # 色を問わず背景タグは全部捨てる
         if any(d == low or d in low.split() or low.endswith(" " + d)
                for d in CAPTION_DROP):
             continue
