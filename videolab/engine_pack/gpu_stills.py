@@ -322,8 +322,52 @@ def max_area_for(leg_scale) -> float:
     return 0.45
 
 
+def subject_parts(img, min_frac: float = 0.02) -> tuple:
+    """キー済み立ち絵の前景を連結成分に分ける。
+
+    戻り値 (最大塊の占有率, min_frac以上の塊の数, 縁に接している辺の数)。
+    ★ターンテーブルは渡された絵を増幅する。分身・浮いた欠片・見切れを
+    抱えたまま回すと8方向すべてがクリーチャーになる (2026-07-23実障害:
+    背面セルが顔2つ・耳4本・宙に浮いた耳の欠片つきで出た)。回す前に
+    ここで止める。scipy無しで済むよう、縮小マスク上の反復伝播で数える。"""
+    import numpy as np
+    from PIL import Image as _I
+    a = np.asarray(img.convert("RGB")).astype(int)
+    dist = (np.abs(a[..., 0] - MAGENTA[0]) + np.abs(a[..., 1] - MAGENTA[1])
+            + np.abs(a[..., 2] - MAGENTA[2]))
+    fg = dist >= 70
+    if not fg.any():
+        return 0.0, 0, 0
+    h, w = fg.shape
+    b = max(1, int(min(h, w) * 0.01))
+    edges = sum(bool(x) for x in (
+        fg[:b].any(), fg[-b:].any(), fg[:, :b].any(), fg[:, -b:].any()))
+    small = np.asarray(_I.fromarray((fg * 255).astype("uint8")).resize(
+        (96, 160), _I.NEAREST)) > 127
+    lab = np.zeros(small.shape, dtype=np.int32)
+    lab[small] = np.arange(1, int(small.sum()) + 1)
+    for _ in range(240):
+        prev = lab
+        m = lab.copy()
+        m[1:, :] = np.maximum(m[1:, :], lab[:-1, :])
+        m[:-1, :] = np.maximum(m[:-1, :], lab[1:, :])
+        m[:, 1:] = np.maximum(m[:, 1:], lab[:, :-1])
+        m[:, :-1] = np.maximum(m[:, :-1], lab[:, 1:])
+        lab = np.where(small, m, 0)
+        if np.array_equal(lab, prev):
+            break
+    ids, counts = np.unique(lab[lab > 0], return_counts=True)
+    if not len(counts):
+        return 0.0, 0, edges
+    tot = float(counts.sum())
+    big = int((counts >= tot * min_frac).sum())
+    return float(counts.max()) / tot, big, edges
+
+
 def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
-              max_area: float = 0.45, min_torso: float = 0.6) -> tuple:
+              max_area: float = 0.45, min_torso: float = 0.6,
+              max_height: float = 0.97, min_main: float = 0.82,
+              max_parts: int = 3) -> tuple:
     """立ち絵として使えるか (ok, 理由)。閾値は実走4枚の実測から:
 
       正常 = 面積21.8% / 22.7% (縦90%・97%)
@@ -340,12 +384,25 @@ def stills_ok(img, min_area: float = 0.04, min_height: float = 0.45,
     if area > max_area:
         return False, (f"画面を埋めすぎです (面積{area * 100:.0f}% — "
                        "複数体を並べた可能性)")
+    # ★ターンテーブルに回す前の「成立している見た目」検査 (2026-07-23)
+    if height > max_height:
+        return False, (f"上下が見切れています (縦{height * 100:.0f}% — "
+                       "頭か足がキャンバス外に出ている)")
+    main, parts, edges = subject_parts(img)
+    if parts > max_parts:
+        return False, (f"体がばらけています (大きな塊が{parts}個 — "
+                       "分身や浮いた欠片の可能性)")
+    if main < min_main:
+        return False, (f"胴体が一塊になっていません (最大塊{main * 100:.0f}%"
+                       " — 分身や欠片が混ざっている)")
+    if edges >= 3:
+        return False, f"四方が見切れています (縁に接する辺{edges}/4)"
     torso = torso_solid(img)
     if torso < min_torso:
         return False, (f"胴が抜けています (中心線の残り{torso * 100:.0f}% — "
                        "背景と同系色の服がキーで消えた可能性)")
     return True, (f"面積{area * 100:.1f}% 縦{height * 100:.0f}% "
-                  f"胴{torso * 100:.0f}%")
+                  f"胴{torso * 100:.0f}% 一塊{main * 100:.0f}%")
 
 
 def concept_to_illustrious_prompt(meta: dict) -> str:
@@ -647,6 +704,7 @@ def build_seed_pack_zip(req: dict, rid: str = "",
                         templates_dir: Path | None = None,
                         ref_bytes: bytes | None = None,
                         stills_model: str | None = None,
+                        front_bytes: bytes | None = None,
                         ) -> tuple[str, bytes, dict]:
     """Codex無しでGPUに渡すシードパック (8方向なし) を作る。
 
@@ -677,7 +735,8 @@ def build_seed_pack_zip(req: dict, rid: str = "",
         "palette": str(req.get("palette") or "").strip(),
         "silhouette": str(req.get("silhouette") or "").strip(),
         "notes": str(req.get("notes") or "").strip(),
-        "stills_source": "gpu_turntable",
+        "stills_source": ("front_turntable" if front_bytes
+                          else "gpu_turntable"),
         "stills_model": model,
         "request_id": rid,
         "source_round": f"seed_{rid}" if rid else "seed",
@@ -711,6 +770,12 @@ def build_seed_pack_zip(req: dict, rid: str = "",
             z.writestr("motion_prompt.txt", motion_en)
         if ref_bytes:
             z.writestr("ref.png", ref_bytes)
+        # ★出来合いの正面立ち絵 (Codexが描いたもの等)。これが入っていれば
+        # GPUは生成せず、そのまま360°ターンテーブルへ回す
+        # (2026-07-23ユーザー提案「Codexルートも正面だけ出させて、AniSoraに
+        # 360度ローテートさせれば連続性維持した8方向を安定して作れる」)。
+        if front_bytes:
+            z.writestr("front.png", front_bytes)
         if templates_dir is None:
             templates_dir = Path(__file__).resolve().parent.parent / "templates"
         tp = Path(templates_dir) / f"{tmpl}.json"

@@ -135,7 +135,22 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.67"
+__version__ = "0.11.70"
+# 0.11.70: ターンテーブルへ回す前に「成立している見た目」を検査する
+# (ユーザー指示)。回転は渡された絵を増幅するので、分身・浮いた欠片・
+# 見切れを抱えたまま回すと8方向すべてがクリーチャーになる (2026-07-23の
+# ロップ実障害: 背面セルが顔2つ・耳4本・宙に浮いた耳の欠片つき)。追加した
+# のは ①縦占有の上限97% (従来は下限しか見ておらず縦100%=見切れが素通り
+# していた) ②連結成分の最大塊>=82% (分身・欠片の検出) ③大きな塊は3個まで
+# ④四辺のうち3辺以上に接していたら見切れ。実測: 正常3枚=最大塊99.9-100%
+# /塊1個、事故絵=最大塊47%/塊2個。
+# 0.11.69: 「正面1枚+360°回転」を Codexルートでも使えるように受け口を新設
+# (ユーザー提案「Codexルートも正面だけ出させてAniSoraに回させれば連続性
+# 維持した8方向を安定して作れる」)。パックに front.png があればGPUは正面を
+# 生成せず、その1枚をターンテーブルへ回す。stills_source=front_turntable。
+# 0.11.68: 対向ペア4枚のタグを進捗スパン表へ登録 (未登録で KeyError
+# 'P1_front_back' となり依頼ごと失敗した)。参照側も .get() で安全側へ —
+# 進捗表示のための数値でジョブを落とす価値はない。
 # 0.11.67: 歩行をAniSora Low単体・骨なし・その場足踏みへ (ユーザー指示
 # 「VACEハイは顔ごと変えてしまうので骨指定せず、歩行もAniSoraローで全部。
 # 回転しないようその場足踏み。1フレーム目と中間と終端は立ち絵にして、
@@ -8961,126 +8976,147 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         log(f"英語化スキップ: {str(e)[:120]}")
 
     # ---- 1) 正面立ち絵 ----
-    j["detail"] = f"GPU立ち絵: {model} 正面生成"
-    log(f"GPU立ち絵フォールバック開始 (model={model})")
-    if model == "qwen":
-        prompt = gs.concept_to_qwen_prompt(meta)
-        fw, fh = 768, 1344
-        neg = gs.stills_negative(meta, QwenImageAdapter.NEG)
-        extra: dict = {}
-        mode = "i2i" if _use_init else "t2i"
-        images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
-        if _use_init:
-            extra["denoise"] = _den
-        steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "30") or 30)
-        cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "4.0") or 4.0)
+    # ★出来合いの正面が同梱されていれば生成しない (2026-07-23ユーザー提案):
+    # Codexルートも「正面1枚だけ描かせて、あとはAniSoraの360°回転で8方向」
+    # にすれば、8枚を別々に描くより連続性と同一性が構造的に保たれる。
+    _given = None
+    for _cand in (pack / "front.png", pack / "01_generation" / "front.png"):
+        if _cand.is_file():
+            _given = _cand
+            break
+    if _given is not None:
+        front = gs.key_to_magenta(_PIL.open(_given).convert("RGB"))
+        _ok_g, _why_g = gs.stills_ok(
+            front, max_area=gs.max_area_for(meta.get("leg_scale")))
+        log(f"同梱の正面立ち絵を使用: {_given.name} ({_why_g})"
+            + ("" if _ok_g else " ★検査は通らなかったがそのまま使う"))
+        front_save = pack / "01_generation" / "seed_front.png"
+        front_save.parent.mkdir(parents=True, exist_ok=True)
+        front.save(front_save)
+        j["detail"] = "GPU立ち絵: 同梱の正面から回転"
     else:
-        prompt = gs.concept_to_illustrious_prompt(meta)
-        fw = int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768)
-        fh = int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344)
-        fw, fh = _snap(fw, 8, 512), _snap(fh, 8, 512)
-        pose = _seed_front_pose_png(meta, fw, fh)
-        pose_path = pack / "01_generation" / "seed_front_pose.png"
-        pose_path.parent.mkdir(parents=True, exist_ok=True)
-        pose.save(pose_path)
-        buf = io.BytesIO()
-        pose.save(buf, format="PNG")
-        extra = {
-            "pose_image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
-            "controlnet_scale": float(
-                os.environ.get("VIDEOLAB_STILLS_CN", "0.95") or 0.95),
-        }
-        neg = gs.stills_negative(meta, IllustriousAdapter.NEG)
-        mode = "i2i" if _use_init else "t2i"
-        images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
-        if _use_init:
-            extra["denoise"] = _den
-        steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "28") or 28)
-        cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "6.0") or 6.0)
-        for cfgp in (HERE.parent / "config.json", HERE / "config.json"):
-            try:
-                hft = str(json.loads(cfgp.read_text(encoding="utf-8"))
-                          .get("hf_token") or "").strip()
-                if hft:
-                    extra["hf_token"] = hft
-                    break
-            except Exception:
-                pass
-
-    try:
-        jid1 = submit_job(model, GenRequest(
-            mode=mode, prompt=prompt, negative=neg, images=images,
-            width=fw, height=fh, num_frames=1, fps=1, steps=steps,
-            seed=seed, guidance=cfg, extra=extra))
-        sj1 = _wp_wait(j, jid1, 0.02, 0.25)
-    except Exception as e:                # noqa: BLE001
-        if model != "illustrious" and "illustrious" in ADAPTERS:
-            log(f"{model} 正面生成失敗 → illustrious 再試行: {str(e)[:160]}")
-            model = "illustrious"
-            # Illustrious で作り直し
+        front = None
+    if front is None:
+        j["detail"] = f"GPU立ち絵: {model} 正面生成"
+        log(f"GPU立ち絵フォールバック開始 (model={model})")
+        if model == "qwen":
+            prompt = gs.concept_to_qwen_prompt(meta)
+            fw, fh = 768, 1344
+            neg = gs.stills_negative(meta, QwenImageAdapter.NEG)
+            extra: dict = {}
+            mode = "i2i" if _use_init else "t2i"
+            images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
+            if _use_init:
+                extra["denoise"] = _den
+            steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "30") or 30)
+            cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "4.0") or 4.0)
+        else:
             prompt = gs.concept_to_illustrious_prompt(meta)
-            fw = _snap(int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768),
-                       8, 512)
-            fh = _snap(int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344),
-                       8, 512)
+            fw = int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768)
+            fh = int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344)
+            fw, fh = _snap(fw, 8, 512), _snap(fh, 8, 512)
             pose = _seed_front_pose_png(meta, fw, fh)
+            pose_path = pack / "01_generation" / "seed_front_pose.png"
+            pose_path.parent.mkdir(parents=True, exist_ok=True)
+            pose.save(pose_path)
             buf = io.BytesIO()
             pose.save(buf, format="PNG")
             extra = {
-                "pose_image_b64": base64.b64encode(
-                    buf.getvalue()).decode("ascii"),
-                "controlnet_scale": 0.95,
+                "pose_image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+                "controlnet_scale": float(
+                    os.environ.get("VIDEOLAB_STILLS_CN", "0.95") or 0.95),
             }
-            jid1 = submit_job("illustrious", GenRequest(
-                mode="t2i", prompt=prompt,
-                negative=gs.stills_negative(meta, IllustriousAdapter.NEG),
-                images=[], width=fw, height=fh, num_frames=1, fps=1,
-                steps=28, seed=seed, guidance=6.0, extra=extra))
+            neg = gs.stills_negative(meta, IllustriousAdapter.NEG)
+            mode = "i2i" if _use_init else "t2i"
+            images = [_fit_ref(ref_img, fw, fh)] if _use_init else []
+            if _use_init:
+                extra["denoise"] = _den
+            steps = int(os.environ.get("VIDEOLAB_STILLS_STEPS", "28") or 28)
+            cfg = float(os.environ.get("VIDEOLAB_STILLS_CFG", "6.0") or 6.0)
+            for cfgp in (HERE.parent / "config.json", HERE / "config.json"):
+                try:
+                    hft = str(json.loads(cfgp.read_text(encoding="utf-8"))
+                              .get("hf_token") or "").strip()
+                    if hft:
+                        extra["hf_token"] = hft
+                        break
+                except Exception:
+                    pass
+
+        try:
+            jid1 = submit_job(model, GenRequest(
+                mode=mode, prompt=prompt, negative=neg, images=images,
+                width=fw, height=fh, num_frames=1, fps=1, steps=steps,
+                seed=seed, guidance=cfg, extra=extra))
             sj1 = _wp_wait(j, jid1, 0.02, 0.25)
-        else:
-            raise
-    front_path = Path(str(sj1.get("path") or ""))
-    if not front_path.is_file():
-        raise RuntimeError("正面立ち絵の生成結果がありません")
-    front = gs.key_to_magenta(_PIL.open(front_path).convert("RGB"))
-    # ★背景同化ゲート (v0.11.52): 背景と同じ色で塗られたキャラはキー後に
-    # 消え、髪だけの絵が回転→歩行まで流れる (2026-07-23実走)。ここで弾いて
-    # 種を変えて描き直す — 下流で気づくと20分と数百円を捨てることになる
-    tries = max(1, int(os.environ.get("VIDEOLAB_STILLS_TRIES", "3") or 3))
-    _mx = gs.max_area_for(meta.get('leg_scale'))
-    ok, why = gs.stills_ok(front, max_area=_mx)
-    for att in range(2, tries + 1):
-        if ok:
-            break
-        log(f"⚠ 正面立ち絵をやり直します ({att - 1}/{tries - 1}): {why}")
-        j["detail"] = f"GPU立ち絵: {model} 正面やり直し {att - 1}"
-        seed = (seed + 7919) % (2 ** 31)
-        # ★同じ手を繰り返さない: 下地(i2i)が原因のことがあるので、2回目
-        # からは参考画像を外して t2i にする (種替えだけだと3回とも同じ
-        # 失敗を繰り返して依頼ごと落ちる — ロップの実障害)
-        if mode == "i2i" and _has_text:
-            log("  下地(参考画像)を外して t2i でやり直します")
-            mode, images = "t2i", []
-            extra.pop("denoise", None)
-        jid_r = submit_job(model, GenRequest(
-            mode=mode, prompt=prompt, negative=neg, images=images,
-            width=fw, height=fh, num_frames=1, fps=1, steps=steps,
-            seed=seed, guidance=cfg, extra=extra))
-        sj_r = _wp_wait(j, jid_r, 0.02, 0.25)
-        p_r = Path(str(sj_r.get("path") or ""))
-        if not p_r.is_file():
-            continue
-        cand = gs.key_to_magenta(_PIL.open(p_r).convert("RGB"))
-        ok, why = gs.stills_ok(cand, max_area=_mx)
-        front = cand
-    if not ok:
-        raise RuntimeError(
-            f"正面立ち絵が{tries}回とも使えませんでした: {why} "
-            "(背景と同系色に塗られている可能性 — palette指定を見直すか "
-            "VIDEOLAB_STILLS_TRIES を増やしてください)")
-    front_save = pack / "01_generation" / "seed_front.png"
-    front.save(front_save)
-    log(f"正面立ち絵完了: {front_save.name} ({why})")
+        except Exception as e:                # noqa: BLE001
+            if model != "illustrious" and "illustrious" in ADAPTERS:
+                log(f"{model} 正面生成失敗 → illustrious 再試行: {str(e)[:160]}")
+                model = "illustrious"
+                # Illustrious で作り直し
+                prompt = gs.concept_to_illustrious_prompt(meta)
+                fw = _snap(int(os.environ.get("VIDEOLAB_STILLS_W", "768") or 768),
+                           8, 512)
+                fh = _snap(int(os.environ.get("VIDEOLAB_STILLS_H", "1344") or 1344),
+                           8, 512)
+                pose = _seed_front_pose_png(meta, fw, fh)
+                buf = io.BytesIO()
+                pose.save(buf, format="PNG")
+                extra = {
+                    "pose_image_b64": base64.b64encode(
+                        buf.getvalue()).decode("ascii"),
+                    "controlnet_scale": 0.95,
+                }
+                jid1 = submit_job("illustrious", GenRequest(
+                    mode="t2i", prompt=prompt,
+                    negative=gs.stills_negative(meta, IllustriousAdapter.NEG),
+                    images=[], width=fw, height=fh, num_frames=1, fps=1,
+                    steps=28, seed=seed, guidance=6.0, extra=extra))
+                sj1 = _wp_wait(j, jid1, 0.02, 0.25)
+            else:
+                raise
+        front_path = Path(str(sj1.get("path") or ""))
+        if not front_path.is_file():
+            raise RuntimeError("正面立ち絵の生成結果がありません")
+        front = gs.key_to_magenta(_PIL.open(front_path).convert("RGB"))
+        # ★背景同化ゲート (v0.11.52): 背景と同じ色で塗られたキャラはキー後に
+        # 消え、髪だけの絵が回転→歩行まで流れる (2026-07-23実走)。ここで弾いて
+        # 種を変えて描き直す — 下流で気づくと20分と数百円を捨てることになる
+        tries = max(1, int(os.environ.get("VIDEOLAB_STILLS_TRIES", "3") or 3))
+        _mx = gs.max_area_for(meta.get('leg_scale'))
+        ok, why = gs.stills_ok(front, max_area=_mx)
+        for att in range(2, tries + 1):
+            if ok:
+                break
+            log(f"⚠ 正面立ち絵をやり直します ({att - 1}/{tries - 1}): {why}")
+            j["detail"] = f"GPU立ち絵: {model} 正面やり直し {att - 1}"
+            seed = (seed + 7919) % (2 ** 31)
+            # ★同じ手を繰り返さない: 下地(i2i)が原因のことがあるので、2回目
+            # からは参考画像を外して t2i にする (種替えだけだと3回とも同じ
+            # 失敗を繰り返して依頼ごと落ちる — ロップの実障害)
+            if mode == "i2i" and _has_text:
+                log("  下地(参考画像)を外して t2i でやり直します")
+                mode, images = "t2i", []
+                extra.pop("denoise", None)
+            jid_r = submit_job(model, GenRequest(
+                mode=mode, prompt=prompt, negative=neg, images=images,
+                width=fw, height=fh, num_frames=1, fps=1, steps=steps,
+                seed=seed, guidance=cfg, extra=extra))
+            sj_r = _wp_wait(j, jid_r, 0.02, 0.25)
+            p_r = Path(str(sj_r.get("path") or ""))
+            if not p_r.is_file():
+                continue
+            cand = gs.key_to_magenta(_PIL.open(p_r).convert("RGB"))
+            ok, why = gs.stills_ok(cand, max_area=_mx)
+            front = cand
+        if not ok:
+            raise RuntimeError(
+                f"正面立ち絵が{tries}回とも使えませんでした: {why} "
+                "(背景と同系色に塗られている可能性 — palette指定を見直すか "
+                "VIDEOLAB_STILLS_TRIES を増やしてください)")
+        front_save = pack / "01_generation" / "seed_front.png"
+        front.save(front_save)
+        log(f"正面立ち絵完了: {front_save.name} ({why})")
 
     # ---- 2) AniSora Low ターンテーブル (360°) ----
     j["detail"] = "GPU立ち絵: AniSora Low ターンテーブル"
@@ -9385,6 +9421,13 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         _lo = 0.02 + 0.86 * _di / len(_WP_DIRS)
         _hi = 0.02 + 0.86 * (_di + 1) / len(_WP_DIRS)
         spans[f"D{_di + 1:02d}_{_dd}"] = (_lo, _lo, _lo, _hi)
+    # 対向ペア4枚 (2026-07-23)。★spansに載せ忘れると KeyError で依頼ごと
+    # 落ちる (実際に 'P1_front_back' で落とした) ので layout定義から導く
+    for _pi, _pl in enumerate(cw.LAYOUT_PAIRS4):
+        _lo = 0.02 + 0.86 * _pi / len(cw.LAYOUT_PAIRS4)
+        _hi = 0.02 + 0.86 * (_pi + 1) / len(cw.LAYOUT_PAIRS4)
+        _ptag = "P{}_{}".format(_pi + 1, "_".join(d for d in _pl[2] if d))
+        spans[_ptag] = (_lo, _lo, _lo, _hi)
     def _gen_hemisphere(tag: str, layout, seed: int = 42) -> None:
         """半球1つ分 (骨格グリッド→VACE→AniSora再加工→セル分割)。
 
@@ -9393,7 +9436,10 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
         (退避は呼び出し側の責任)。"""
         if j.get("_cancel"):
             raise JobCancelled()
-        s1lo, s1hi, s2lo, s2hi = spans[tag]
+        # ★未登録タグでも落とさない: 進捗表示のためだけの値で、
+        # ここのKeyErrorで依頼を失敗させる価値はない (2026-07-23に
+        # レイアウト追加で 'P1_front_back' が無くて実際に落とした)
+        s1lo, s1hi, s2lo, s2hi = spans.get(tag, (0.02, 0.45, 0.45, 0.88))
         _face_gap = None       # 実験g3: 間引きギャップ用の顔限定制御列
         j["detail"] = f"[{tag}] 骨格グリッド生成"
         log(f"[{tag}] 骨格グリッド生成 ({nf}f {w}x{h}, "
