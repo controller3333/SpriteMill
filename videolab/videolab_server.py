@@ -135,7 +135,23 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.82"
+__version__ = "0.11.83"
+# 0.11.83: ネガティブが77トークンを溢れて半分死んでいたのを収める +
+# magenta hair を否定へ (2026-07-24ユーザー指示)。
+# CLIPは77トークンで打ち切り、diffusersは truncation=True で黙って捨てる
+# (IllustriousAdapter は kw=dict(prompt=..., negative_prompt=...) に生文字列を
+# 渡すだけで prompt_embeds もチャンク分割も無い)。実測で本番のネガティブは
+# **140〜144トークン** = 後ろ半分が一度もモデルに届いていなかった。犠牲は末尾の
+# COLOR_NEG で、monochrome と white background は全依頼で常に圏外 —
+# 「白い線画が出て被写体面積0%で落ちた」実障害への対策が、書かれてから一度も
+# 効いていない。テストの  lint と同じ「書いたのに働かない番人」型。
+# 同義語を畳んで 68〜72トークンへ (余裕5〜9)。捨てたのは重複のみ
+# (greyscale/grayscale、lineart/line art/sketch、2girls/3girls/crowd 等)。
+# tests/test_gpu_stills.py に77トークン予算の番人を置いた — 実トークナイザが
+# あれば実測、無ければ近似 (実測を最大5過小評価するので+6の余裕込み)。
+# ★正のプロンプトは未対応: 長い依頼 (実測120トークン) では末尾の背景指定・
+# fully clothed・full body・front view が全部切られ、solo しか残らない。
+# 概念の予算配分か、チャンク分割エンコードでの根治が要る。
 # 0.11.82: キーのしきい値を「谷」へ寄せ直す (衝突しているキャラだけ)。
 # らいよんちゃん実測: 髪のマゼンタ度 p98=69 に対しきい値70 = 余裕1。背景は
 # 211〜218 なので谷は146も空いているのに、しきい値がキャラの肩に乗っていた。
@@ -3151,9 +3167,13 @@ class IllustriousAdapter(VideoAdapter):
     disk_gb = 12
     defaults = {"width": 1152, "height": 896, "num_frames": 1, "fps": 1,
                 "steps": 28, "guidance": 6.0}
-    NEG = ("worst quality, low quality, bad anatomy, bad hands, "
-           "extra digits, fewer digits, watermark, signature, text, "
-           "jpeg artifacts, blurry, lowres")
+    # ★短く保つこと: CLIPは77トークンで打ち切る。ここに gpu_stills の
+    # 頭身/背景/単独/NSFW/彩色の否定が連結されるので、土台が長いと**後ろから
+    # 黙って捨てられる**。2026-07-24の実測で連結後140〜144トークン = 半分が
+    # 一度も適用されていなかった (monochrome と white background は全依頼で
+    # 常に圏外)。tests/test_gpu_stills.py に77トークン予算の番人がある。
+    NEG = ("worst quality, low quality, blurry, bad anatomy, "
+           "watermark, text")
 
     def __init__(self):
         super().__init__()
