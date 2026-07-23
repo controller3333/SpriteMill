@@ -135,7 +135,18 @@ __version__ = "0.11.0"  # 0.11.0: 動きの型4択=AI経路の一本化 (2026-07
 # 0.11.1: AI生成を真のAniSora空間インペイントへ。体マスク内は
 # 開始σ1.0の純ノイズ潜在、顔/推定頭部帯/bbox外背景は静止参照を
 # 毎step潜在固定+デコード後画素固定。ai->otherの姿勢固定文も撤去。
-__version__ = "0.11.74"
+__version__ = "0.11.76"
+# 0.11.76: 8方向の割り当てを総当たりへ (ユーザー報告「向きのフォーマットが
+# まだ狂ってる」)。従来は「正面1枚を当てる」→「回り方を当てる」の推定を
+# 直列に重ねており、どちらか外れると8方向まるごとずれた。C17の8方向指示書
+# 全部を送り、8起点×2回り=16通りの総誤差が最小の配置を採る。どの1枚にも
+# 賭けない。指示書が揃わない環境だけ従来推定へ退避。
+# 0.11.75: 足踏みが全く動かなかった件の根治 (ユーザー報告「びっくりする
+# ほど歩きません!」)。latent源に立ち絵をnf枚並べた**静止動画**を渡していた
+# のが原因 — SDEdit式の再加工は元の動きを保つので、動かない素材からは
+# 動かない結果しか出ない。refine源もlatent固定も廃し、参照キャンバス1枚
+# からの素のi2vへ (同じAniSoraのターンテーブルがこの構成で360°回っている
+# のが反証)。回転止めはプロンプト側 (足踏み+facing固定) に委ねる。
 # 0.11.74: 見た目検査の見切れ判定を「縦の割合」から「上端と下端の両方に
 # 実際に接しているか」へ。0.11.70の縦97%上限は厳しすぎ、良品まで3回とも
 # 弾いて依頼を落とした (ロップ「縦99%」で失敗)。骨格が画面の86%を占める
@@ -9189,56 +9200,39 @@ def _seed_build_stills(j: dict, pid: str, meta: dict, log) -> None:
         _fr = gs.facing_ref_path()
         if _fr is not None:
             ref_right = _PIL.open(_fr).convert("RGB")
-    # ★正面コマを回転の中から探す (2026-07-23ユーザー指示)。立ち絵が正面
-    # 向きに描かれるとは限らず、そのときフレーム0を正面とみなすと8方向
-    # まるごとずれる。左右対称性 + C17 front指示書との近さで選ぶ。
-    ref_front = None
-    for cand in (pack / "facing_ref_front.png",
-                 pack / "01_generation" / "facing_ref_front.png"):
-        if cand.is_file():
-            ref_front = _PIL.open(cand).convert("RGB")
-            break
-    if ref_front is None:
-        _ff = gs.facing_ref_path(kind="front")
-        if _ff is not None:
-            ref_front = _PIL.open(_ff).convert("RGB")
-    ref_back = None
-    for cand in (pack / "facing_ref_back.png",
-                 pack / "01_generation" / "facing_ref_back.png"):
-        if cand.is_file():
-            ref_back = _PIL.open(cand).convert("RGB")
-            break
-    if ref_back is None:
-        _fb = gs.facing_ref_path(kind="back")
-        if _fb is not None:
-            ref_back = _PIL.open(_fb).convert("RGB")
-    front_idx = gs.find_front_index(frames, ref_front, ref_back)
-    if front_idx:
-        log(f"正面コマを回転内から検出: フレーム{front_idx}/{len(frames)} "
-            "(立ち絵が正面向きでなかったため0コマ目を使わない)")
-    sense, score = gs.measure_rotation_sense(frames, ref_right)
-    order = gs.turntable_order(sense)
-    if sense == 0:
-        log(f"⚠ 回転の向きを判定できず (score={score:+.1f}"
-            f"{'・向き参照なし' if ref_right is None else ''}) — "
-            "右回り既定で切り出します")
+    # ★8方向まとめて総当たりで配置を決める (2026-07-23ユーザー報告
+    # 「向きのフォーマットが狂ってる」「前後が逆」)。従来は「正面1枚を
+    # 当てる」→「回り方を当てる」の推定を直列に重ねており、どちらか外れると
+    # 8方向まるごとずれた。8つの起点 × 2つの回り方 = 16通りを指示書と
+    # 突き合わせ、総誤差が最小の配置を採る。どの1枚にも賭けない。
+    _guides = {}
+    for _d in gs.TURNTABLE_RIGHT_FIRST:
+        for _c in (pack / f"facing_ref_{_d}.png",
+                   pack / "01_generation" / f"facing_ref_{_d}.png"):
+            if _c.is_file():
+                _guides[_d] = _PIL.open(_c).convert("RGB")
+                break
+        else:
+            _gp = gs.facing_ref_path(kind=_d)
+            if _gp is not None:
+                _guides[_d] = _PIL.open(_gp).convert("RGB")
+    _order, _fi, _sc = gs.align_turntable(frames, _guides)
+    if _order is not None:
+        order, front_idx = _order, _fi
+        log(f"8方向の配置を総当たりで決定: "
+            f"{'右回り' if order is gs.TURNTABLE_RIGHT_FIRST else '左回り'}"
+            f"・正面=フレーム{front_idx}/{len(frames)} (誤差{_sc:.1f})")
     else:
-        log(f"回転の向き実測: {'右回り' if sense > 0 else '左回り'} "
-            f"(score={score:+.1f}) → 1/4周を "
-            f"{order[2]} として切り出します")
+        # 指示書が揃わない環境は従来推定へ
+        ref_front = _guides.get("front")
+        ref_back = _guides.get("back")
+        front_idx = gs.find_front_index(frames, ref_front, ref_back)
+        sense, score = gs.measure_rotation_sense(frames, _guides.get("right"))
+        order = gs.turntable_order(sense)
+        log(f"指示書が揃わないため従来推定: 正面={front_idx} "
+            f"回り={'右' if sense >= 0 else '左'}")
     crops = gs.extract_turntable_dirs(frames, order=order,
                                       front_idx=front_idx)
-    # ★切り出した2枚で前後を検証し、逆なら半周ずらして取り直す
-    # (2026-07-23ユーザー報告「前後・斜め前後が逆」)。1枚で正面を当てる
-    # 賭けより、front枠とback枠を突き合わせる方が確実に効く。
-    if gs.front_back_swapped(crops.get("front"), crops.get("back"),
-                             ref_front, ref_back):
-        half = max(1, (len(frames) - 1) // 2)
-        front_idx = (front_idx + half) % max(1, len(frames) - 1)
-        log(f"前後が逆でした — 正面を半周ずらして取り直します "
-            f"(front={front_idx})")
-        crops = gs.extract_turntable_dirs(frames, order=order,
-                                          front_idx=front_idx)
     # 正面は生成原画を優先 (回転0°のブレ防止)
     # 正面コマが回転の先頭 (=生成した立ち絵そのもの) のときだけ原画を
     # 優先する。回転の途中から採ったならそちらが本当の正面なので触らない
@@ -9965,24 +9959,19 @@ def _walkpack_run(j: dict, pid: str, meta: dict, log) -> None:
             #   ・その間だけ AniSora が動きを作る = その場足踏み
             # 錨が「立ち姿」なので周期の節目で必ず立ち姿へ戻り、向きが
             # 流れない (回転priorを構造で殺す)。動きの強さは motion=4。
-            _march_sigma = _wp_knob_float(_kn, "march_sigma", 0.90, 0.60, 0.95)
-            # ★中間の錨は外す (2026-07-23ユーザー指示「中央に錨が
-            # あると歩かないかもしれません。最初とラストだけでいいかも」)。
-            # 中間を立ち姿へ固定すると、その前後が立ち姿へ補間されて
-            # 動きが痩せる。両端だけならループは閉じたまま中は自由。
-            _march_pins = sorted({0, nf - 1})
+            # ★素のi2v (2026-07-23ユーザー報告「びっくりするほど歩き
+            # ません!」)。latent源に「立ち絵をnf枚並べた静止動画」を渡して
+            # いたのが原因 — SDEdit式の再加工は元の動きを保つので、動かない
+            # 素材を渡せば動かないのが正解になる。錨を減らしても素材が静止
+            # では同じ。決定的な反証: 同じAniSoraのターンテーブルは refine源
+            # 無しの素のi2vで360°回っている。なので refine_frames_b64 も
+            # latent固定も使わず、参照キャンバス1枚から素直に動かす。
+            # 回転止めはプロンプト (足踏み・facing固定) に委ねる。
             j["detail"] = f"[{tag}] AniSora単体・足踏み"
-            log(f"[{tag}] AniSora Low単体 (骨なし・VACE不使用): "
-                f"立ち絵を{nf}f並べてσ{_march_sigma:.2f}で再加工、"
-                f"フレーム{_march_pins}を立ち絵へ固定 (回転止め)、"
-                "motion=4")
-            _still_seq = [canvas] * nf
+            log(f"[{tag}] AniSora Low単体・素のi2v (骨なし・VACE不使用): "
+                f"参照キャンバス1枚から{nf}f、motion=4")
             extra2 = {
                 "anisora_low_only": True,
-                "refine_frames_b64": pv.encode_frames_b64(_still_seq),
-                "refine_strength": _march_sigma,
-                "refine_cond_still": True,
-                "latent_pin_frames": _march_pins,
                 "motion_score": _wp_knob_float(_kn, "motion", 4.0, 2.0, 4.0),
             }
             if offload:

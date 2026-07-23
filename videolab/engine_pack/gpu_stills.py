@@ -489,8 +489,7 @@ def facing_ref_path(posesets_dir=None, kind: str = "right"):
     較正の出典がC17なので、差し替え式の現行poseset (色分け人形・左右が
     ほぼ対称) では代用しない — 感度が落ちて誤判定側に倒れる
     (pipeline._facing_margin_vs_poseset の注記と同じ理由)。"""
-    name = {"front": "front_1.png",
-            "back": "back_1.png"}.get(kind, "right_1.png")
+    name = f"{kind}_1.png" if kind in DIR_INDEX else "right_1.png"
     root = Path(posesets_dir) if posesets_dir else (
         Path(__file__).resolve().parent.parent / "posesets")
     here = Path(__file__).resolve().parent
@@ -623,6 +622,43 @@ def front_back_swapped(crop_front, crop_back,
     now = _d(af, gf) + _d(ab, gb)
     swap = _d(af, gb) + _d(ab, gf)
     return swap < now - 1.0          # 明確に良いときだけ入れ替える
+
+
+def align_turntable(frames, guides: dict, min_gain: float = 0.5) -> tuple:
+    """8方向まとめて一番合う配置を選ぶ (order, front_idx, score)。
+
+    ★従来は「正面1枚を当てる」→「回転方向を当てる」の推定を直列に
+    重ねていたので、どちらか外れると8方向まるごとずれた (2026-07-23:
+    前後が逆・向きのフォーマットが狂う)。8方向ぶんの指示書と突き合わせて
+    総当たり (8つの起点 × 2つの回り方 = 16通り) で最小誤差を選べば、
+    どの1枚に賭ける必要もない。guides={方向名: PIL} (C17指示書)。
+    guidesが足りなければ (None, 0, 0.0) を返し呼び出し側は従来推定へ。"""
+    import numpy as np
+    n = len(frames or [])
+    need = set(TURNTABLE_RIGHT_FIRST)
+    if n < 8 or not guides or not need.issubset(set(guides)):
+        return None, 0, 0.0
+    g = {d: _norm64(guides[d]) for d in need}
+    if any(v is None for v in g.values()):
+        return None, 0, 0.0
+    best = (None, 0, None)
+    for k in range(8):                      # 起点 (どのコマを正面と見るか)
+        fi = int(round(k * (n - 1) / 8.0))
+        sampled = []
+        for slot in range(8):
+            idx = int((fi + round(slot * (n - 1) / 8.0)) % max(1, n - 1))
+            sampled.append(_norm64(key_to_magenta(frames[idx])))
+        if any(v is None for v in sampled):
+            continue
+        for order in (TURNTABLE_RIGHT_FIRST, TURNTABLE_LEFT_FIRST):
+            sc = 0.0
+            for slot, d in enumerate(order):
+                sc += float(np.abs(sampled[slot] - g[d]).mean())
+            if best[2] is None or sc < best[2]:
+                best = (order, fi, sc)
+    if best[0] is None:
+        return None, 0, 0.0
+    return best
 
 
 def turntable_order(sense: int) -> tuple:
